@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 数据缓存 / 训练产物(可再生,不入库)
+data_cache/
+
+# 运行日志 / 临时
+*.log
+.DS_Store
+Thumbs.db

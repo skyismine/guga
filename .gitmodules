@@ -1,0 +1,3 @@
+[submodule "SilverQuant"]
+	path = SilverQuant
+	url = https://gitee.com/silver6wings/SilverQuant.git

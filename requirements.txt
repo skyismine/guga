@@ -1,0 +1,16 @@
+# 运行本系统所需的依赖(已在 quant_simple 环境中安装验证)
+# 环境: conda 创建 Python 3.14 + 本清单
+numpy>=2.0
+pandas>=2.2
+matplotlib>=3.8
+requests>=2.31
+akshare>=1.16
+vectorbt>=1.1.0
+scikit-learn>=1.4
+lightgbm>=4.5
+flask>=3.0
+
+# 可选:SilverQuant 实盘/模拟交易(QMT/掘金)依赖,无需实盘可忽略
+# xtquant>=250516.1.1
+# pywencai>=0.12.3
+# mootdx>=0.11.7
