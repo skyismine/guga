@@ -72,13 +72,18 @@ def generate_advice(df: pd.DataFrame, features: pd.DataFrame, pred: dict,
     fg = mkt.get("market_fear_greed")
     basis_avg = mkt.get("market_basis_avg")
     basis_im = mkt.get("market_basis_im")
-    adv_ratio = mkt.get("market_adv_ratio")
+    adv_ratio = mkt.get("market_adv_ratio")   # 样本篮子代理宽度(模型特征)
     activity = market.get("activity") if market else None
     advance, decline, limit_up = None, None, None
     if activity:
         advance = activity.get("advance")
         decline = activity.get("decline")
         limit_up = activity.get("limit_up")
+    # 全市场实际宽度(乐咕)优先,缺失时退回样本篮子代理;避免"显示全市场家数却用篮子判断"
+    real_adv = None
+    if advance is not None and decline is not None and (advance + decline) > 0:
+        real_adv = advance / (advance + decline)
+    breadth_src = real_adv if real_adv is not None else adv_ratio
     live_basis = None
     if market and market.get("futures"):
         b = market["futures"].get("if")
@@ -103,8 +108,8 @@ def generate_advice(df: pd.DataFrame, features: pd.DataFrame, pred: dict,
     fg_fear = fg is not None and fg <= config.FG_FEAR
     fg_greed = fg is not None and fg >= config.FG_GREED
     fg_extreme_greed = fg is not None and fg >= config.FG_EXTREME_GREED
-    breadth_up = adv_ratio is not None and adv_ratio >= 0.7
-    breadth_down = adv_ratio is not None and adv_ratio <= 0.3
+    breadth_up = breadth_src is not None and breadth_src >= config.MARKET_BREADTH_UP
+    breadth_down = breadth_src is not None and breadth_src <= config.MARKET_BREADTH_DOWN
     basis_discount = basis_avg is not None and basis_avg <= config.BASIS_DEEP_DISCOUNT
     basis_premium = basis_avg is not None and basis_avg >= config.BASIS_PREMIUM
     basis_im_discount = basis_im is not None and basis_im <= config.BASIS_IM_DISCOUNT
@@ -284,7 +289,7 @@ def generate_advice(df: pd.DataFrame, features: pd.DataFrame, pred: dict,
             "basis_im": _f(basis_im),
             "basis_label": basis_label(basis_avg) if basis_avg is not None else None,
             "basis_if_live": _f(live_basis),
-            "adv_ratio": _f(adv_ratio),
+            "adv_ratio": _f(breadth_src),
             "advance": _f(advance), "decline": _f(decline), "limit_up": _f(limit_up),
         },
         "position_hint": pos_hint,
