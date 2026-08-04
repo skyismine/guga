@@ -80,6 +80,15 @@ PAGE = r"""<!DOCTYPE html>
         建议: {{ r.advice.action_cn }}</span>
       <p class="mut">上涨 {{ '%0.1f'|format(r.prediction.p_up*100) }}% · 震荡 {{ '%0.1f'|format(r.prediction.p_flat*100) }}% · 下跌 {{ '%0.1f'|format(r.prediction.p_down*100) }}%
          · 置信度 {{ '%0.1f'|format(r.advice.confidence*100) }}%{% if r.advice.strong %} · 强信号{% endif %}</p>
+      <p>预期涨跌幅
+        {% if r.prediction.expected_return is not none %}
+          <b class="{{ 'up' if r.prediction.expected_return>=0 else 'down' }}">{{ '%+.2f'|format(r.prediction.expected_return*100) }}%</b>
+        {% else %}<b>-</b>{% endif %}
+        &nbsp;·&nbsp; 盈亏比
+        {% if r.prediction.reward_risk is not none %}
+          <b class="{{ 'up' if r.prediction.reward_risk>=1 else 'down' }}">{{ '%0.2f'|format(r.prediction.reward_risk) }}</b>
+          <span class="mut">(期望盈利/期望亏损)</span>
+        {% else %}<b>-</b>{% endif %}</p>
       {% if r.quote %}
       <p>实时价 <b>{{ r.quote.price }}</b>
          <span class="{{ 'up' if r.quote.pct_chg>=0 else 'down' }}">{{ '%+.2f'|format(r.quote.pct_chg*100) }}%</span>

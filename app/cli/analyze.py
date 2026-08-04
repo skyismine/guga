@@ -40,6 +40,15 @@ def print_report(r: dict) -> None:
     print(f"  方向: {p['direction_cn']}    概率: {p['prob']:.1%}")
     bar = "█" * int(p["prob"] * 20)
     print(f"  上涨 {p['p_up']:.1%}  |{bar:<20}| 下跌 {p['p_down']:.1%}   (震荡 {p['p_flat']:.1%})")
+    if p.get("expected_return") is not None:
+        er = p["expected_return"]
+        color = 31 if er > 0 else (32 if er < 0 else 33)
+        print(f"  预期涨跌幅: {_color(f'{er:+.2%}', color)}"
+              f"   ({'盈利' if er >= 0 else '亏损'})")
+    if p.get("reward_risk") is not None:
+        rr = p["reward_risk"]
+        print(f"  盈亏比: {_color(f'{rr:.2f}', 31 if rr >= 1 else 32)}"
+              f"   (期望盈利/期望亏损{' ≥1 划算' if rr >= 1 else ' <1 不划算'})")
 
     q = r.get("quote") or {}
     if q:

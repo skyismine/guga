@@ -73,6 +73,18 @@ def train(horizon: int = None, threshold: float = None, verbose: bool = True) ->
     )
     model.fit(X_tr, y_tr)
 
+    # ---- 各类别平均未来收益(训练段),用于预测期输出"预期涨跌幅/盈亏比"
+    fwd_cache = {code: g["close"].shift(-horizon) / g["close"] - 1
+                 for code, g in groups.items()}
+    train_df = train_df.copy()
+    # 逐行映射 (code, date) -> 未来收益(索引含跨股票重复日期,避免用 .loc 标签选择)
+    train_df["_fwd_ret"] = [
+        fwd_cache[c].get(d, np.nan)
+        for c, d in zip(train_df["code"], train_df.index)
+    ]
+    class_avg = train_df.groupby("label")["_fwd_ret"].mean()
+    class_avg_returns = {int(k): round(float(v), 5) for k, v in class_avg.items()}
+
     # ---- 评估
     proba = model.predict_proba(X_te)
     pred = model.predict(X_te)
@@ -100,6 +112,7 @@ def train(horizon: int = None, threshold: float = None, verbose: bool = True) ->
         "n_features": len(feature_names),
         "split_date": str(pd.Timestamp(split_date).date()),
         "classes": {int(k): v for k, v in LABEL_NAME.items()},
+        "class_avg_returns": class_avg_returns,
         "metrics": {
             "accuracy": round(float(acc), 4),
             "f1_weighted": round(float(f1), 4),

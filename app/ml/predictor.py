@@ -52,11 +52,34 @@ class Predictor:
             out[cols[c]] = proba[:, classes.index(c)]
         return out
 
+    # ------------------------------------------------------------ 期望涨跌幅 / 盈亏比
+    def _avg_returns(self) -> dict:
+        """模型各类别平均未来收益(训练段统计,来自 meta)。"""
+        avg = (self.meta or {}).get("class_avg_returns") or {}
+        return {int(k): float(v) for k, v in avg.items()}
+
+    def _exp_metrics(self, row: pd.Series):
+        """由概率 + 类别平均收益估算 预期涨跌幅 与 盈亏比。
+
+        expected_return = Σ p_c × avg_ret_c         (未来 horizon 日的期望涨跌幅)
+        reward_risk     = (p_up×avg_up) / (p_down×|avg_down|)   (期望盈利/期望亏损)
+        """
+        avg = self._avg_returns()
+        if not avg:
+            return None, None
+        exp_ret = (row["up"] * avg.get(2, 0.0) + row["flat"] * avg.get(1, 0.0)
+                   + row["down"] * avg.get(0, 0.0))
+        upside = row["up"] * max(avg.get(2, 0.0), 0.0)
+        downside = row["down"] * max(-avg.get(0, 0.0), 0.0)
+        rr = (upside / downside) if downside > 1e-4 else None
+        return exp_ret, rr
+
     def predict_latest(self, features: pd.DataFrame) -> dict:
         """最新一行的预测结果。"""
         proba = self.predict_proba(features)
         row = proba.iloc[-1]
         best = row.idxmax()
+        exp_ret, rr = self._exp_metrics(row)
         return {
             "p_up": float(row["up"]),
             "p_flat": float(row["flat"]),
@@ -64,6 +87,8 @@ class Predictor:
             "direction": best,
             "direction_cn": LABEL_NAME_CN[{"up": 2, "flat": 1, "down": 0}[best]],
             "prob": float(row[best]),
+            "expected_return": round(exp_ret, 5) if exp_ret is not None else None,
+            "reward_risk": round(rr, 3) if rr is not None else None,
             "date": str(proba.index[-1].date()),
         }
 
@@ -72,6 +97,14 @@ class Predictor:
         proba = self.predict_proba(features)
         proba["signal"] = proba[["up", "flat", "down"]].idxmax(axis=1)
         proba["signal_cn"] = proba["signal"].map({"up": "上涨", "flat": "震荡", "down": "下跌"})
+        exp = []
+        rr = []
+        for _, row in proba.iterrows():
+            e, r = self._exp_metrics(row)
+            exp.append(e)
+            rr.append(r)
+        proba["expected_return"] = exp
+        proba["reward_risk"] = rr
         return proba
 
     # ------------------------------------------------------------ 模型信息
