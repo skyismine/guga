@@ -5,6 +5,13 @@
   -  >= +threshold  -> 2 (up)
   -  <= -threshold  -> 0 (down)
   -  其余            -> 1 (flat)
+
+阈值支持两种模式:
+  1. 滚动分位数(默认):对每只个股,日期 t 的涨/跌阈值取"过去 window 个交易日已实现
+     的 forward_return"的 30%/70% 分位数。窗口整体 shift(horizon),保证阈值只依赖
+     t 时点已实现的数据(无前视)。自动适配个股波动率与市场环境,三类样本比例天然
+     稳定在约 30/40/30,从根源上解决固定百分比造成的阈值漂移。
+  2. 固定百分比(config.PREDICT_THRESHOLD):仅当 LABEL_QUANTILE_WINDOW<=0 时回退。
 """
 from typing import List, Tuple
 
@@ -23,9 +30,23 @@ def build_labels(close: pd.Series, horizon: int = None, threshold: float = None)
     horizon = horizon or config.PREDICT_HORIZON
     threshold = threshold or config.PREDICT_THRESHOLD
     fwd = close.shift(-horizon) / close - 1
-    y = pd.Series(np.where(fwd >= threshold, 2, np.where(fwd <= -threshold, 0, 1)),
-                  index=close.index, dtype=int)
-    y = y.mask(fwd.isna())
+
+    window = getattr(config, "LABEL_QUANTILE_WINDOW", 0)
+    if window and window > 0:
+        q_lo = getattr(config, "LABEL_QUANTILE_LOW", 0.30)
+        q_hi = getattr(config, "LABEL_QUANTILE_HIGH", 0.70)
+        min_periods = getattr(config, "LABEL_QUANTILE_MIN_PERIODS", 60)
+        # 无前视: t 时刻阈值只用 s+horizon<=t 的已实现收益(即 fwd 整体 shift(horizon))
+        thr_lo = fwd.shift(horizon).rolling(window, min_periods=min_periods).quantile(q_lo)
+        thr_hi = fwd.shift(horizon).rolling(window, min_periods=min_periods).quantile(q_hi)
+        y = pd.Series(np.where(fwd >= thr_hi, 2, np.where(fwd <= thr_lo, 0, 1)),
+                      index=close.index, dtype=float)
+        # 阈值窗口不足或 forward_return 缺失的日期统一置为 NaN(由上层 dropna 剔除)
+        y = y.mask(fwd.isna() | thr_lo.isna() | thr_hi.isna())
+    else:
+        y = pd.Series(np.where(fwd >= threshold, 2, np.where(fwd <= -threshold, 0, 1)),
+                      index=close.index, dtype=float)
+        y = y.mask(fwd.isna())
     return y
 
 

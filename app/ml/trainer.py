@@ -43,13 +43,18 @@ def train(horizon: int = None, threshold: float = None, verbose: bool = True) ->
     t0 = time.time()
 
     if verbose:
-        print(f"[训练] 开始,horizon={horizon}日,threshold={threshold:.1%}")
+        print(f"[训练] 开始,horizon={horizon}日,threshold={threshold:.1%}(滚动分位数: "
+              f"window={config.LABEL_QUANTILE_WINDOW}, q=({config.LABEL_QUANTILE_LOW}, "
+              f"{config.LABEL_QUANTILE_HIGH}))")
     groups = _history_groups(verbose)
     data, y, feature_names = build_dataset(list(groups.values()), horizon, threshold)
     train_df, test_df, split_date = time_split(data)
     if verbose:
         print(f"[训练] 样本: {len(data)}(train {len(train_df)} / test {len(test_df)}), "
               f"特征: {len(feature_names)}, 切分日: {split_date.date()}")
+        vc = data["label"].value_counts(normalize=True)
+        print(f"[训练] 三类样本占比: 下跌 {vc.get(0, 0):.1%} / 震荡 {vc.get(1, 0):.1%} / "
+              f"上涨 {vc.get(2, 0):.1%}")
 
     if len(train_df) < config.MIN_TRAIN_SAMPLES:
         raise RuntimeError(f"训练样本不足: {len(train_df)} < {config.MIN_TRAIN_SAMPLES}")
@@ -106,6 +111,9 @@ def train(horizon: int = None, threshold: float = None, verbose: bool = True) ->
         "trained_at": dt.datetime.now().isoformat(timespec="seconds"),
         "horizon": horizon,
         "threshold": threshold,
+        "label_method": "rolling_quantile",
+        "label_window": config.LABEL_QUANTILE_WINDOW,
+        "label_quantiles": [config.LABEL_QUANTILE_LOW, config.LABEL_QUANTILE_HIGH],
         "n_samples": int(len(data)),
         "n_train": int(len(train_df)),
         "n_test": int(len(test_df)),

@@ -84,7 +84,9 @@ python run_web.py            # http://127.0.0.1:8000
 ```
 
 - `/` 输入股票代码 → 走势预测 + 操作建议 + K 线/概率图
+- `/signals` 今日信号单(股票池按预期收益排序:Top-N 买入候选 / 末位风险提示 / 全池排序)
 - `/api/analyze?code=600519` JSON 接口
+- `/api/signals` 今日信号单 JSON 接口
 - `/api/backtest` 回测汇总接口
 - `/api/model` 模型信息
 
@@ -121,7 +123,10 @@ python run_predict.py live       # 交易时段实盘模拟(轮询新浪实时�
 
 ### 特征与标签(无前视)
 - 特征仅用当期及历史数据(`compute_features`),时间切分训练,预测信号滞后 1 日执行;
-- 标签 = 未来 `horizon` 日收益,`>= +threshold` → 上涨,`<= -threshold` → 下跌,否则震荡;
+- 标签 = 未来 `horizon` 日收益,**滚动分位数阈值**(默认):对每只个股,日期 t 的涨/跌阈值取
+  过去 250 个交易日已实现未来收益的 30%/70% 分位数(窗口整体 shift(horizon) 保证无前视)。
+  自动适配个股波动率与市场环境,三类样本占比长期稳定在约 30/40/30,根治固定百分比(±1.5%)
+  的阈值漂移;`LABEL_QUANTILE_WINDOW<=0` 时回退固定阈值(`PREDICT_THRESHOLD`);
 - 市场级特征(`market_*` 前缀,由 `market_features.py` 构建并按日期对齐):
   - **涨跌家数/宽度**: `market_adv_ratio`(样本篮子上涨占比)、`market_above_ma20`(站上 MA20 占比)、
     `market_hot_ratio`(强势股占比)、`market_dispersion`(截面离散度)等;
@@ -144,6 +149,16 @@ python run_predict.py live       # 交易时段实盘模拟(轮询新浪实时�
 - **盈亏比** `reward_risk` = (P(上涨)×平均上涨收益) / (P(下跌)×|平均下跌收益|),
   即期望盈利/期望亏损,`≥1` 视为风险回报划算;`p_down≈0` 时不可计算返回 `None`。
 CLI 与 Web 均展示这两项,`predict_series` 亦逐日输出,可用于回测与图表。
+
+### 每日信号排序(Top-N,信号系统主入口)
+`ranker.py` 提供面向实盘"只发信号、不做自动交易"的每日信号清单:
+- `daily_signals()`:对股票池按 **预期收益** 排序,取前 `RANK_TOP_N` 为买入候选
+  (要求 `p_up ≥ RANK_MIN_P_UP` 且预期收益 ≥ 0),末位为风险提示;用相对排序替代
+  绝对概率阈值,天然适配个股波动率与市场环境差异;
+- `rank_backtest()`:walk-forward 排序回测,统计样本外 top-N 的"未来 horizon 日实际
+  收益"与全池均值/末位对比。实测(top3, 2026-03~07):Top3 均收益 **+0.42%/3日** >
+  全池 +0.03% > 末位 -0.09%,跑赢全池占比 58.8%,排序信号呈单调性。
+运行:`python -m app.strategy.ranker today`(今日信号) / `... bt`(排序回测)。
 
 ## 结果与声明
 
