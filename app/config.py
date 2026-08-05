@@ -76,7 +76,7 @@ TEST_RATIO = 0.2           # 按时间切分的验证集比例
 
 # 特征筛选(相关性去冗余 + 重要性 Top-N)
 FEATURE_SELECT = True               # 训练时是否使用筛选后的特征子集
-FEATURE_SELECT_TOP_N = 25           # 保留的特征数量
+FEATURE_SELECT_TOP_N = 30           # 保留的特征数量
 FEATURE_CORR_THRESHOLD = 0.8        # |相关系数| 超过该值视为冗余(按重要性贪心保留)
 FEATURE_SELECTED_FILE = "selected_features.json"   # 选择结果(存于 MODEL_DIR)
 

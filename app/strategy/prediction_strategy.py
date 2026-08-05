@@ -15,6 +15,7 @@ from app.advice.advisor import ACTION_CN
 from app.data.fetcher import get_daily_history, get_spot_quote
 from app.features.indicators import compute_features
 from app.features.market_features import attach_market_features
+from app.features.industry_features import prepare_features
 from app.ml.predictor import Predictor
 from app.strategy.paper_delegate import PaperDelegate
 
@@ -57,7 +58,7 @@ class PredictionStrategy:
             quote = quotes.get(code)
             try:
                 df = get_daily_history(code, days=240, adjust=self.pool.price_adjust)
-                features = attach_market_features(compute_features(df))
+                features = prepare_features(df, code)
                 pred = self.predictor.predict_latest(features)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[预测失败] %s: %s", code, e)
@@ -110,7 +111,7 @@ class PredictionStrategy:
             quote = quotes.get(code)
             try:
                 df = get_daily_history(code, days=240, adjust=self.pool.price_adjust)
-                features = attach_market_features(compute_features(df))
+                features = prepare_features(df, code)
                 pred = self.predictor.predict_latest(features)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[预测失败] %s: %s", code, e)

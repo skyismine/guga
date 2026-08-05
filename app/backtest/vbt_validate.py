@@ -18,6 +18,7 @@ from app import config
 from app.data.fetcher import get_daily_history, get_stock_name
 from app.features.indicators import compute_features
 from app.features.market_features import attach_market_features
+from app.features.industry_features import prepare_features
 from app.ml.predictor import Predictor
 
 _METRIC_KEYS = {
@@ -33,12 +34,12 @@ _METRIC_KEYS = {
 }
 
 
-def build_signals(df: pd.DataFrame, predictor: Predictor,
+def build_signals(df: pd.DataFrame, predictor: Predictor, code: str = None,
                   buy_threshold: float = None, sell_threshold: float = None):
     """由历史特征与模型生成 (entries, exits) 布尔序列。"""
     buy_threshold = buy_threshold or config.BUY_P_UP
     sell_threshold = sell_threshold or config.SELL_P_DOWN
-    features = attach_market_features(compute_features(df))
+    features = prepare_features(df, code)
     proba = predictor.predict_proba(features)
     proba = proba.dropna()
 
@@ -58,7 +59,7 @@ def backtest_stock(code: str, predictor: Optional[Predictor] = None,
     code = str(code).zfill(6)
     predictor = predictor or Predictor()
     df = get_daily_history(code, days=config.HIST_DAYS, adjust="qfq")
-    entries, exits = build_signals(df, predictor, buy_threshold, sell_threshold)
+    entries, exits = build_signals(df, predictor, code, buy_threshold, sell_threshold)
 
     close = df["close"].reindex(entries.index)
     pf = vbt.Portfolio.from_signals(
@@ -131,7 +132,7 @@ def backtest_oos(codes: Optional[List[str]] = None, train_ratio: float = 0.7,
     trains, tests, all_features = {}, {}, {}
     for code in codes:
         df = get_daily_history(code, days=config.HIST_DAYS, adjust="qfq")
-        features = attach_market_features(compute_features(df))
+        features = prepare_features(df, code)
         split_i = int(len(features) * train_ratio)
         trains[code] = features.iloc[:split_i]
         tests[code] = features.iloc[split_i:]

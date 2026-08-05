@@ -7,15 +7,16 @@ from app.data.fetcher import (get_daily_history, get_spot_quote,
                               get_stock_name)
 from app.features.indicators import compute_features
 from app.features.market_features import attach_market_features, market_snapshot
+from app.features.industry_features import prepare_features
 from app.ml.predictor import Predictor
 
 
 def _full_pipeline(code: str, with_quote: bool = True):
-    """数据 -> 特征(含市场级) -> 预测 -> 建议 -> 快照,供两种返回共用。"""
+    """数据 -> 特征(含市场级+行业) -> 预测 -> 建议 -> 快照,供两种返回共用。"""
     df = get_daily_history(code, days=600, adjust="qfq")
     if len(df) < 120:
         raise ValueError(f"{code} 历史数据不足({len(df)}行)")
-    features = attach_market_features(compute_features(df))
+    features = prepare_features(df, code)
     predictor = Predictor()
     pred = predictor.predict_latest(features)
     quote = None

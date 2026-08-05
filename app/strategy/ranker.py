@@ -16,12 +16,13 @@ from app import config
 from app.data.fetcher import get_daily_history, get_stock_name
 from app.features.indicators import compute_features
 from app.features.market_features import attach_market_features
+from app.features.industry_features import prepare_features
 from app.ml.predictor import Predictor
 
 
 def _one_signal(code: str, predictor: Predictor) -> dict:
     df = get_daily_history(code, days=config.HIST_DAYS, adjust="qfq")
-    r = predictor.predict_latest(attach_market_features(compute_features(df)))
+    r = predictor.predict_latest(prepare_features(df, code))
     return {
         "code": code,
         "name": get_stock_name(code),

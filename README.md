@@ -134,10 +134,17 @@ python run_predict.py live       # 交易时段实盘模拟(轮询新浪实时�
   - **期指资金**: `market_basis_*`(IF/IH/IC/IM 四大期指相对现货指数的升贴水);
   - 实时端另有乐咕乐股全市场涨跌家数(涨停/跌停)与期指实时基差快照。
 - ATR 已含于个股特征(`atr14` / `atr_pct`),同时用于建议层的仓位控制与止损。
+- **行业/风格特征**(`industry_features.py`):个股所属申万一级行业指数涨跌 + 相对行业超额收益,
+  帮助模型区分 **个股 alpha 与行业 beta**(提升跨风格/跨行业稳定性):
+  - `ind_ret_1/5/20`(行业 beta)、`ind_ma20_gap`(行业趋势)、`ind_vol20`(行业波动);
+  - `alpha_1/5/20`(个股-行业超额收益)、`alpha_trend`(相对行业动能)。
+  行业指数取申万一级(sina `index_hist_sw`,稳定);个股→行业映射样本池静态表优先、任意代码
+  动态解析兜底,均本地缓存;无行业标的(如 ETF)该组特征为 NaN,LightGBM 原生处理缺失。
+  A/B 同窗口验证:含行业特征 跑赢全池 55.9% vs 不含 50.5%(Top3 未来3日均收益 +0.37% vs +0.31%)。
 - **特征筛选**(`select_features.py`):相关性去冗余 + 重要性 Top-N。对特征两两计算相关系数,
   按 LightGBM gain 重要性降序贪心保留(|相关系数| > 0.8 视为冗余剔除同簇中重要性较低的),
-  再取前 `FEATURE_SELECT_TOP_N`(默认 25)。结果存 `selected_features.json`,训练/回测统一使用。
-  当前 63 → 25 个特征,排序信号实测提升(Top3 未来3日均收益 +0.42% → +0.57%)。
+  再取前 `FEATURE_SELECT_TOP_N`(默认 30)。结果存 `selected_features.json`,训练/回测统一使用。
+  加入行业特征后共 72 个候选 → 筛至 30 个(含 `ind_*`/`alpha_*`)。
 
 ### 操作建议
 `advisor.py` 综合 模型概率 + 均线排列 + RSI + MACD + 量比 + 布林位置,

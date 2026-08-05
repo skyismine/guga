@@ -19,6 +19,7 @@ from app.data.fetcher import (get_daily_history, get_spot_quotes,
                               is_trading_time)
 from app.features.indicators import compute_features
 from app.features.market_features import attach_market_features
+from app.features.industry_features import prepare_features
 from app.ml.predictor import Predictor
 from app.strategy.paper_delegate import PaperDelegate
 from app.strategy.prediction_strategy import PredictionPool, PredictionStrategy
@@ -79,7 +80,7 @@ def run_replay(pool_codes, init_cash: float = 100_000.0, horizon=None,
     series = {}
     for code in pool.get_code_list():
         df = get_daily_history(code, days=config.HIST_DAYS, adjust="qfq")
-        features = attach_market_features(compute_features(df))
+        features = prepare_features(df, code)
         history[code] = df
         series[code] = predictor.predict_series(features).dropna()
 

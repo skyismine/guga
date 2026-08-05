@@ -21,6 +21,7 @@ import pandas as pd
 from app import config
 from app.features.indicators import compute_features
 from app.features.market_features import attach_market_features, build_market_frame
+from app.features.industry_features import attach_industry_features
 
 LABEL_NAME = {0: "down", 1: "flat", 2: "up"}
 LABEL_NAME_CN = {0: "下跌", 1: "震荡", 2: "上涨"}
@@ -85,7 +86,9 @@ def build_dataset(df_list: List[pd.DataFrame], horizon: int = None,
     data = pd.concat(frames).sort_index()
     # 并入市场级特征(涨跌家数/恐贪/期指基差),按日期对齐
     data = attach_market_features(data)
-    mcols = [c for c in data.columns if c.startswith("market_")]
+    # 并入行业特征(行业指数涨跌 + 相对行业超额收益),按 (code,date) 对齐
+    data = attach_industry_features(data)
+    mcols = [c for c in data.columns if c.startswith(("market_", "ind_", "alpha_"))]
     data = data.dropna(subset=mcols)
     # 特征列 = 除 label/code 外的全部指标列
     feature_names = [c for c in data.columns if c not in ("label", "code")]
