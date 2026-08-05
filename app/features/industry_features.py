@@ -75,9 +75,12 @@ def _load_map():
     try:
         import json
         with open(_MAP_PATH, encoding="utf-8") as f:
-            _map_cache = json.load(f)
+            data = json.load(f)
     except (OSError, ValueError):
-        _map_cache = {}
+        data = {}
+    # 原地更新而非重新绑定,保证 import 处持有的 _map_cache 引用始终为同一对象
+    _map_cache.clear()
+    _map_cache.update(data)
 
 
 def _save_map():
@@ -92,7 +95,7 @@ def _save_map():
 
 
 def _resolve_dynamic(code: str):
-    """动态解析个股行业(akshare,失败返回 None)。"""
+    """动态解析个股行业(akshare,失败返回 None)。失败不写缓存,避免污染映射。"""
     sw = None
     try:
         import akshare as ak
@@ -110,9 +113,26 @@ def _resolve_dynamic(code: str):
                 break
     except Exception as e:  # noqa: BLE001
         print(f"[industry] {code} 行业解析失败: {e}")
-    _map_cache[code] = sw
-    _save_map()
+    if sw is not None:
+        _map_cache[code] = sw
+        _save_map()
     return sw
+
+
+def prefetch_industry_indices(sleep: float = 1.5) -> None:
+    """预取全部申万一级行业指数收盘序列到本地缓存(避免训练时连续拉取被限流)。"""
+    from app import config as _cfg
+    os.makedirs(_IND_HIST_DIR, exist_ok=True)
+    for sw in SW_CODE_TO_NAME:
+        path = os.path.join(_IND_HIST_DIR, f"{sw}.pkl")
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) <= _cfg.CACHE_TTL_SECONDS:
+            continue
+        try:
+            _get_sw_index_close(sw)
+            print(f"  [行业] {SW_CODE_TO_NAME[sw]}({sw}) 已缓存")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [行业] {SW_CODE_TO_NAME[sw]}({sw}) 失败: {e}")
+        time.sleep(sleep)
 
 
 def _get_sw_index_close(sw_code: str) -> pd.Series:

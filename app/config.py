@@ -59,14 +59,33 @@ RANK_TOP_N = 3            # 每日推荐买入股票数量
 RANK_MIN_P_UP = 0.40      # 候选股 p_up 下限(过滤低置信,防纯排序选入烂票)
 RANK_MIN_EXP_RET = 0.0    # 候选股预期收益下限(<=0 视为无上涨空间)
 
-# 用于训练的全市场样本股票(代码前缀), 建议覆盖主板/创业板
-TRAIN_PREFIXES = ("60", "00", "30")
-TRAIN_STOCK_CODES = [      # 一组流动性好、覆盖各行业的样本股
+# 用于训练的全市场样本股票(代码前缀), 建议覆盖主板/创业板/科创板
+TRAIN_PREFIXES = ("60", "00", "30", "68")
+_STATIC_TRAIN_CODES = [        # 静态基础池(扩充池缺失时的回退)
     "600519", "601318", "600036", "601899", "600030",
     "600900", "601012", "600887", "600309", "603259",
     "000001", "000858", "000333", "000651", "002594",
     "002415", "300750", "300059", "300124", "002230",
 ]
+
+
+def _load_expanded_codes():
+    """优先加载扩充训练池(data_cache/train_pool.json,>=100 只),否则回退静态池。"""
+    import json
+    import os
+    path = os.path.join(DATA_DIR, "train_pool.json")
+    try:
+        if os.path.exists(path):
+            d = json.load(open(path, encoding="utf-8"))
+            codes = d.get("codes") or []
+            if len(codes) >= 100:
+                return codes
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+TRAIN_STOCK_CODES = _load_expanded_codes() or _STATIC_TRAIN_CODES
 TRAIN_YEARS_BACK = 3       # 取最近 N 年历史作为训练数据
 
 # 模型
