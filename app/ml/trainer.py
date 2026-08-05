@@ -48,6 +48,13 @@ def train(horizon: int = None, threshold: float = None, verbose: bool = True) ->
               f"{config.LABEL_QUANTILE_HIGH}))")
     groups = _history_groups(verbose)
     data, y, feature_names = build_dataset(list(groups.values()), horizon, threshold)
+    # 特征筛选:按 selected_features.json 裁剪(相关性去冗余 + 重要性 Top-N)
+    if getattr(config, "FEATURE_SELECT", True):
+        from app.features.select_features import apply_selection
+        selected = apply_selection(data, feature_names)
+        if len(selected) < len(feature_names) and verbose:
+            print(f"[训练] 特征筛选: {len(feature_names)} -> {len(selected)}")
+        feature_names = selected
     train_df, test_df, split_date = time_split(data)
     if verbose:
         print(f"[训练] 样本: {len(data)}(train {len(train_df)} / test {len(test_df)}), "

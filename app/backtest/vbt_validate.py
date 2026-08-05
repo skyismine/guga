@@ -118,12 +118,14 @@ def backtest_oos(codes: Optional[List[str]] = None, train_ratio: float = 0.7,
     """
     from lightgbm import LGBMClassifier
     from app.ml.dataset import build_dataset, build_labels
+    from app.features.select_features import load_selected_features
 
     codes = codes or config.TRAIN_STOCK_CODES
     horizon = horizon or config.PREDICT_HORIZON
     threshold = threshold or config.PREDICT_THRESHOLD
     buy_threshold = buy_threshold or config.BUY_P_UP
     sell_threshold = sell_threshold or config.SELL_P_DOWN
+    sel = load_selected_features() if getattr(config, "FEATURE_SELECT", True) else []
 
     # 1) 组织数据
     trains, tests, all_features = {}, {}, {}
@@ -141,9 +143,12 @@ def backtest_oos(codes: Optional[List[str]] = None, train_ratio: float = 0.7,
         df = get_daily_history(code, days=config.HIST_DAYS, adjust="qfq")
         y = build_labels(df["close"], horizon, threshold).reindex(f.index).dropna()
         X = f.reindex(y.index)
+        feat_names = list(X.columns)
+        if sel:
+            feat_names = [c for c in feat_names if c in sel]
+            X = X[feat_names]
         X_tr_all.append(X.values)
         y_tr_all.append(y.values)
-        feat_names = list(X.columns)
     X_tr_all = np.concatenate(X_tr_all)
     y_tr_all = np.concatenate(y_tr_all)
     model = LGBMClassifier(n_estimators=400, learning_rate=0.04,
