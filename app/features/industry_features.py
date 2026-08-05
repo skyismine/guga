@@ -24,6 +24,7 @@ import pandas as pd
 from app import config
 from app.features.indicators import compute_features
 from app.features.market_features import attach_market_features
+from app.features.standardize import zscore_frame, standardize_stock_frame
 
 # 申万一级行业名称 <-> 代码(固定集合)
 SW_CODE_TO_NAME = {
@@ -132,17 +133,25 @@ def _get_sw_index_close(sw_code: str) -> pd.Series:
     return close
 
 
-def _industry_frame_for(sw_code: str, index: pd.DatetimeIndex) -> pd.DataFrame:
-    """行业特征帧,对齐到给定交易日索引。"""
-    close = _get_sw_index_close(sw_code).reindex(index).ffill()
+def _industry_frame_for(sw_code: str, index: pd.DatetimeIndex):
+    """行业特征帧,对齐到给定交易日索引。
+
+    返回 (feat, raw):feat 为特征列(滚动 z-score 后,ind_* 供模型),raw 为原始值
+    (ind_ret_*/ind_ma20_gap 供计算 alpha 超额收益,需与个股收益同尺度)。
+    """
+    close = _get_sw_index_close(sw_code)
     ret1 = close.pct_change()
-    ind = pd.DataFrame(index=index)
-    ind["ind_ret_1"] = ret1
-    ind["ind_ret_5"] = close.pct_change(5)
-    ind["ind_ret_20"] = close.pct_change(20)
-    ind["ind_ma20_gap"] = close / close.rolling(20).mean() - 1
-    ind["ind_vol20"] = ret1.rolling(20).std()
-    return ind
+    raw = pd.DataFrame(index=close.index)
+    raw["ind_ret_1"] = ret1
+    raw["ind_ret_5"] = close.pct_change(5)
+    raw["ind_ret_20"] = close.pct_change(20)
+    raw["ind_ma20_gap"] = close / close.rolling(20).mean() - 1
+    raw["ind_vol20"] = ret1.rolling(20).std()
+    if config.STANDARDIZE_ROLLING:
+        feat = zscore_frame(raw)
+    else:
+        feat = raw
+    return feat.reindex(index).ffill(), raw.reindex(index).ffill()
 
 
 def attach_industry_features(data: pd.DataFrame) -> pd.DataFrame:
@@ -156,27 +165,30 @@ def attach_industry_features(data: pd.DataFrame) -> pd.DataFrame:
             continue
         mask = out["code"] == code
         idx = out.index[mask]
-        ind = _industry_frame_for(sw, pd.DatetimeIndex(idx))
+        ind, ind_raw = _industry_frame_for(sw, pd.DatetimeIndex(idx))
         for col in ind.columns:
             out.loc[mask, col] = ind[col].values
         for h in (1, 5, 20):
-            out.loc[mask, f"alpha_{h}"] = out.loc[mask, f"ret_{h}"] - ind[f"ind_ret_{h}"].values
-        out.loc[mask, "alpha_trend"] = out.loc[mask, "close_ma20"].values - ind["ind_ma20_gap"].values
+            out.loc[mask, f"alpha_{h}"] = out.loc[mask, f"ret_{h}"].values - ind_raw[f"ind_ret_{h}"].values
+        out.loc[mask, "alpha_trend"] = out.loc[mask, "close_ma20"].values - ind_raw["ind_ma20_gap"].values
     return out
 
 
 def prepare_features(df: pd.DataFrame, code: str = None) -> pd.DataFrame:
-    """统一特征装配:个股技术特征 + 市场级特征 + 行业特征(推断/回测路径)。"""
+    """统一特征装配:个股技术特征 + 市场级特征 + 行业特征(推断/回测路径)。
+
+    标准化口径:market_*/ind_* 在源端滚动 z-score;个股特征与 alpha_* 最后按股票滚动 z-score。
+    """
     code = str(code).zfill(6) if code else (getattr(df, "name", None) or None)
     features = attach_market_features(compute_features(df))
     sw = get_industry_sw(code) if code else None
     if sw:
-        ind = _industry_frame_for(sw, features.index)
+        ind, ind_raw = _industry_frame_for(sw, features.index)
         features = features.join(ind, how="left")
         for h in (1, 5, 20):
-            features[f"alpha_{h}"] = features[f"ret_{h}"] - features[f"ind_ret_{h}"]
-        features["alpha_trend"] = features["close_ma20"] - features["ind_ma20_gap"]
-    return features
+            features[f"alpha_{h}"] = features[f"ret_{h}"] - ind_raw[f"ind_ret_{h}"]
+        features["alpha_trend"] = features["close_ma20"] - ind_raw["ind_ma20_gap"]
+    return standardize_stock_frame(features)
 
 
 if __name__ == "__main__":

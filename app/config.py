@@ -80,6 +80,11 @@ FEATURE_SELECT_TOP_N = 30           # 保留的特征数量
 FEATURE_CORR_THRESHOLD = 0.8        # |相关系数| 超过该值视为冗余(按重要性贪心保留)
 FEATURE_SELECTED_FILE = "selected_features.json"   # 选择结果(存于 MODEL_DIR)
 
+# 特征标准化(滚动 z-score,仅用历史窗口,避免未来数据)
+STANDARDIZE_ROLLING = True      # 是否启用滚动 z-score 标准化
+STANDARDIZE_WINDOW = 250        # 均值/标准差滚动窗口(交易日)
+STANDARDIZE_MIN_PERIODS = 60    # 窗口最小样本数,不足则产生 NaN(训练时剔除)
+
 # 预测信号转操作建议的阈值
 BUY_P_UP = 0.55            # P(上涨) >= 该值 -> 考虑买入
 SELL_P_DOWN = 0.55         # P(下跌) >= 该值 -> 考虑卖出

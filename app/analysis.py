@@ -12,10 +12,14 @@ from app.ml.predictor import Predictor
 
 
 def _full_pipeline(code: str, with_quote: bool = True):
-    """数据 -> 特征(含市场级+行业) -> 预测 -> 建议 -> 快照,供两种返回共用。"""
+    """数据 -> 特征(含市场级+行业) -> 预测 -> 建议 -> 快照,供两种返回共用。
+
+    features 为标准化特征(供模型);raw_features 为原始指标特征(供操作建议的阈值判断)。
+    """
     df = get_daily_history(code, days=600, adjust="qfq")
     if len(df) < 120:
         raise ValueError(f"{code} 历史数据不足({len(df)}行)")
+    raw_features = compute_features(df)
     features = prepare_features(df, code)
     predictor = Predictor()
     pred = predictor.predict_latest(features)
@@ -26,7 +30,7 @@ def _full_pipeline(code: str, with_quote: bool = True):
         except Exception:
             quote = None
     mkt = market_snapshot()
-    advice = generate_advice(df, features, pred, quote, market=mkt)
+    advice = generate_advice(df, raw_features, pred, quote, market=mkt)
     return df, features, predictor, pred, quote, mkt, advice
 
 

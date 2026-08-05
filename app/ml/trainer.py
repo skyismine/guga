@@ -55,6 +55,10 @@ def train(horizon: int = None, threshold: float = None, verbose: bool = True) ->
         if len(selected) < len(feature_names) and verbose:
             print(f"[训练] 特征筛选: {len(feature_names)} -> {len(selected)}")
         feature_names = selected
+    # 滚动 z-score 标准化(按个股,仅用历史窗口;market_/ind_ 在源端已标准化)
+    from app.features.standardize import standardize_dataset
+    data = standardize_dataset(data, feature_names)
+    data = data.dropna(subset=feature_names)
     train_df, test_df, split_date = time_split(data)
     if verbose:
         print(f"[训练] 样本: {len(data)}(train {len(train_df)} / test {len(test_df)}), "

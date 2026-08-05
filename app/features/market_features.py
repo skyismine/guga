@@ -25,6 +25,7 @@ from app import config
 from app.data.fetcher import get_daily_history
 from app.data import market as mk
 from app.features.indicators import compute_features
+from app.features.standardize import zscore_frame
 
 _MARKET_FRAME_PATH = os.path.join(config.DATA_DIR, "market_frame.pkl")
 
@@ -120,9 +121,13 @@ def attach_market_features(features: pd.DataFrame, frame: pd.DataFrame = None) -
 
     注意:个股帧的日期会跨多只股票重复出现,join 右侧必须先收敛到
     唯一日期(右侧唯一 -> 左侧重复, 多对一, 不会因重复索引发生笛卡尔爆炸)。
+    market_* 特征在源端做滚动 z-score(按市场帧序列,同一天所有股票取值一致,横截面可比)。
     """
     frame = frame if frame is not None else build_market_frame()
     cols = [c for c in frame.columns if c.startswith("market_")]
+    if config.STANDARDIZE_ROLLING:
+        frame = zscore_frame(frame[cols])
+        cols = list(frame.columns)
     out = features.copy()
     m = frame[cols].reindex(pd.Index(out.index.unique())).ffill()
     out = out.join(m, how="left")

@@ -88,6 +88,9 @@ def rank_backtest(codes=None, top_n: int = None, train_ratio: float = None) -> d
     if getattr(config, "FEATURE_SELECT", True):
         from app.features.select_features import apply_selection
         feature_names = apply_selection(data, feature_names)
+    from app.features.standardize import standardize_dataset
+    data = standardize_dataset(data, feature_names)
+    data = data.dropna(subset=feature_names)
     train_df, test_df, split_date = time_split(data)
 
     X_tr, y_tr = train_df[feature_names].values, train_df["label"].values
