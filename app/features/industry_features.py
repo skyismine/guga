@@ -61,6 +61,7 @@ _A_STOCK_PREFIXES = ("60", "68", "00", "30")
 _IND_HIST_DIR = os.path.join(config.DATA_DIR, "industry")
 _MAP_PATH = os.path.join(config.DATA_DIR, "industry_code_map.json")
 _map_cache = {}
+_FAIL_WARNED = set()
 
 
 def get_industry_sw(code: str):
@@ -119,7 +120,10 @@ def _resolve_dynamic(code: str):
                             break
                 break
     except Exception as e:  # noqa: BLE001
-        print(f"[industry] {code} 行业解析失败: {e}")
+        if code not in _FAIL_WARNED:
+            _FAIL_WARNED.add(code)
+            print(f"[industry] {code} 行业解析失败({type(e).__name__}),"
+                  f"已记录,后续不再重复打印")
     if sw is not None:
         _map_cache[code] = sw
         _save_map()

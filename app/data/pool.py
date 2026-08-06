@@ -17,6 +17,7 @@ from app import config
 from app.features.industry_features import (SW_CODE_TO_NAME, _load_map,
                                             _save_map, _map_cache,
                                             STATIC_STOCK_INDUSTRY)
+from app.config import _STATIC_TRAIN_CODES  # 静态基准池,避免自引用膨胀
 
 _POOL_PATH = os.path.join(config.DATA_DIR, "train_pool.json")
 _POOL_MIN_PER_INDUSTRY = 4   # 每行业大/中盘各取几只
@@ -45,10 +46,14 @@ def _industry_stocks(sw_code: str) -> pd.DataFrame:
     return df
 
 
-def _sample_industry(sw_code: str, per: int) -> list:
-    """每行业抽样:per//2 只大盘(权重最大) + per//2 只中盘(权重中位段)。"""
+def _filtered_df(sw_code: str) -> pd.DataFrame:
+    """某申万一级行业过滤后的成分(排除 ST/退市/非 A 股前缀)。"""
     df = _industry_stocks(sw_code)
-    df = df[df.apply(lambda r: _filter_ok(r["name"], r["code"]), axis=1)]
+    return df[df.apply(lambda r: _filter_ok(r["name"], r["code"]), axis=1)]
+
+
+def _sample_from_df(df: pd.DataFrame, per: int) -> list:
+    """每行业抽样:per//2 只大盘(权重最大) + per//2 只中盘(权重中位段)。"""
     if df.empty:
         return []
     s = df.sort_values("weight", ascending=False).reset_index(drop=True)
@@ -61,6 +66,11 @@ def _sample_industry(sw_code: str, per: int) -> list:
         step = max(1, len(mid_slice) // (per // 2))
         mid = mid_slice[::step][: per // 2]
     return large + mid
+
+
+def _sample_industry(sw_code: str, per: int) -> list:
+    """每行业抽样:per//2 只大盘(权重最大) + per//2 只中盘(权重中位段)。"""
+    return _sample_from_df(_filtered_df(sw_code), per)
 
 
 def build_train_pool(per: int = None, max_total: int = None, use_cache: bool = True):
@@ -79,8 +89,12 @@ def build_train_pool(per: int = None, max_total: int = None, use_cache: bool = T
     _load_map()
     for sw_code, ind_name in SW_CODE_TO_NAME.items():
         try:
-            picked = _sample_industry(sw_code, per)
-            print(f"  [池] {ind_name}({sw_code}): {len(picked)} 只")
+            df = _filtered_df(sw_code)
+            # 全量成分写入反查映射(任意 A 股代码即可本地命中行业,无需网络解析)
+            for c in df["code"]:
+                _map_cache.setdefault(c, sw_code)
+            picked = _sample_from_df(df, per)
+            print(f"  [池] {ind_name}({sw_code}): 成分 {len(df)} / 抽样 {len(picked)} 只")
         except Exception as e:  # noqa: BLE001
             print(f"  [池] {ind_name}({sw_code}) 失败: {e}")
             continue
@@ -91,8 +105,8 @@ def build_train_pool(per: int = None, max_total: int = None, use_cache: bool = T
                 _map_cache[c] = sw_code
 
     codes = codes[:max_total]
-    # 保留原有样本池(保证与历史实验可比的股票也在内),行业映射用静态表兜底
-    for c in config.TRAIN_STOCK_CODES:
+    # 保留静态基准池(保证与历史实验可比的股票也在内),行业映射用静态表兜底
+    for c in _STATIC_TRAIN_CODES:
         if c not in codes:
             codes.append(c)
             industry[c] = STATIC_STOCK_INDUSTRY.get(c)
