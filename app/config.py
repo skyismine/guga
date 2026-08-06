@@ -88,6 +88,15 @@ def _load_expanded_codes():
 TRAIN_STOCK_CODES = _load_expanded_codes() or _STATIC_TRAIN_CODES
 TRAIN_YEARS_BACK = 3       # 取最近 N 年历史作为训练数据
 
+# 月度重训调度:固定月度频率,持续适配市场风格变化
+# 与 trainer.py 的 walk-forward 训练逻辑直接对接(train_all)。
+RETRAIN_ENABLED = True              # 是否启用自动重训
+RETRAIN_INTERVAL_DAYS = 30          # 固定月度:距上次重训满 N 天即触发(默认近似自然月)
+RETRAIN_DAY_OF_MONTH = 0            # >0 时按"每月 X 日"触发,0 表示用间隔天数模式
+RETRAIN_CHECK_SECONDS = 3600        # daemon 检查周期(秒)
+RETRAIN_WEB_AUTO = True             # Web 启动时是否自动启动重训 daemon
+RETRAIN_LOG = os.path.join(DATA_DIR, "retrain.log")
+
 # 模型
 MODEL_NAME = "gbm_3class"
 MIN_TRAIN_SAMPLES = 500    # 训练样本下限,不足则无法训练

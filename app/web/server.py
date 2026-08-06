@@ -400,7 +400,23 @@ def api_signals():
     })
 
 
+@app.route("/api/retrain", methods=["POST"])
+def api_retrain():
+    """手动触发月度重训(force=1 强制)。POST /api/retrain?force=1"""
+    from app.scheduler import retrain_if_due
+    try:
+        res = retrain_if_due(force=request.args.get("force") == "1", verbose=False)
+        return jsonify({"retrained": res["retrained"], "reason": res.get("reason"),
+                        "summary": res.get("summary") or None})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+
 def main():
+    if getattr(config, "RETRAIN_WEB_AUTO", True):
+        from app.scheduler import start_daemon
+        start_daemon(verbose=True)
+        print("  月度重训 daemon 已启动(按固定月度频率自动适配市场风格)\n")
     host = os.environ.get("GUGA_HOST", "127.0.0.1")
     port = int(os.environ.get("GUGA_PORT", "8000"))
     print(f"\n  量化预测仪表盘: http://{host}:{port}\n")
