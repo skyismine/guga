@@ -53,6 +53,11 @@ STATIC_STOCK_INDUSTRY = {
     "300124": "801730", "002230": "801750",
 }
 
+# 仅对这些前缀的 A 股代码尝试解析行业(覆盖沪深主板/中小/创业/科创)。
+# 其他代码(5xxxxx ETF、1xxxxx 基金、200/900 B股、指数等)无申万一级行业,
+# 直接返回 None,不发起 eastmoney 请求(避免网络/代理错误刷屏)。
+_A_STOCK_PREFIXES = ("60", "68", "00", "30")
+
 _IND_HIST_DIR = os.path.join(config.DATA_DIR, "industry")
 _MAP_PATH = os.path.join(config.DATA_DIR, "industry_code_map.json")
 _map_cache = {}
@@ -61,6 +66,8 @@ _map_cache = {}
 def get_industry_sw(code: str):
     """返回股票对应的申万一级行业代码(或 None)。本地缓存 + 静态表优先。"""
     code = str(code).zfill(6)
+    if not code.startswith(_A_STOCK_PREFIXES):
+        return None
     if code in STATIC_STOCK_INDUSTRY:
         return STATIC_STOCK_INDUSTRY[code]
     if not _map_cache:
