@@ -91,7 +91,17 @@ TRAIN_YEARS_BACK = 3       # 取最近 N 年历史作为训练数据
 # 模型
 MODEL_NAME = "gbm_3class"
 MIN_TRAIN_SAMPLES = 500    # 训练样本下限,不足则无法训练
-TEST_RATIO = 0.2           # 按时间切分的验证集比例
+TEST_RATIO = 0.2           # 按时间切分的验证集比例(single_split 模式)
+
+# 训练验证方式:walk_forward(时间序列滚动前视) | single_split(单次时间切分)
+# walk-forward:把时间轴切为 WF_K_FOLDS 段,前 WF_INITIAL_FOLDS 段作初始训练,
+# 其后每段作为一次测试折(训练集随测试段推进而扩展/滚动),全部无前视,
+# 逐折报告指标并取最后一折(最新时段)模型部署,更贴合实盘连续预测。
+TRAIN_MODE = "walk_forward"
+WF_K_FOLDS = 4              # 时间切分数(>=3,测试折数 = K - INITIAL_FOLDS)
+WF_INITIAL_FOLDS = 1        # 初始训练占用的最早段数(保证首折训练样本充足)
+WF_FIXED_WINDOW_DAYS = 0    # >0 训练用固定滚动窗口(交易日),0=expand 使用全部历史
+WF_MIN_TEST_DAYS = 20       # 每折测试段最少交易日数,不足则跳过该折
 
 # 特征筛选(相关性去冗余 + 重要性 Top-N)
 FEATURE_SELECT = True               # 训练时是否使用筛选后的特征子集

@@ -67,18 +67,20 @@ def _exp_return_from_proba(proba: pd.DataFrame, class_avg_returns: dict) -> pd.S
     return ret
 
 
-def rank_backtest(codes=None, top_n: int = None, train_ratio: float = None) -> dict:
-    """walk-forward 排序回测:前段训练,后段每个交易日对池内股票按"预期收益"排序,
-    统计 top-N 的"未来 horizon 日实际收益",并与全池均值(随机基准)对比。
-    无前视:特征只用当日及历史,模型只在训练段上训练,收益为未来真实收益。
+def rank_backtest(codes=None, top_n: int = None, k_folds: int = None) -> dict:
+    """walk-forward 排序回测:把时间轴切为多段,前段初始训练、其后每段逐一测试;
+    每折用"该测试折之前全部历史"训练(无前视),对池内股票按预期收益排序,
+    统计 top-N / 末位 / 全池的"未来 horizon 日实际收益",跨折汇总。
+    与训练验证口径一致,结果比单次切分更贴合实盘连续预测。
     """
     from lightgbm import LGBMClassifier
 
-    from app.ml.dataset import build_dataset, time_split
+    from app.ml.dataset import build_dataset
+    from app.ml.trainer import (_class_avg_returns, _model_params,
+                                _walk_forward_splits)
 
     codes = codes or config.TRAIN_STOCK_CODES
     top_n = top_n or config.RANK_TOP_N
-    train_ratio = train_ratio or (1 - config.TEST_RATIO)
     horizon = config.PREDICT_HORIZON
 
     hist = {c: get_daily_history(c, days=config.HIST_DAYS, adjust="qfq") for c in codes}
@@ -91,49 +93,60 @@ def rank_backtest(codes=None, top_n: int = None, train_ratio: float = None) -> d
     from app.features.standardize import standardize_dataset
     data = standardize_dataset(data, feature_names)
     data = data.dropna(subset=feature_names)
-    train_df, test_df, split_date = time_split(data)
 
-    X_tr, y_tr = train_df[feature_names].values, train_df["label"].values
-    model = LGBMClassifier(n_estimators=400, learning_rate=0.04,
-                           max_depth=3, num_leaves=8, reg_lambda=1.0,
-                           min_child_samples=50, subsample=0.8,
-                           colsample_bytree=0.8, verbosity=-1, random_state=42)
-    model.fit(X_tr, y_tr)
+    k = k_folds or int(getattr(config, "WF_K_FOLDS", 4))
+    init = max(1, min(k - 2, int(getattr(config, "WF_INITIAL_FOLDS", 1))))
+    window = int(getattr(config, "WF_FIXED_WINDOW_DAYS", 0))
+    splits = _walk_forward_splits(data, k, init, window)
+    if not splits:
+        raise RuntimeError("rank_backtest: 无可评估折(时间窗过短)")
 
-    # 训练段各类别平均未来收益(预期收益的定价基础)
     fwd_cache = {c: df["close"].shift(-horizon) / df["close"] - 1
                  for c, df in hist.items()}
-    tmp = train_df.copy()
-    tmp["_fwd"] = [fwd_cache[c].get(d, np.nan) for c, d in zip(tmp["code"], tmp.index)]
-    class_avg = tmp.groupby("label")["_fwd"].mean()
-    class_avg_returns = {int(k): round(float(v), 5) for k, v in class_avg.items()}
 
-    # 测试段逐日排序
-    proba = model.predict_proba(test_df[feature_names].values)
-    pcols = {c: i for i, c in enumerate(model.classes_)}
-    test_df = test_df.copy()
-    test_df["_exp"] = sum(proba[:, pcols[k]] * v for k, v in class_avg_returns.items()
-                          if k in pcols)
-
-    dates = sorted(test_df.index.unique())
     rows = []
-    for d in dates:
-        sub = test_df[test_df.index == d]
-        if len(sub) < top_n:
-            continue
-        ranked = sub.sort_values("_exp", ascending=False)
-        top_codes = list(ranked["code"].head(top_n))
-        bot_codes = list(ranked["code"].tail(top_n))
-        top_fwd = np.mean([fwd_cache[c].get(d, np.nan) for c in top_codes])
-        bot_fwd = np.mean([fwd_cache[c].get(d, np.nan) for c in bot_codes])
-        pool_fwd = np.mean([fwd_cache[c].get(d, np.nan) for c in sub["code"]])
-        rows.append({"date": d, "top_fwd": top_fwd, "bot_fwd": bot_fwd,
-                     "pool_fwd": pool_fwd})
-    df = pd.DataFrame(rows).set_index("date").dropna()
+    fold_summaries = []
+    for i, (tr_df, te_df, ts, te) in enumerate(splits, 1):
+        model = LGBMClassifier(**_model_params())
+        model.fit(tr_df[feature_names].values, tr_df["label"].values)
+        avg = _class_avg_returns(tr_df, hist, horizon)
+        proba = model.predict_proba(te_df[feature_names].values)
+        pcols = {c: j for j, c in enumerate(model.classes_)}
+        te_df = te_df.copy()
+        te_df["_exp"] = sum(proba[:, pcols[k]] * v
+                            for k, v in avg.items() if k in pcols)
 
+        fold_rows = []
+        for d in sorted(te_df.index.unique()):
+            sub = te_df[te_df.index == d]
+            if len(sub) < top_n:
+                continue
+            ranked = sub.sort_values("_exp", ascending=False)
+            top_codes = list(ranked["code"].head(top_n))
+            bot_codes = list(ranked["code"].tail(top_n))
+            top_fwd = np.mean([fwd_cache[c].get(d, np.nan) for c in top_codes])
+            bot_fwd = np.mean([fwd_cache[c].get(d, np.nan) for c in bot_codes])
+            pool_fwd = np.mean([fwd_cache[c].get(d, np.nan) for c in sub["code"]])
+            rows.append({"date": d, "top_fwd": top_fwd, "bot_fwd": bot_fwd,
+                         "pool_fwd": pool_fwd, "fold": i})
+            fold_rows.append({"top_fwd": top_fwd, "bot_fwd": bot_fwd,
+                              "pool_fwd": pool_fwd})
+        if fold_rows:
+            fr = pd.DataFrame(fold_rows)
+            fold_summaries.append({
+                "fold": i,
+                "period": f"{pd.Timestamp(ts).date()} ~ {pd.Timestamp(te).date()}",
+                "days": int(len(fr)),
+                "top_fwd_mean": round(float(fr["top_fwd"].mean()), 4),
+                "bottom_fwd_mean": round(float(fr["bot_fwd"].mean()), 4),
+                "pool_fwd_mean": round(float(fr["pool_fwd"].mean()), 4),
+                "top_win_vs_pool": round(float((fr["top_fwd"] > fr["pool_fwd"]).mean()), 4),
+            })
+
+    df = pd.DataFrame(rows).set_index("date").dropna()
     summary = {
         "pool": codes,
-        "split_date": str(pd.Timestamp(split_date).date()),
+        "split_date": str(pd.Timestamp(splits[-1][2]).date()),
         "period": f"{df.index[0].date()} ~ {df.index[-1].date()}" if len(df) else "-",
         "days": len(df),
         "top_n": top_n,
@@ -142,7 +155,9 @@ def rank_backtest(codes=None, top_n: int = None, train_ratio: float = None) -> d
         "pool_fwd_mean": round(float(df["pool_fwd"].mean()), 4),
         "top_hit_rate": round(float((df["top_fwd"] > 0).mean()), 4),
         "top_win_vs_pool": round(float((df["top_fwd"] > df["pool_fwd"]).mean()), 4),
-        "class_avg_returns": class_avg_returns,
+        "validation": {"method": "walk_forward", "k_folds": len(splits),
+                       "folds": fold_summaries},
+        "class_avg_returns": avg,
         "daily": df,
     }
     return summary
@@ -154,8 +169,13 @@ if __name__ == "__main__":
     if mode == "bt":
         s = rank_backtest()
         tn = s["top_n"]
-        print(f"\n[排序回测] 池 {len(s['pool'])} 只,top_n={tn}, "
-              f"切分 {s['split_date']}, 周期 {s['period']} ({s['days']} 交易日)")
+        v = s["validation"]
+        print(f"\n[排序回测] 池 {len(s['pool'])} 只,top_n={tn},Walk-Forward {v['k_folds']} 折,"
+              f" 周期 {s['period']} ({s['days']} 交易日)")
+        for f in v["folds"]:
+            print(f"  折{f['fold']} {f['period']} ({f['days']}日): "
+                  f"Top{tn} {f['top_fwd_mean']:.2%} | 全池 {f['pool_fwd_mean']:.2%} | "
+                  f"末位 {f['bottom_fwd_mean']:.2%} | 跑赢 {f['top_win_vs_pool']:.1%}")
         print(f"[排序回测] Top{tn} 未来{config.PREDICT_HORIZON}日均收益 {s['top_fwd_mean']:.2%}"
               f" | 全池均值 {s['pool_fwd_mean']:.2%} | 末位 {s['bottom_fwd_mean']:.2%}")
         print(f"[排序回测] Top{tn} 正向占比 {s['top_hit_rate']:.1%}, "
