@@ -35,10 +35,17 @@ class Predictor:
         return True
 
     # ------------------------------------------------------------ 预测
+    _MISSING_WARNED = set()
+
     def _align(self, features: pd.DataFrame) -> np.ndarray:
+        """对齐模型特征;缺失列(如无行业标的)补中性 0,防御性避免推理失败。"""
         missing = [c for c in self.feature_names if c not in features.columns]
         if missing:
-            raise ValueError(f"特征缺失: {missing}")
+            for c in missing:
+                if c not in self._MISSING_WARNED:
+                    print(f"[predictor] 特征缺失补 0: {c}")
+                    self._MISSING_WARNED.add(c)
+                features[c] = 0.0
         return features[self.feature_names].values
 
     def predict_proba(self, features: pd.DataFrame) -> pd.DataFrame:

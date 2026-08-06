@@ -215,6 +215,11 @@ def prepare_features(df: pd.DataFrame, code: str = None) -> pd.DataFrame:
         for h in (1, 5, 20):
             features[f"alpha_{h}"] = features[f"ret_{h}"] - ind_raw[f"ind_ret_{h}"]
         features["alpha_trend"] = features["close_ma20"] - ind_raw["ind_ma20_gap"]
+    else:
+        # 无行业标的(ETF/指数/解析失败):行业 beta 与相对行业 alpha 取中性 0
+        for col in ("ind_ret_1", "ind_ret_5", "ind_ret_20", "ind_ma20_gap",
+                    "ind_vol20", "alpha_1", "alpha_5", "alpha_20", "alpha_trend"):
+            features[col] = 0.0
     return standardize_stock_frame(features)
 
 
