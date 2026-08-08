@@ -183,27 +183,57 @@ def _zt_pool(date=None, refresh=False) -> list:
 
 
 def _news_mentions() -> dict:
-    """财联社电报中命中概念名的次数(当日缓存)。"""
+    """财联社电报中命中概念名的次数(当日缓存)。
+
+    容错设计:
+    - 财联社电报超时/失败时,降级用东财要闻(stock_info_global_em)统计;
+    - 两级来源均失败才返回空 dict;
+    - 失败不落盘空缓存,次日/下次调用自动重试;
+    - 失败原因打印日志,便于与"真无相关新闻"区分。
+    """
     path = os.path.join(config.DATA_DIR, f"news_{_today()}.json")
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8") as f:
-                return json.load(f)
+                cached = json.load(f)
+            if cached:
+                return cached
         except (OSError, ValueError):
             pass
-    def _fetch():
+
+    def _count_cls():
         import akshare as ak
         df = ak.stock_info_global_cls(symbol="全部")
-        out = {}
         text = ""
         for _, r in df.iterrows():
             text += " " + str(r.iloc[1]) + " " + str(r.iloc[2])
+        return _count_mentions(text)
+
+    def _count_em():
+        import akshare as ak
+        df = ak.stock_info_global_em()
+        text = ""
+        for _, r in df.iterrows():
+            title = str(r.get("标题", ""))
+            summary = str(r.get("摘要", ""))
+            text += " " + title + " " + summary
+        return _count_mentions(text)
+
+    def _count_mentions(text: str) -> dict:
+        out = {}
         for name in _all_concepts():
-            if text.count(_concept_kw(name)) > 0:
-                out[name] = text.count(_concept_kw(name))
+            n = text.count(_concept_kw(name))
+            if n > 0:
+                out[name] = n
         return out
 
-    out = _with_timeout(_fetch, 20, {}, name="news_cls")
+    out = _with_timeout(_count_cls, 20, None, name="news_cls")
+    if out is None:
+        print("[mainline] 财联社电报超时/失败,降级东财要闻统计 news_mentions")
+        out = _with_timeout(_count_em, 20, None, name="news_em")
+    if out is None:
+        print("[mainline] 东财要闻亦失败,news_mentions 为空(未落盘,下次自动重试)")
+        return {}
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False)
