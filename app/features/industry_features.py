@@ -1,32 +1,15 @@
-"""行业/风格特征:所属申万一级行业指数涨跌幅 + 相对行业超额收益(alpha)。
+"""申万行业映射工具(训练池分层抽样用)+ 概念特征装配(re-export)。
 
-目的:让模型区分"个股 alpha"与"行业 beta",提升跨风格/跨行业稳定性。
-新增特征(ind_* / alpha_* 前缀):
-- ind_ret_1/5/20 : 行业指数近 1/5/20 日涨跌幅(行业 beta)
-- ind_ma20_gap   : 行业指数相对其 MA20 的位置(行业趋势)
-- ind_vol20      : 行业指数 20 日波动率(行业风险)
-- alpha_1/5/20   : 个股涨跌幅 - 行业涨跌幅(相对超额收益/alpha)
-- alpha_trend    : (个股相对其MA20) - (行业相对其MA20)(相对行业动能)
-
-设计原则:
-- 行业指数用申万一级(sina 源,index_hist_sw),历史长且稳定;
-- 个股->行业映射:样本池静态表优先,任意代码动态解析兜底,均本地缓存;
-- 全部为"当日及历史"信息,无前视;解析失败/ETF 等无行业标的的行业特征为 NaN,
-  LightGBM 原生处理缺失。
+特征层数据源已由申万行业指数切换为同花顺概念指数(见 concept_features),
+本模块仅保留供训练池构建使用的申万映射工具,并把对外特征装配接口
+prepare_features / attach_industry_features 转发到概念实现,调用方无感。
 """
+import json
 import os
-import pickle
-import time
-
-import numpy as np
-import pandas as pd
 
 from app import config
-from app.features.indicators import compute_features
-from app.features.market_features import attach_market_features
-from app.features.standardize import zscore_frame, standardize_stock_frame
 
-# 申万一级行业名称 <-> 代码(固定集合)
+# 申万一级行业名称 <-> 代码(固定集合,训练池分层抽样用)
 SW_CODE_TO_NAME = {
     "801010": "农林牧渔", "801030": "基础化工", "801040": "钢铁",
     "801050": "有色金属", "801080": "电子", "801110": "家用电器",
@@ -42,7 +25,6 @@ SW_CODE_TO_NAME = {
 }
 SW_NAME_TO_CODE = {v: k for k, v in SW_CODE_TO_NAME.items()}
 
-# 样本池静态映射:股票代码 -> 申万一级行业代码(训练/回测池,避免逐只动态解析)
 STATIC_STOCK_INDUSTRY = {
     "600519": "801120", "601318": "801790", "600036": "801780",
     "601899": "801050", "600030": "801790", "600900": "801160",
@@ -53,12 +35,7 @@ STATIC_STOCK_INDUSTRY = {
     "300124": "801730", "002230": "801750",
 }
 
-# 仅对这些前缀的 A 股代码尝试解析行业(覆盖沪深主板/中小/创业/科创)。
-# 其他代码(5xxxxx ETF、1xxxxx 基金、200/900 B股、指数等)无申万一级行业,
-# 直接返回 None,不发起 eastmoney 请求(避免网络/代理错误刷屏)。
 _A_STOCK_PREFIXES = ("60", "68", "00", "30")
-
-_IND_HIST_DIR = os.path.join(config.DATA_DIR, "industry")
 _MAP_PATH = os.path.join(config.DATA_DIR, "industry_code_map.json")
 _map_cache = {}
 _FAIL_WARNED = set()
@@ -81,12 +58,10 @@ def get_industry_sw(code: str):
 def _load_map():
     global _map_cache
     try:
-        import json
         with open(_MAP_PATH, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         data = {}
-    # 原地更新而非重新绑定,保证 import 处持有的 _map_cache 引用始终为同一对象
     _map_cache.clear()
     _map_cache.update(data)
 
@@ -94,7 +69,6 @@ def _load_map():
 def _save_map():
     global _map_cache
     try:
-        import json
         os.makedirs(os.path.dirname(_MAP_PATH), exist_ok=True)
         with open(_MAP_PATH, "w", encoding="utf-8") as f:
             json.dump(_map_cache, f, ensure_ascii=False, indent=2)
@@ -103,7 +77,7 @@ def _save_map():
 
 
 def _resolve_dynamic(code: str):
-    """动态解析个股行业(akshare,失败返回 None)。失败不写缓存,避免污染映射。"""
+    """动态解析个股申万行业(akshare,失败返回 None)。失败不写缓存。"""
     sw = None
     try:
         import akshare as ak
@@ -130,108 +104,17 @@ def _resolve_dynamic(code: str):
     return sw
 
 
-def prefetch_industry_indices(sleep: float = 1.5) -> None:
-    """预取全部申万一级行业指数收盘序列到本地缓存(避免训练时连续拉取被限流)。"""
-    from app import config as _cfg
-    os.makedirs(_IND_HIST_DIR, exist_ok=True)
-    for sw in SW_CODE_TO_NAME:
-        path = os.path.join(_IND_HIST_DIR, f"{sw}.pkl")
-        if os.path.exists(path) and time.time() - os.path.getmtime(path) <= _cfg.CACHE_TTL_SECONDS:
-            continue
-        try:
-            _get_sw_index_close(sw)
-            print(f"  [行业] {SW_CODE_TO_NAME[sw]}({sw}) 已缓存")
-        except Exception as e:  # noqa: BLE001
-            print(f"  [行业] {SW_CODE_TO_NAME[sw]}({sw}) 失败: {e}")
-        time.sleep(sleep)
-
-
-def _get_sw_index_close(sw_code: str) -> pd.Series:
-    """申万一级行业指数日收盘序列(本地缓存 TTL)。"""
-    os.makedirs(_IND_HIST_DIR, exist_ok=True)
-    path = os.path.join(_IND_HIST_DIR, f"{sw_code}.pkl")
-    if os.path.exists(path) and time.time() - os.path.getmtime(path) <= config.CACHE_TTL_SECONDS:
-        try:
-            with open(path, "rb") as f:
-                return pickle.load(f)
-        except Exception:
-            pass
-    import akshare as ak
-    df = ak.index_hist_sw(symbol=sw_code, period="day")
-    close = df.set_index("日期")["收盘"].astype(float).sort_index()
-    with open(path, "wb") as f:
-        pickle.dump(close, f)
-    return close
-
-
-def _industry_frame_for(sw_code: str, index: pd.DatetimeIndex):
-    """行业特征帧,对齐到给定交易日索引。
-
-    返回 (feat, raw):feat 为特征列(滚动 z-score 后,ind_* 供模型),raw 为原始值
-    (ind_ret_*/ind_ma20_gap 供计算 alpha 超额收益,需与个股收益同尺度)。
-    """
-    close = _get_sw_index_close(sw_code)
-    ret1 = close.pct_change()
-    raw = pd.DataFrame(index=close.index)
-    raw["ind_ret_1"] = ret1
-    raw["ind_ret_5"] = close.pct_change(5)
-    raw["ind_ret_20"] = close.pct_change(20)
-    raw["ind_ma20_gap"] = close / close.rolling(20).mean() - 1
-    raw["ind_vol20"] = ret1.rolling(20).std()
-    if config.STANDARDIZE_ROLLING:
-        feat = zscore_frame(raw)
-    else:
-        feat = raw
-    return feat.reindex(index).ffill(), raw.reindex(index).ffill()
-
-
-def attach_industry_features(data: pd.DataFrame) -> pd.DataFrame:
-    """把行业特征按 (code, date) 对齐并入数据集(训练路径,data 含 code 列)。"""
-    if "code" not in data.columns:
-        return data
-    out = data.copy()
-    for code in out["code"].unique():
-        sw = get_industry_sw(code)
-        if sw is None:
-            continue
-        mask = out["code"] == code
-        idx = out.index[mask]
-        ind, ind_raw = _industry_frame_for(sw, pd.DatetimeIndex(idx))
-        for col in ind.columns:
-            out.loc[mask, col] = ind[col].values
-        for h in (1, 5, 20):
-            out.loc[mask, f"alpha_{h}"] = out.loc[mask, f"ret_{h}"].values - ind_raw[f"ind_ret_{h}"].values
-        out.loc[mask, "alpha_trend"] = out.loc[mask, "close_ma20"].values - ind_raw["ind_ma20_gap"].values
-    return out
-
-
-def prepare_features(df: pd.DataFrame, code: str = None) -> pd.DataFrame:
-    """统一特征装配:个股技术特征 + 市场级特征 + 行业特征(推断/回测路径)。
-
-    标准化口径:market_*/ind_* 在源端滚动 z-score;个股特征与 alpha_* 最后按股票滚动 z-score。
-    """
-    code = str(code).zfill(6) if code else (getattr(df, "name", None) or None)
-    features = attach_market_features(compute_features(df))
-    sw = get_industry_sw(code) if code else None
-    if sw:
-        ind, ind_raw = _industry_frame_for(sw, features.index)
-        features = features.join(ind, how="left")
-        for h in (1, 5, 20):
-            features[f"alpha_{h}"] = features[f"ret_{h}"] - ind_raw[f"ind_ret_{h}"]
-        features["alpha_trend"] = features["close_ma20"] - ind_raw["ind_ma20_gap"]
-    else:
-        # 无行业标的(ETF/指数/解析失败):行业 beta 与相对行业 alpha 取中性 0
-        for col in ("ind_ret_1", "ind_ret_5", "ind_ret_20", "ind_ma20_gap",
-                    "ind_vol20", "alpha_1", "alpha_5", "alpha_20", "alpha_trend"):
-            features[col] = 0.0
-    return standardize_stock_frame(features)
+# 特征装配接口:转发到概念实现(同花顺概念指数)
+from app.features.concept_features import (  # noqa: E402,F401
+    attach_industry_features,
+    get_concepts,
+    main_concept_sw,
+    prefetch_concepts as prefetch_industry_indices,
+    prepare_features,
+)
 
 
 if __name__ == "__main__":
     for c in ("600519", "300750", "000001"):
         sw = get_industry_sw(c)
         print(f"{c} -> {sw}({SW_CODE_TO_NAME.get(sw, '?')})")
-    df = prepare_features(__import__("app.data.fetcher", fromlist=["get_daily_history"])
-                          .get_daily_history("600519", days=650, adjust="qfq"), "600519")
-    print("行业特征列:", [c for c in df.columns if c.startswith(("ind_", "alpha_"))])
-    print(df[["ind_ret_20", "alpha_20", "ind_ma20_gap"]].tail(3).round(4).to_string())
