@@ -54,6 +54,9 @@ DEFAULTS = {
     },
     # ---- 决策执行引擎(模块:今日决策)
     "decision": {
+        # 决策输入参数(可在系统设置中修改)
+        "total_asset": 1000000.0,   # 总资金(元),执行计划的仓位/股数计算基准
+        "taste": "balanced",        # 风险偏好: conservative | balanced | aggressive
         # 第一层 大盘开仓许可评级(任一不满足即降级,取最低评级)
         "market": {
             "score_full": 70.0, "zt_full": 80, "adv_ratio_full": 1.5,   # A级条件
@@ -77,6 +80,15 @@ DEFAULTS = {
         "batch": {"first": 0.60, "second": 0.40},
         # 大盘打分成交额满分基准(亿元)
         "min_amount_yi": 10000.0,
+    },
+    # ---- 大模型文案(可选接入,OpenAI 兼容接口)
+    "llm": {
+        "enable": False,             # 总开关:关闭时报告用规则话术兜底
+        "base_url": "https://api.openai.com/v1",
+        "api_key": "",               # 密钥(仅本地保存,不出网)
+        "model": "gpt-4o-mini",
+        "timeout": 60,               # 请求超时(秒)
+        "max_tokens": 1500,          # 生成长度上限
     },
     # ---- 合规话术(固定,不可编辑)
     "disclaimer": "以上内容为辅助决策参考,不构成投资建议。股市有风险,入市需谨慎。",

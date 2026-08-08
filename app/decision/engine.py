@@ -358,9 +358,10 @@ def execution_plan(target: dict, total_asset: float, taste: str,
 
 # ---------------------------------------------------------------- 聚合
 def decision_brief(total_asset: float = None, taste: str = None) -> dict:
-    """四层聚合,输出完整决策包。"""
-    total_asset = total_asset or float(getattr(config, "DECISION_TOTAL_ASSET", 1000000) or 1000000)
-    taste = taste or getattr(config, "DECISION_RISK_TASTE", "balanced")
+    """四层聚合,输出完整决策包。默认参数取自 settings.decision(可配置)。"""
+    dcfg = _cfg()
+    total_asset = total_asset or float(dcfg.get("total_asset", 1000000) or 1000000)
+    taste = taste or dcfg.get("taste", "balanced")
 
     p1 = market_permit()
     p2 = mainline_select()

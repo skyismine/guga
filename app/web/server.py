@@ -36,8 +36,8 @@ from markupsafe import Markup as _Markup
 
 _SIDE_MENU = [("/decision", "decision", "🎯 今日决策"),
               ("/analyze", "home", "📈 走势预测"), ("/signals", "signals", "📋 今日信号单"),
-              ("/review", "review", "📝 每日复盘"), ("/mainline", "mainline", "🔥 主线板块"),
-              ("/portfolio", "portfolio", "💼 持仓诊断"), ("/report", "report", "📄 复盘报告"),
+              ("/report", "report", "📄 复盘报告"), ("/mainline", "mainline", "🔥 主线板块"),
+              ("/portfolio", "portfolio", "💼 持仓诊断"),
               ("/alerts", "alerts", "🚨 盘中预警"), ("/settings", "settings", "⚙️ 系统设置")]
 
 
@@ -188,6 +188,11 @@ def _shell(active: str, title: str, content: str) -> str:
   input, select, textarea { padding:8px 12px; border-radius:8px; border:1px solid var(--line); background:#0b1018; color:var(--txt); font-size:14px; margin:2px 0; }
   .footer { color:var(--mut); font-size:12px; margin-top:16px; line-height:1.8; }
   .tag { display:inline-block; padding:2px 8px; border-radius:6px; background:#22304a; color:#7aa2ff; font-size:12px; margin-right:6px; }
+  .toast { position:fixed; top:18px; left:50%; transform:translateX(-50%); z-index:999; display:none;
+           padding:11px 22px; border-radius:10px; font-size:14px; font-weight:600;
+           background:#1a2130; border:1px solid var(--line); box-shadow:0 6px 24px rgba(0,0,0,.45); }
+  .toast.ok { color:#26a69a; border-color:#26a69a66; }
+  .toast.err { color:#ef5350; border-color:#ef535066; }
   @media(max-width:900px){ .grid,.grid3{grid-template-columns:1fr;} }
 </style>
 </head>
@@ -907,7 +912,7 @@ def page_decision():
         '<a class="btn gray" href="/signals">📋 今日信号单</a> '
         '<a class="btn gray" href="/mainline">🔥 主线板块</a> '
         '<a class="btn gray" href="/portfolio">💼 持仓诊断</a> '
-        '<a class="btn gray" href="/review">📝 每日复盘</a> '
+        '<a class="btn gray" href="/report">📄 复盘报告</a> '
         '<a class="btn gray" href="/alerts">🚨 盘中预警</a></div></div>',
         '<div class="footer">决策引擎由四层漏斗自动收敛:市场许可 → 主线遴选 → 标的匹配 → 执行参数。仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
@@ -954,15 +959,8 @@ def _jsonable_review(data: dict) -> dict:
 
 @app.route("/review")
 def review():
-    date = (request.args.get("date") or "").strip() or None
-    c = _get_review(date)
-    if c["err"]:
-        return render_template_string(PAGE_REVIEW, date="-", sections=None,
-                                      tables={}, error=f"复盘生成失败: {c['err']}", SIDE=_SIDE("review"))
-    d = c["data"]
-    return render_template_string(PAGE_REVIEW, date=d.get("date"),
-                                  sections=d.get("sections"),
-                                  tables=d.get("tables") or {}, error=None, SIDE=_SIDE("review"))
+    """每日复盘已合并进复盘报告,统一跳转到 /report。"""
+    return redirect("/report", code=302)
 
 
 @app.route("/api/review")
@@ -1283,13 +1281,35 @@ def _start_auto_report(interval_sec: int = 60) -> None:
 
 @app.route("/report")
 def page_report():
+    err = request.args.get("err")
+    if err:
+        date = _REPORT_HTML["date"] or "暂无"
+        content = [
+            f'<header><h1>📄 每日深度复盘报告</h1>'
+            f'<span class="mut">AI 深度复盘文案 · 生成时间 {_h(date)}</span></header>',
+            f'<div class="card"><h3 style="color:#e74c3c">❌ 生成失败</h3>'
+            f'<div class="line">{_h(err)}</div></div>',
+            '<div class="footer">报告内容仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
+        ]
+        return _shell("report", "复盘报告", "\n".join(content))
+    # 无缓存时自动生成一次(避免首次进入只见占位提示)
+    if not _REPORT_HTML["html"]:
+        try:
+            from app.support import daily_report as _rep
+            _set_report(_rep.generate(use_cache=True, save=False))
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
     html = _REPORT_HTML["html"]
     date = _REPORT_HTML["date"] or "暂无"
+    err_card = ""
+    if err and not html:
+        err_card = f'<div class="card"><h3 style="color:#e74c3c">❌ 自动生成失败</h3><div class="line">{_h(err)}</div></div>'
     content = [
-        f"<header><h1>📄 每日量化复盘报告</h1>"
-        f'<span class="mut">五大模块自动聚合 · 生成时间 {_h(date)}</span>'
+        f'<header><h1>📄 每日深度复盘报告</h1>'
+        f'<span class="mut">AI 深度复盘文案 · 生成时间 {_h(date)}</span>'
         f'<form method="post" action="/api/report/generate" style="display:inline"><button class="btn">🔄 生成/刷新</button></form></header>',
-        html or '<div class="card"><h3>尚未生成报告</h3><div class="line">点击「生成/刷新」将聚合大盘复盘 / 主线板块 / 持仓诊断 / 风控校验,结果直接显示在本页(不保存文件)。</div></div>',
+        err_card,
+        html or '<div class="card"><h3>尚未生成报告</h3><div class="line">点击「生成/刷新」将把当日盘面核心数据交给大模型 API,生成专业深度复盘文案并直接显示在本页(不保存文件)。</div></div>',
         '<div class="footer">报告内容仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
     return _shell("report", "复盘报告", "\n".join(content))
@@ -1297,13 +1317,15 @@ def page_report():
 
 @app.route("/api/report/generate", methods=["POST"])
 def api_report_generate():
+    """生成复盘并重定向回报告页直接展示(失败带错误提示)。"""
+    from urllib.parse import quote as _q
     from app.support import daily_report as rep
     try:
         res = rep.generate(use_cache=True, save=False)
         _set_report(res)
-        return jsonify({"ok": True, "date": res["date"]})
+        return redirect("/report", code=303)
     except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)}), 500
+        return redirect(f"/report?err={_q(str(e)[:100])}", code=303)
 
 
 @app.route("/api/report")
@@ -1413,6 +1435,10 @@ _SETTING_FIELDS = [
         ("risk.add_increase_cap", "单次加仓上限比例", "number", 0.1, 2, "不超过现有仓位的比例"),
         ("risk.max_total_pct", "总仓位上限", "number", 0.1, 1, "极端行情的兜底上限"),
     ]),
+    ("决策输入", [
+        ("decision.total_asset", "总资金(元)", "number", 1000, 1000000000, "今日决策执行计划的仓位/股数计算基准"),
+        ("decision.taste", "风险偏好", "text", None, None, "conservative / balanced / aggressive"),
+    ]),
     ("监控预警", [
         ("monitor.enable", "启用监控总开关", "checkbox", None, None, "关闭后不会自动轮询"),
         ("monitor.refresh_sec", "轮询间隔(秒)", "number", 30, 3600, "监控检查频率"),
@@ -1428,6 +1454,14 @@ _SETTING_FIELDS = [
     ("自动报告", [
         ("auto_report_time", "自动生成时间", "text", None, None, "交易日 HH:MM,到点自动生成复盘报告"),
         ("portfolio_path", "持仓 CSV 路径", "text", None, None, "持仓文件保存位置"),
+    ]),
+    ("大模型文案", [
+        ("llm.enable", "启用大模型文案", "checkbox", None, None, "关闭时报告 AI 部分用规则话术兜底"),
+        ("llm.base_url", "接口地址 Base URL", "text", None, None, "OpenAI 兼容,如 https://api.openai.com/v1"),
+        ("llm.api_key", "API 密钥", "text", None, None, "仅保存在本地 settings.json"),
+        ("llm.model", "模型名", "text", None, None, "如 gpt-4o-mini / deepseek-chat"),
+        ("llm.timeout", "请求超时(秒)", "number", 10, 300, "接口响应超时上限"),
+        ("llm.max_tokens", "生成长度上限", "number", 200, 4000, "单次生成最大 token"),
     ]),
 ]
 
@@ -1466,11 +1500,30 @@ def page_settings():
     content = [
         "<header><h1>⚙️ 系统设置</h1>"
         '<span class="mut">阈值与规则实时生效(需保存),持久化至 data_cache/settings.json</span>'
-        '<form method="post" action="/api/settings/save" style="display:inline">'
+        '<form id="settings-form" style="display:inline">'
         f'{_render_settings_form(cfg)}'
-        '<div style="margin:8px 0"><button class="btn">💾 保存全部设置</button></div></form>'
-        '<form method="post" action="/api/settings/reset" style="display:inline">'
-        '<button class="btn red">恢复默认</button></form></header>',
+        '<div style="margin:8px 0"><button class="btn" type="submit">💾 保存全部设置</button></div></form>'
+        '<button class="btn red" onclick="doReset()">恢复默认</button></header>'
+        '<div id="toast"></div>'
+        '<script>'
+        'function showToast(msg, ok){var t=document.getElementById("toast");'
+        't.textContent=msg;t.className="toast "+(ok?"ok":"err");t.style.display="block";'
+        'clearTimeout(t._h);t._h=setTimeout(function(){t.style.display="none";},3200);}'
+        'document.getElementById("settings-form").addEventListener("submit",function(e){'
+        'e.preventDefault();var f=this,b=document.createElement("button");b.type="submit";'
+        'b.style.display="none";f.appendChild(b);'
+        'fetch("/api/settings/save",{method:"POST",body:new FormData(f)})'
+        '.then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})'
+        '.then(function(o){if(o.ok&&!o.j.error){showToast("✅ 设置已保存并生效",true);}'
+        'else{showToast("❌ 保存失败: "+(o.j&&o.j.error||o.j&&o.j.message||"未知错误"),false);}}'
+        ').catch(function(e){showToast("❌ 保存失败: "+e,false);});b.remove();});'
+        'function doReset(){if(!confirm("确定恢复默认设置?")){return;}'
+        'fetch("/api/settings/reset",{method:"POST"})'
+        '.then(function(r){return r.json();})'
+        '.then(function(j){if(!j.error){showToast("✅ 已恢复默认设置",true);setTimeout(function(){location.reload();},800);}'
+        'else{showToast("❌ 恢复失败: "+j.error,false);}})'
+        '.catch(function(e){showToast("❌ 恢复失败: "+e,false);});}'
+        '</script>',
         '<div class="footer">⚠ 风控与监控阈值建议谨慎修改。免责声明:本系统全部内容仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
     return _shell("settings", "系统设置", "\n".join(content))
@@ -1480,7 +1533,7 @@ def _flatten_form(form) -> dict:
     out = {}
     for key in form:
         val = form.get(key)
-        if key.startswith("monitor.rules."):
+        if key.startswith("monitor.rules.") or key == "llm.enable":
             val = True
         else:
             try:
@@ -1494,6 +1547,7 @@ def _flatten_form(form) -> dict:
         for p in parts[:-1]:
             node = node.setdefault(p, {})
         node[parts[-1]] = val
+    out.setdefault("llm", {}).setdefault("enable", False)
     return out
 
 
