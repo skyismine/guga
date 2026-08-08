@@ -4,6 +4,7 @@
 """
 import io
 import os
+import re as _re
 import sys
 import time as _time
 
@@ -11,11 +12,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import pandas as pd
 from flask import Flask, jsonify, render_template_string, request
+from markupsafe import Markup, escape
 
 from app.analysis import analyze, analyze_light
 from app import config
 
 app = Flask(__name__)
+
+
+def _boldify(s) -> Markup:
+    """将文本中的 **加粗** 标记渲染为 <b>,先转义防注入。"""
+    esc = escape(str(s))
+    esc = _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
+    return Markup(esc)
+
+
+app.jinja_env.filters["boldify"] = _boldify
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -69,7 +81,7 @@ PAGE = r"""<!DOCTYPE html>
   <header>
     <h1>📈 量化走势预测与操作建议</h1>
     <span class="mut">SilverQuant · Akshare · VectorBT · LightGBM</span>
-    <nav><a href="/signals">📋 今日信号单</a></nav>
+    <nav><a href="/signals">📋 今日信号单</a><a href="/review">📝 每日复盘</a></nav>
   </header>
   <form method="get" action="/">
     <input name="code" placeholder="股票代码, 如 600519" value="{{ code or '' }}" autofocus>
@@ -208,7 +220,7 @@ PAGE_SIGNALS = r"""<!DOCTYPE html>
   <header>
     <h1>📋 今日信号单</h1>
     <span class="mut">股票池按预期收益排序 · Top-{{ top_n }} 买入候选 · 末位风险提示 · {{ date }}</span>
-    <nav><a href="/">📈 走势分析</a></nav>
+    <nav><a href="/">📈 走势分析</a><a href="/review">📝 每日复盘</a></nav>
   </header>
 
   {% if error %}<div class="card err">{{ error }}</div>{% endif %}
@@ -233,6 +245,136 @@ PAGE_SIGNALS = r"""<!DOCTYPE html>
   <div class="footer">
     信号仅基于量化模型排序,不构成投资建议。股市有风险,入市需谨慎。<br>
     排名依据:预期涨跌幅 = Σ P(类) × 该类平均未来收益;盈亏比 = 期望盈利/期望亏损。
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
+PAGE_REVIEW = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>每日复盘 - 量化预测分析</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2130; --line:#2a3350; --txt:#e6e9f0; --mut:#8a94a8; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--txt); }
+  .wrap { max-width:1180px; margin:0 auto; padding:18px; }
+  header { display:flex; align-items:center; gap:12px; padding:14px 0; flex-wrap:wrap; }
+  header h1 { font-size:20px; margin:0; }
+  .mut { color:var(--mut); font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin:14px 0; }
+  .card h3 { margin:0 0 10px; font-size:15px; color:#7aa2ff; }
+  .line { font-size:14px; line-height:1.9; padding:3px 0; }
+  .line.title { font-weight:700; color:#7aa2ff; margin:16px 0 6px; font-size:15px; }
+  .line b { color:#ffca28; font-weight:700; }
+  .up{color:#ef5350;} .down{color:#26a69a;} .flat{color:#ffca28;} .mut{color:var(--mut);}
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td,th { padding:7px 10px; border-bottom:1px solid var(--line); text-align:left; }
+  th { color:#b9c2d4; font-weight:600; background:#151c2b; }
+  tr:hover td { background:#1d2638; }
+  .tbl { margin:10px 0 14px; }
+  .tbl-title { font-size:13px; color:#8a94a8; margin:10px 0 4px; font-weight:600; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .err { color:#ff6e6e; padding:12px; }
+  nav a { display:inline-block; margin-left:8px; padding:7px 14px; border-radius:8px;
+          border:1px solid var(--line); color:var(--txt); text-decoration:none; font-size:14px; }
+  nav a:hover { border-color:#2f6fed; color:#7aa2ff; }
+  .footer { color:var(--mut); font-size:12px; margin-top:16px; line-height:1.8; }
+  @media(max-width:820px){ .grid{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>📝 A股每日深度复盘</h1>
+    <span class="mut">{{ date }} · 数据来源:东财/同花顺/新浪/央视联播</span>
+    <nav><a href="/">📈 走势分析</a><a href="/signals">📋 今日信号单</a></nav>
+  </header>
+
+  {% if error %}<div class="card err">{{ error }}</div>{% endif %}
+
+  {% if sections %}
+  <div class="grid">
+    <div class="card">
+      <h3>📋 当日市场快照</h3>
+      <table>
+        <tr><th>上涨</th><td class="up">{{ tables.activity.advance }}</td><th>下跌</th><td class="down">{{ tables.activity.decline }}</td></tr>
+        <tr><th>平盘</th><td>{{ tables.activity.flat }}</td><th>活跃度</th><td>{{ tables.activity.activity_pct }}%</td></tr>
+        <tr><th>涨停</th><td class="up">{{ tables.activity.limit_up }} 家</td><th>跌停</th><td class="down">{{ tables.activity.limit_down }} 家</td></tr>
+        {% if tables.north.north_available %}
+        <tr><th>北向净买入</th><td colspan="3" class="{{ 'up' if tables.north.north_total_yi>=0 else 'down' }}">{{ '%+.2f'|format(tables.north.north_total_yi) }} 亿</td></tr>
+        {% else %}
+        <tr><th>北向</th><td colspan="3" class="mut">实时净买入已停止披露</td></tr>
+        {% endif %}
+        <tr><th>港股通(南向)</th><td colspan="3" class="{{ 'up' if tables.north.south_total_yi>=0 else 'down' }}">{{ '%+.2f'|format(tables.north.south_total_yi) }} 亿</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>🔥 短线情绪速览</h3>
+      <table>
+        <tr><th>涨停池</th><td class="up">{{ tables.limit_up.total }} 家</td><th>最高连板</th><td>{{ tables.limit_up.max_lian }} 板</td></tr>
+        <tr><th>炸板</th><td>{{ tables.limit_up.zhadan_total }} 次</td><th>封板资金</th><td>{{ tables.limit_up.total_money_yi }} 亿</td></tr>
+        <tr><th>{{ tables.limit_up.ind_label or '涨停行业分布' }}</th><td colspan="3">{% for k,v in (tables.limit_up.industries or {}).items() %}{% if v is float %}{{ k }}{{ '%.1f'|format(v) }}亿{% else %}{{ k }}{{ v }}家{% endif %}{% if not loop.last %}、{% endif %}{% endfor %}</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>📅 市场量能 · 涨跌宽度 · 大盘资金(近10个交易日)</h3>
+    <table>
+      <tr><th>日期</th><th>上证收盘</th><th>涨跌幅</th><th>两市成交额(亿)</th>
+          <th>主力净流入(亿)</th><th>上涨</th><th>下跌</th><th>涨停</th><th>跌停</th></tr>
+      {% for m in tables.market_daily | reverse %}
+      <tr>
+        <td>{{ m.date }}</td>
+        <td>{{ '%.2f'|format(m.close) if m.close is not none else '-' }}</td>
+        <td class="{{ 'up' if (m.pct_chg or 0)>=0 else 'down' }}">{{ '%+.2f'|format(m.pct_chg) if m.pct_chg is not none else '-' }}%</td>
+        <td>{{ '%.0f'|format(m.amount_yi) if m.amount_yi is not none else '-' }}</td>
+        <td class="{{ 'up' if (m.main_yi or 0)>=0 else 'down' }}">{{ '%+.2f'|format(m.main_yi) if m.main_yi is not none else '-' }}</td>
+        <td>{{ '%.0f'|format(m.advance) if m.advance is not none else '-' }}</td>
+        <td>{{ '%.0f'|format(m.decline) if m.decline is not none else '-' }}</td>
+        <td>{{ '%.0f'|format(m.limit_up) if m.limit_up is not none else '-' }}</td>
+        <td>{{ '%.0f'|format(m.limit_down) if m.limit_down is not none else '-' }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    <p class="mut">注:两市成交额与主力净流入为东财沪/深指数口径;涨停家数为东财涨停池口径;上涨/下跌/跌停家数
+      为乐咕当日口径,自每日复盘运行起自动累积补齐近10日历史。</p>
+  </div>
+
+  {% for key, sec in sections.items() %}
+  <div class="card">
+    <h3>{{ sec.title }}</h3>
+    {% for it in sec['items'] %}
+      {% if it.t is defined %}
+        <div class="line">{{ it.t | boldify }}</div>
+      {% elif it.head is defined %}
+        <div class="line title">{{ it.head }}</div>
+      {% elif it.table is defined %}
+        <div class="tbl">
+          {% if it.table.title %}<div class="tbl-title">{{ it.table.title }}</div>{% endif %}
+          <table>
+            <tr>{% for c in it.table.cols %}<th>{{ c }}</th>{% endfor %}</tr>
+            {% for row in it.table.rows %}
+            <tr>{% for cell in row %}
+              {% if cell is mapping %}<td class="{{ cell.c }}">{{ cell.v | boldify }}</td>
+              {% else %}<td>{{ cell | boldify }}</td>{% endif %}
+            {% endfor %}</tr>
+            {% endfor %}
+          </table>
+        </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+  {% endfor %}
+  {% endif %}
+
+  <div class="footer">
+    复盘内容由规则引擎基于当日行情/资金/事件数据自动生成,仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。
   </div>
 </div>
 </body>
@@ -410,6 +552,59 @@ def api_retrain():
                         "summary": res.get("summary") or None})
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 500
+
+
+# ---- 每日复盘 ----
+_REVIEW_CACHE = {"t": 0.0, "data": None, "err": None}
+_REVIEW_TTL = 600  # 秒
+
+
+def _get_review(date: str = None) -> dict:
+    from app.review import collect_review, generate_review
+    if (_REVIEW_CACHE["data"] is None
+            or _REVIEW_CACHE["err"] is not None
+            or _time.time() - _REVIEW_CACHE["t"] > _REVIEW_TTL):
+        try:
+            d = collect_review(date=date, use_cache=True)
+            r = generate_review(d)
+            _REVIEW_CACHE["data"] = {"date": d.get("date"), **r}
+            _REVIEW_CACHE["err"] = None
+        except Exception as e:  # noqa: BLE001
+            _REVIEW_CACHE["data"] = None
+            _REVIEW_CACHE["err"] = str(e)
+        _REVIEW_CACHE["t"] = _time.time()
+    return _REVIEW_CACHE
+
+
+def _jsonable_review(data: dict) -> dict:
+    return {
+        "date": data.get("date"),
+        "sections": {k: {"title": v["title"], "lines": v["lines"]}
+                     for k, v in (data.get("sections") or {}).items()},
+        "tables": data.get("tables") or {},
+    }
+
+
+@app.route("/review")
+def review():
+    date = (request.args.get("date") or "").strip() or None
+    c = _get_review(date)
+    if c["err"]:
+        return render_template_string(PAGE_REVIEW, date="-", sections=None,
+                                      tables={}, error=f"复盘生成失败: {c['err']}")
+    d = c["data"]
+    return render_template_string(PAGE_REVIEW, date=d.get("date"),
+                                  sections=d.get("sections"),
+                                  tables=d.get("tables") or {}, error=None)
+
+
+@app.route("/api/review")
+def api_review():
+    date = (request.args.get("date") or "").strip() or None
+    c = _get_review(date)
+    if c["err"]:
+        return jsonify({"error": c["err"]}), 500
+    return jsonify(_jsonable_review(c["data"]))
 
 
 def main():
