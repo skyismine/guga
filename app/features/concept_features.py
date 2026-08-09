@@ -14,6 +14,7 @@ import os
 import pickle
 import re
 import time
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -40,27 +41,89 @@ _map = None
 _idx_fail = set()
 
 
+def _get_ths_js() -> str:
+    """读取 akshare 内置的同花顺 JS 混淆脚本内容(用于生成防爬 v 值)。"""
+    from akshare.stock_feature.stock_board_concept_ths import _get_file_content_ths
+    return _get_file_content_ths("ths.js")
+
+
 # ---------------------------------------------------------------- 概念列表 name->code
+def _flow_concepts() -> dict:
+    """从同花顺概念资金流排行页提取 板块名->代码 映射。
+
+    概念名录(_name_to_code)覆盖 375 个板块,但资金流排行页还含名录缺失的
+    板块(如 CRO概念/308734、ChatGPT概念 等),其链接同样指向概念详情页。
+    两源合并可保证资金流板块与成分映射/指数体系一致,消除"有板块无成分"缺口。
+    """
+    from py_mini_racer import MiniRacer as _MR
+    js_code = _MR()
+    js_content = _get_ths_js()
+    js_code.eval(js_content)
+    v_code = js_code.call("v")
+    headers = dict(_UA)
+    headers.update({
+        "hexin-v": v_code,
+        "Host": "data.10jqka.com.cn",
+        "Referer": "http://data.10jqka.com.cn/funds/gnzjl/",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    out = {}
+    try:
+        r = requests.get(
+            "https://data.10jqka.com.cn/funds/gnzjl/field/tradezdf/order/desc/ajax/1/free/1/",
+            headers=headers, timeout=20)
+        soup = BeautifulSoup(r.text, "lxml")
+        raw_page = soup.find(name="span", attrs={"class": "page_info"})
+        page_num = 1
+        if raw_page and "/" in raw_page.text:
+            page_num = int(raw_page.text.split("/")[1])
+        for page in range(1, page_num + 1):
+            url = ("https://data.10jqka.com.cn/funds/gnzjl/"
+                   "field/tradezdf/order/desc/page/%d/ajax/1/free/1/" % page)
+            try:
+                rr = requests.get(url, headers=headers, timeout=20)
+                s2 = BeautifulSoup(rr.text, "lxml")
+            except Exception:  # noqa: BLE001
+                time.sleep(1.5)
+                continue
+            for a in s2.find_all("a", href=re.compile(r"gn/detail/code/\d+/")):
+                m = re.search(r"gn/detail/code/(\d+)/", a.get("href", ""))
+                nm = a.get_text(strip=True)
+                if m and nm:
+                    out[nm] = m.group(1)
+            time.sleep(0.1)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def _name_to_code() -> dict:
-    """同花顺概念 名称->代码 映射(本地缓存 json 优先,否则走 akshare)。"""
+    """同花顺概念 名称->代码 映射(本地缓存 json 优先,否则走 akshare)。
+
+    在 akshare 概念名录基础上,合并概念资金流排行板块(补全名录缺失板块),
+    保证资金流口径的板块名(如 CRO概念)与成分/指数体系一致。
+    """
     global _name_code
     if _name_code is not None:
         return _name_code
+    merged = {}
     if os.path.exists(_NAME_CODE_PATH):
         try:
             with open(_NAME_CODE_PATH, encoding="utf-8") as f:
-                _name_code = json.load(f)
-            return _name_code
+                merged = json.load(f)
         except (OSError, ValueError):
+            merged = {}
+    if not merged:
+        from akshare.stock_feature.stock_board_concept_ths import _get_stock_board_concept_name_ths
+        merged = _get_stock_board_concept_name_ths()
+        merged.update(_flow_concepts())
+        try:
+            os.makedirs(_CONCEPT_DIR, exist_ok=True)
+            with open(_NAME_CODE_PATH, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=1)
+        except OSError:
             pass
-    from akshare.stock_feature.stock_board_concept_ths import _get_stock_board_concept_name_ths
-    _name_code = _get_stock_board_concept_name_ths()
-    try:
-        os.makedirs(_CONCEPT_DIR, exist_ok=True)
-        with open(_NAME_CODE_PATH, "w", encoding="utf-8") as f:
-            json.dump(_name_code, f, ensure_ascii=False, indent=1)
-    except OSError:
-        pass
+    _name_code = merged
     return _name_code
 
 
@@ -156,6 +219,61 @@ def main_concept_sw(code: str):
 
 
 # ---------------------------------------------------------------- 概念指数
+def _fetch_index_close_by_code(code: str, name: str, start_date: str) -> pd.Series:
+    """按板块代码直连抓取同花顺概念指数收盘序列。
+
+    akshare 的 stock_board_concept_index_ths 内部使用概念名录映射,
+    名录缺失的板块(如 CRO概念/308734)会 KeyError;这里直接用代码取
+    clid 再拉取 bk 日线,兼容名录外板块。
+    """
+    from py_mini_racer import MiniRacer as _MR
+    js_code = _MR()
+    js_code.eval(_get_ths_js())
+    v_code = js_code.call("v")
+    headers = dict(_UA)
+    headers.update({"Cookie": f"v={v_code}"})
+    page_url = f"https://q.10jqka.com.cn/gn/detail/code/{code}"
+    r = requests.get(page_url, headers=headers, timeout=20)
+    soup = BeautifulSoup(r.text, "lxml")
+    clid = soup.find(name="input", attrs={"id": "clid"})
+    if clid is None:
+        raise KeyError(f"{name} 无 clid")
+    inner_code = clid["value"]
+    cur_year = datetime.now().year
+    begin_year = int(start_date[:4])
+    hd = dict(headers)
+    hd.update({"Referer": "http://q.10jqka.com.cn", "Host": "d.10jqka.com.cn"})
+    frames = []
+    for year in range(begin_year, cur_year + 1):
+        url = f"https://d.10jqka.com.cn/v4/line/bk_{inner_code}/01/{year}.js"
+        try:
+            rr = requests.get(url, headers=hd, timeout=20)
+            text = rr.text
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            from akshare.utils import demjson
+            obj = demjson.decode(text[text.find("{") : -1])
+            rows = obj["data"].split(";")
+        except Exception:  # noqa: BLE001
+            continue
+        for row in rows:
+            parts = row.split(",")
+            if len(parts) < 6:
+                continue
+            try:
+                frames.append([parts[0], float(parts[2])])  # 日期,收盘
+            except (IndexError, ValueError):
+                continue
+    if not frames:
+        raise KeyError(f"{name} 无指数数据")
+    df = pd.DataFrame(frames, columns=["date", "close"])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna().drop_duplicates("date").sort_values("date")
+    df = df[(df["date"] >= pd.to_datetime(start_date))]
+    return pd.Series(df["close"].values, index=df["date"].values, name="close").astype(float)
+
+
 def _get_concept_close(name: str) -> pd.Series:
     """概念指数日收盘序列(本地缓存 TTL,失败重试)。"""
     code = _name_to_code().get(name)
@@ -169,16 +287,10 @@ def _get_concept_close(name: str) -> pd.Series:
                 return pickle.load(f)
         except Exception:
             pass
-    import akshare as ak
     last = None
     for i in range(4):
         try:
-            df = ak.stock_board_concept_index_ths(symbol=name, start_date=_INDEX_START,
-                                                  end_date=time.strftime("%Y%m%d"))
-            close_col = next((c for c in df.columns if "收盘" in str(c)), None)
-            if close_col is None:
-                raise KeyError(f"{name} 无收盘列: {list(df.columns)}")
-            close = df.set_index("日期")[close_col].astype(float).sort_index()
+            close = _fetch_index_close_by_code(code, name, _INDEX_START)
             with open(path, "wb") as f:
                 pickle.dump(close, f)
             return close
@@ -262,7 +374,7 @@ def prepare_features(df: pd.DataFrame, code: str = None) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- 全量预取
 def prefetch_concepts(sleep: float = 0.2) -> None:
-    """全量预取:概念成分映射(375 概念分页抓取)+ 各概念指数历史(本地缓存)。"""
+    """全量预取:概念成分映射(概念名录+资金流板块分页抓取)+ 各概念指数历史(本地缓存)。"""
     os.makedirs(_CONCEPT_DIR, exist_ok=True)
     os.makedirs(_INDEX_DIR, exist_ok=True)
     cm = _name_to_code()
