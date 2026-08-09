@@ -184,8 +184,27 @@ def _pass_reasons(r, stats) -> list:
     return out
 
 
+def _sector_pool(name: str) -> str:
+    """板块属性池判定:进攻(aggressive)/ 防御(defensive),关键词命中优先,默认按配置。"""
+    pool = _cfg().get("pool", {})
+    for kw in pool.get("aggressive_kw", []):
+        if kw and kw.lower() in name.lower():
+            return "aggressive"
+    for kw in pool.get("defensive_kw", []):
+        if kw and kw.lower() in name.lower():
+            return "defensive"
+    return pool.get("default", "aggressive")
+
+
 def mainline_select() -> dict:
-    """第二层:一票否决 + 准入 + 分级(核心主攻/防御备选/观察池)。"""
+    """第二层:一票否决 + 准入 + 属性池分级(核心主攻/防御备选/观察池)。
+
+    先划分板块属性池(进攻/防御),再池内排名,禁止跨池对比:
+    - 核心主攻:进攻属性池中综合得分第 1 名(满足准入);
+    - 防御备选:防御属性池中综合得分第 1 名(满足准入);
+    - 观察池:其余得分>=准入线的板块,按综合得分降序;
+    - 强制校验:观察池任一板块得分不得高于防御备选,否则调整标签并标注。
+    """
     dcfg = _cfg()
     mline = dcfg.get("mainline", {})
     rows = _ml.sector_scores(use_cache=True)
@@ -215,33 +234,45 @@ def mainline_select() -> dict:
                 "news_hits": r.get("news_hits", 0), "stats": stats or {}}
         if r["score"] >= mline.get("pass_score", 60.0):
             item["reasons"] = _pass_reasons(r, stats)
+            item["pool"] = _sector_pool(r["industry"])
             passed.append(item)
         else:
             item["level"] = "watch"
             item["reasons"] = [f"综合评分 {r['score']} 分,低于准入线 {mline.get('pass_score', 60.0)} 分,仅跟踪"]
             low.append(item)
 
-    passed.sort(key=lambda x: -x["score"])
-    core = passed[0] if passed else None
+    # ---- 属性池内分级(禁止跨池对比)
+    aggressive = sorted([p for p in passed if p.get("pool") == "aggressive"], key=lambda x: -x["score"])
+    defensive_pool = sorted([p for p in passed if p.get("pool") == "defensive"], key=lambda x: -x["score"])
+    core = aggressive[0] if aggressive else None
     if core:
         core["level"] = "core"
-
-    defensive = None
-    if core and len(passed) > 1:
-        def _defense_key(it):
-            low_pos = 0.0 if not it["stats"].get("ret20") else -it["stats"]["ret20"]
-            low_vol = 0.0 if not it["stats"].get("vol20") else it["stats"]["vol20"]
-            return it["score"] * 0.5 + low_pos * 40 - low_vol * 100
-        candidates = [p for p in passed if p["name"] != core["name"]]
-        if candidates:
-            defensive = max(candidates, key=_defense_key)
+    defensive = defensive_pool[0] if defensive_pool else None
     if defensive:
         defensive["level"] = "defensive"
-        defensive["reasons"].append("低位低波动防御属性(备选方向)")
+        defensive["reasons"].append("防御属性池第 1 名(备选方向)")
 
+    # ---- 观察池:其余得分达标板块,降序
     core_name = core["name"] if core else None
     def_name = defensive["name"] if defensive else None
-    watch = [p for p in passed if p["name"] != core_name and p["name"] != def_name][: mline.get("watch_n", 3)]
+    watch_candidates = [p for p in passed if p["name"] != core_name and p["name"] != def_name]
+    watch_candidates.sort(key=lambda x: -x["score"])
+
+    # ---- 强制校验:观察池得分不得高于防御备选(防倒挂)
+    mcheck = dcfg.get("mainline_check", {})
+    if mcheck.get("enforce", True) and defensive and watch_candidates:
+        if watch_candidates[0]["score"] > defensive["score"]:
+            top_watch = watch_candidates[0]
+            top_watch["level"] = "defensive"
+            top_watch["reasons"] = [r for r in top_watch.get("reasons", [])
+                                    if "属性" not in r and "备选" not in r]
+            top_watch["reasons"].append("属性不匹配,原评分高于防御备选,归入防御备选")
+            defensive = top_watch
+            def_name = defensive["name"]
+            watch_candidates = [p for p in passed if p["name"] != core_name and p["name"] != def_name]
+            watch_candidates.sort(key=lambda x: -x["score"])
+
+    watch = watch_candidates[: mline.get("watch_n", 3)]
     for w in watch:
         w["level"] = "watch"
         w.setdefault("reasons", _pass_reasons(w, w.get("stats") or {}))
@@ -253,6 +284,63 @@ def mainline_select() -> dict:
 
 
 # ---------------------------------------------------------------- 第三层 标的精准匹配
+# 统一 5 档操作信号口径(全系统统一命名),从 advisor 动作映射并叠加修正
+_SIGNAL_LEVELS = ["观望", "减仓兑现", "持有观察", "突破跟进", "关注低吸"]  # 强度升序
+_SIGNAL_RANK = {s: i for i, s in enumerate(_SIGNAL_LEVELS)}
+# advisor 原始动作(action_key) -> 5 档信号
+_ACTION_TO_SIGNAL = {
+    "buy": "关注低吸",
+    "add": "突破跟进",
+    "hold": "持有观察",
+    "reduce": "减仓兑现",
+    "sell": "观望",
+    "wait": "观望",
+}
+
+
+def _shift_signal(sig: str, delta: int) -> str:
+    """信号档位移(正=上修/更积极, 负=下修/更保守),越界封顶。"""
+    idx = _SIGNAL_RANK.get(sig, 0) + delta
+    return _SIGNAL_LEVELS[max(0, min(len(_SIGNAL_LEVELS) - 1, idx))]
+
+
+def _adjust_signal(item: dict, sector_level: str) -> dict:
+    """叠加板块等级修正 + 位置修正,统一为 5 档信号并输出修正说明。
+
+    item 需含 action_key / ret3d;修改 item["signal"]/item["action"]/item["adj_notes"]。
+    """
+    dcfg = _cfg()
+    scfg = dcfg.get("signal", {})
+    if not scfg.get("enabled", True) or item.get("error"):
+        return item
+    base = _ACTION_TO_SIGNAL.get(item.get("action_key"), "观望")
+    sig = base
+    notes = []
+
+    # 1) 板块等级修正:核心主攻上修 1 档
+    boost = scfg.get("sector_boost", {}).get(sector_level, 0)
+    if boost:
+        sig = _shift_signal(sig, boost)
+        notes.append(f"核心主线溢价上修 {boost} 档")
+
+    # 2) 位置修正:低位启动上修 / 短期高位下修
+    low_pos = scfg.get("low_pos_ret3d", 0.05)
+    high_pos = scfg.get("high_pos_ret3d", 0.15)
+    ret3d = item.get("ret3d")
+    if ret3d is not None:
+        if ret3d < low_pos and ret3d > 0:
+            sig = _shift_signal(sig, 1)
+            notes.append(f"低位启动(近3日 {ret3d:+.1%}),信号上修关注")
+        elif ret3d >= high_pos:
+            sig = _shift_signal(sig, -1)
+            notes.append(f"短期高位(近3日 {ret3d:+.1%}),信号下修防回落")
+
+    item["signal"] = sig
+    item["action"] = sig
+    item["adj_notes"] = notes if scfg.get("note", True) else []
+    return item
+
+
 _TRIGGER_TPL = {
     "aggressive": "回踩支撑位 {support} 企稳(缩量)关注,或放量突破压力位 {resistance} 启动信号",
     "steady": "回踩 {entry_low}~{support} 区间分批低吸关注",
@@ -262,22 +350,32 @@ _TRIGGER_TPL = {
 
 def _predict_one(code, predictor, quotes, market):
     try:
-        _, pred, adv = _one(code, predictor, quotes, market, _st.load())
+        df, pred, adv = _one(code, predictor, quotes, market, _st.load())
         lv = adv.get("levels") or {}
+        close = df["close"]
+        ret3d = float(close.iloc[-1] / close.iloc[-4] - 1) if len(close) >= 4 else None
+        ma5 = float(close.rolling(5).mean().iloc[-1]) if len(close) >= 5 else None
+        ma10 = float(close.rolling(10).mean().iloc[-1]) if len(close) >= 10 else None
         return {
             "p_up": round(pred["p_up"], 4), "p_flat": round(pred["p_flat"], 4),
             "p_down": round(pred["p_down"], 4), "direction": pred["direction_cn"],
             "action": adv["action_cn"], "action_key": adv["action"],
             "levels": lv,
             "atr14": (adv.get("technical") or {}).get("atr14"),
+            "ret3d": round(ret3d, 4) if ret3d is not None else None,
+            "ma5": round(ma5, 2) if ma5 is not None else None,
+            "ma10": round(ma10, 2) if ma10 is not None else None,
             "reasons": adv.get("reasons", [])[:3],
         }
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def match_level_targets(sector_name: str) -> dict:
-    """第三层:对某主线输出 激进/稳健/工具 三档,每档首选+备选。"""
+def match_level_targets(sector_name: str, sector_level: str = "watch") -> dict:
+    """第三层:对某主线输出 激进/稳健/工具 三档,每档首选+备选。
+
+    sector_level 决定信号修正:core 板块标的信号整体上修(叠加板块溢价)。
+    """
     spot = _ml._a_spot_map()
     stocks = _ml._match_stocks(sector_name, spot)
     result = {
@@ -308,6 +406,10 @@ def match_level_targets(sector_name: str) -> dict:
             item["rank"] = rank
             item["role"] = {"aggressive": "情绪龙头", "steady": "中军龙头"}[role]
             item.update(_predict_one(c["code"], predictor, quotes, market))
+            if item.get("error"):
+                result[role]["items"].append(item)
+                continue
+            _adjust_signal(item, sector_level)
             lv = item.get("levels") or {}
             item["trigger"] = _TRIGGER_TPL[role].format(
                 support=lv.get("support", "-"), resistance=lv.get("resistance", "-"),
@@ -327,6 +429,10 @@ def match_level_targets(sector_name: str) -> dict:
         item = {"rank": rank, "role": "ETF", "code": e["code"], "name": e["name"],
                 "price": round(e["price"], 3), "amount_wan": round(e["amount_wan"], 0)}
         item.update(_predict_one(e["code"], predictor, quotes, market))
+        if item.get("error"):
+            result["etf"]["items"].append(item)
+            continue
+        _adjust_signal(item, sector_level)
         lv = item.get("levels") or {}
         if lv:
             item["trigger"] = _TRIGGER_TPL["etf"].format(
@@ -348,60 +454,145 @@ def execution_plan(target: dict, total_asset: float, taste: str,
 
     market_cap:市场评级总仓位上限;single_cap:单只标的上限。
     建议仓位取「风险倒推仓位」与风控上限的较小者。
+
+    全链路自洽约束:
+    - 第一目标价 = 现价 x (1 + 0.5 x ATR),且至少高于现价 3%;
+    - 第二目标价 = 近 20 日平台压力位(VectorBT levels.resistance);
+    - 分批与触发强绑定:回踩低吸(逐级降低) / 突破跟进(逐级抬高),二选一;
+    - 回踩区间限定 5日线~10日线,跨度不超过 8%;
+    - 股数 = 风险金额 / (现价-止损价),金额/股数/最大亏损/占比四者自洽。
     """
     dcfg = _cfg()
     risk_rate = dcfg.get("risk", {}).get(taste, 0.015)
     batch = dcfg.get("batch", {"first": 0.60, "second": 0.40})
+    plancfg = dcfg.get("plan", {})
     price = float(target.get("price") or 0)
     if price <= 0:
         return {"ok": False, "reason": "无有效现价"}
     lv = target.get("levels") or {}
     atr = target.get("atr14")
-    stop = float(lv.get("stop_loss") or 0) or (price - (1.5 * atr if atr else price * 0.04))
-    support = float(lv.get("support") or 0) or price * 0.95
-    resistance = float(lv.get("resistance") or 0) or price * 1.08
-    target1 = float(lv.get("target") or 0) or resistance
-    target2 = round(target1 * 1.10, 2)
+    atr = float(atr) if atr else None
+    ma5 = target.get("ma5")
+    ma10 = target.get("ma10")
 
+    # ---- 止损:VectorBT 止损位优先,缺失回退 ATR 或现价比例
+    stop = float(lv.get("stop_loss") or 0) or (price - (1.5 * atr if atr else price * 0.04))
+    # 现价跌破止损视为止损无效(止损应低于买入价),修正为 ATR/比例回退
+    if stop >= price:
+        stop = price - (1.5 * atr if atr else price * 0.04)
+
+    # ---- 目标价
+    resistance = float(lv.get("resistance") or 0) or price * 1.08
+    target1 = price * (1 + (0.5 * (atr / price if atr else 0.04)))
+    target1 = max(target1, price * (1 + plancfg.get("target1_min_gain", 0.03)))  # 至少+3%
+    target1 = max(target1, price * 1.001)  # 确保高于现价
+    target2 = resistance  # 近20日平台压力位
+    # 目标价强制递增:第二目标不得低于第一目标
+    if target2 < target1:
+        target2 = target1
+
+    # ---- 分批模式(与触发条件强绑定)
+    mode = plancfg.get("mode", "auto")
+    if mode == "auto":
+        sig = target.get("signal")
+        ret3d = target.get("ret3d") or 0
+        mode = "breakout" if (sig in ("突破跟进", "关注低吸") and ret3d >= 0.05) else "pullback"
+    if mode == "breakout":
+        # 突破跟进:首批=压力位突破价,二批=突破后回踩确认价(略低于突破价)
+        first_price = resistance
+        second_price = first_price * (1 - 0.01)
+        deep_support = float(lv.get("support") or 0) or price * 0.92
+        mode_note = "突破跟进:首批放量突破压力位,二批回踩确认"
+        trigger = f"放量突破压力位 {first_price:.2f} 确认,回踩 {second_price:.2f} 不破再关注"
+        first_note = "首批:突破压力位(60%)"
+        second_note = "二批:回踩确认(40%)"
+        avg_cost = first_price * batch.get("first", 0.60) + second_price * batch.get("second", 0.40)
+        if stop >= avg_cost:
+            stop = avg_cost * 0.98  # 止损必须低于加权买入成本
+    else:
+        # 回踩低吸:支撑上沿(5日线附近) -> 支撑下沿(10日线附近)
+        hi = (ma5 or price * 0.97)
+        lo = (ma10 or price * 0.94)
+        # 回踩区间跨度限制(不超过 8%),超限则压缩
+        span = (hi - lo) / price
+        if span > plancfg.get("pullback_span_max", 0.08):
+            lo = hi - plancfg.get("pullback_span_max", 0.08) * price
+        lo = min(lo, hi)
+        first_price = hi          # 第一批=支撑上沿(5日线附近)
+        second_price = lo         # 第二批=支撑下沿(10日线附近)
+        # 回踩区间整体位于现价下方(现价过高时保留,勿越现价)
+        first_price = min(first_price, price)
+        second_price = min(second_price, first_price)
+        # 极端加仓位(中期强支撑,不混入短线回踩区间)
+        deep_support = float(lv.get("support") or 0) or price * 0.92
+        # 止损 = min(原止损, 二批下方缓冲),必须低于加权买入成本
+        avg_cost = first_price * batch.get("first", 0.60) + second_price * batch.get("second", 0.40)
+        stop = min(stop, second_price * 0.97)
+        if stop >= avg_cost:
+            stop = second_price * 0.97
+        mode_note = "回踩低吸:首批5日线附近(支撑上沿),二批10日线附近(支撑下沿)"
+        trigger = f"回踩支撑区间 {second_price:.2f}~{first_price:.2f} 缩量企稳"
+        first_note = "首批:回踩支撑上沿(60%)"
+        second_note = "二批:回踩支撑下沿(40%)"
+    # 逐级方向强制校验:回踩二批低于一批,突破二批低于一批但整体在压力位上方
+    if first_price <= 0 or second_price <= 0:
+        first_price, second_price = price, price * 0.97
+
+    # ---- 仓位股数(风险公式,三者自洽;以加权买入成本为基准)
+    avg_cost = first_price * batch.get("first", 0.60) + second_price * batch.get("second", 0.40)
     risk_money = total_asset * risk_rate
-    loss_per_share = max(price - stop, price * 0.01)
-    pos_value = risk_money / (loss_per_share / price)
+    loss_per_share = max(avg_cost - stop, price * 0.01)  # 每股最大亏损(基于加权成本)
+    risk_shares = risk_money / loss_per_share          # 风险公式推股数
     single_cap = single_cap if single_cap is not None else _st.load().get("risk", {}).get("single_pct", 0.10)
     max_mv = total_asset * min(market_cap or 1.0, single_cap)
-    pos_value = min(pos_value, max_mv)
-    shares = int(pos_value / price // 100) * 100
+    pos_value = min(risk_shares * avg_cost, max_mv)    # 同时受单票上限约束
+    shares = int(pos_value / avg_cost // 100) * 100
     shares = max(shares, 100)
+    pos_value = shares * avg_cost
+
+    # 强制校验:风险公式推算仓位 vs 实际仓位,偏差<=5%
+    implied = (risk_shares * avg_cost) if risk_shares else pos_value
+    if implied > 0:
+        dev = abs(pos_value - min(implied, max_mv)) / min(implied, max_mv)
+        if dev > plancfg.get("position_check_tol", 0.05):
+            pos_value = min(implied, max_mv)
+            shares = int(pos_value / avg_cost // 100) * 100
+            shares = max(shares, 100)
+            pos_value = shares * avg_cost
     first = int(shares * batch.get("first", 0.60) // 100) * 100
     second = shares - first
+    max_loss = shares * loss_per_share
 
-    first_price = min(price, float(lv.get("entry_high") or price))
     return {
         "ok": True,
         "taste": taste,
         "name": target.get("name"),
         "code": target.get("code"),
-        "trigger": target.get("trigger"),
+        "trigger": trigger,
+        "mode": mode,
+        "mode_note": mode_note,
         "risk_rate": risk_rate,
         "risk_money": round(risk_money, 2),
         "price": round(price, 2),
         "stop": round(stop, 2),
-        "support": round(support, 2),
+        "support": round(float(lv.get("support") or 0), 2) or round(price * 0.95, 2),
         "resistance": round(resistance, 2),
         "target1": round(target1, 2),
-        "target2": target2,
+        "target2": round(target2, 2),
         "position_value": round(pos_value, 2),
         "shares": shares,
         "position_pct": round(pos_value / total_asset, 4) if total_asset else 0,
+        "max_loss": round(max_loss, 2),
         "batch": {
             "first": {"ratio": batch.get("first", 0.60), "shares": first,
-                      "price": round(first_price, 2),
-                      "note": "首批(60%)回踩/开盘区间分批关注"},
+                      "price": round(first_price, 2), "note": first_note},
             "second": {"ratio": batch.get("second", 0.40), "shares": second,
-                       "price": round(resistance, 2),
-                       "note": f"二批(40%)放量站稳 {resistance:.2f} 后加仓关注"},
+                       "price": round(second_price, 2), "note": second_note},
+            "deep_support": round(deep_support, 2),
         },
-        "note": f"单笔风险 {risk_money:,.0f} 元(总资金 {risk_rate:.1%}),"
-                f"止损 {stop:.2f}(亏 {loss_per_share:.2f}/股),最大仓位 {shares} 股 / {pos_value:,.0f} 元",
+        "note": (f"单笔风险 {risk_money:,.0f} 元(总资金 {risk_rate:.1%}),预计最大亏损 {max_loss:,.0f} 元"
+                 f"({max_loss / total_asset:.2%} 占总资金),止损 {stop:.2f}(亏 {loss_per_share:.2f}/股),"
+                 f"建议仓位 {shares} 股 / {pos_value:,.0f} 元({pos_value / total_asset:.1%})。{mode_note}"),
     }
 
 
@@ -421,7 +612,7 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     targets = {}
     plans = {}
     if core:
-        t = match_level_targets(core["name"])
+        t = match_level_targets(core["name"], sector_level="core")
         targets[core["name"]] = t
         for role, seg in (("aggressive", t["aggressive"]), ("steady", t["steady"]), ("etf", t["etf"])):
             item = seg["items"][0]
@@ -432,7 +623,7 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
                     item, total_asset, taste, market_cap=p1["cap"],
                     single_cap=_st.load().get("risk", {}).get("single_pct", 0.10))
     if defensive:
-        t = match_level_targets(defensive["name"])
+        t = match_level_targets(defensive["name"], sector_level="defensive")
         targets[defensive["name"]] = t
 
     # 极简结论

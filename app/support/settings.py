@@ -75,10 +75,60 @@ DEFAULTS = {
         },
         # 第二层 主线准入与分级
         "mainline": {"pass_score": 60.0, "core_n": 1, "defensive_n": 1, "watch_n": 3},
+        # 第二层 板块属性池(先分池,再池内分级,禁止跨池对比)
+        "pool": {
+            "aggressive_kw": [  # 进攻属性池关键词(命中其一即归进攻)
+                "CRO", "创新药", "生物", "医疗", "半导体", "芯片", "集成电路",
+                "AI", "人工智能", "算力", "计算机", "软件", "数据", "通信",
+                "机器人", "高端装备", "新能源", "光伏", "储能", "锂电", "军工",
+                "数字经济", "消费电子", "光模块", "PCB", "半导体设备",
+            ],
+            "defensive_kw": [  # 防御属性池关键词(命中其一即归防御)
+                "黄金", "贵金属", "消费", "白酒", "食品", "煤炭", "电力",
+                "公用事业", "银行", "保险", "医药商业", "中药", "家用电器",
+                "农林牧渔", "化工", "钢铁", "有色金属", "快递物流",
+            ],
+            "default": "aggressive",  # 未命中任何关键词的板块归属(default: aggressive|defensive)
+        },
+        # 第二层 主线分级强制校验(防倒挂)
+        "mainline_check": {
+            "enforce": True,   # 观察池任一板块得分不得高于防御备选
+            "fallback": "watch",  # 触发倒挂时的处理:调整标签并标注
+        },
+        # 第三层 板块-标的信号修正
+        "signal": {
+            "enabled": True,          # 总开关
+            "levels": {               # 统一 5 档操作信号口径(全系统统一命名)
+                "dip_buy": "关注低吸", "break": "突破跟进", "hold": "持有观察",
+                "reduce": "减仓兑现", "wait": "观望",
+            },
+            "sector_boost": {          # 板块等级修正系数(核心主攻上修1档)
+                "core": 1, "defensive": 0, "watch": 0, "rejected": 0,
+            },
+            "low_pos_ret3d": 0.05,     # 近3日涨幅<此值 视为低位启动(上修信号)
+            "high_pos_ret3d": 0.15,    # 近3日涨幅>=此值 视为短期高位(下修信号)
+            "note": True,              # 输出信号修正说明
+        },
         # 第四层 不同风险偏好的单笔风险系数(占总资金)
         "risk": {"conservative": 0.01, "balanced": 0.015, "aggressive": 0.02},
         # 第四层 分批建仓比例
         "batch": {"first": 0.60, "second": 0.40},
+        # 第四层 执行参数计算规则
+        "plan": {
+            "mode": "auto",            # 分批模式:auto|pullback(回踩低吸)|breakout(突破跟进)
+            "pullback": {              # 回踩低吸模式:分批价位逐级降低
+                "first_line": "ma5",   # 第一批仓位挂单线(5日线附近=支撑上沿)
+                "second_line": "ma10", # 第二批仓位挂单线(10日线附近=支撑下沿)
+            },
+            "breakout": {              # 突破跟进模式:分批价位逐级抬高
+                "first_line": "resistance",  # 第一批=压力位突破价
+                "second_line": "confirm",    # 第二批=突破后回踩确认价
+            },
+            "target1_atr_mult": 0.5,   # 第一目标价 = 现价 x (1 + 0.5xATR)
+            "target1_min_gain": 0.03,  # 第一目标价至少高于买入价 3%
+            "pullback_span_max": 0.08, # 回踩区间(5日线~10日线)跨度上限 8%
+            "position_check_tol": 0.05 # 仓位股数自洽校验偏差上限 5%
+        },
         # 大盘打分成交额满分基准(亿元)
         "min_amount_yi": 10000.0,
     },

@@ -799,7 +799,7 @@ def _sector_chip(it) -> str:
 
 def _target_item_html(it, trigger_on=True) -> str:
     if it.get("error"):
-        return f'<tr><td colspan="8" class="mut">{_h(it["error"])}</td></tr>'
+        return f'<tr><td colspan="9" class="mut">{_h(it["error"])}</td></tr>'
     lv = it.get("levels") or {}
     p_up = f"{it['p_up'] * 100:.0f}%" if it.get("p_up") is not None else "-"
     p_flat = f"{it['p_flat'] * 100:.0f}%" if it.get("p_flat") is not None else "-"
@@ -815,14 +815,17 @@ def _target_item_html(it, trigger_on=True) -> str:
               f"<br>止损 {_h(lv.get('stop_loss'))}" if lv else "-")
     trig = _h(it.get("trigger")) if trigger_on and it.get("trigger") else "-"
     act = it.get("action") or "-"
-    act_cls = {"买入": "up", "卖出": "down", "减仓": "down", "观望": "flat", "持有": "flat"}.get(act, "mut")
+    act_cls = {"关注低吸": "up", "突破跟进": "up", "持有观察": "flat", "减仓兑现": "down", "观望": "flat"}.get(act, "mut")
+    adj = "".join(f'<div class="mut" style="font-size:12px">· {_h(n)}</div>'
+                  for n in (it.get("adj_notes") or [])[:2]) or "-"
     return (f"<tr><td><b>{_h(it.get('name'))}</b><br><span class='mut'>{_h(it.get('code'))}</span></td>"
             f"<td>{_h(it.get('role') or '-')}</td>"
             f"<td>{price}</td>"
             f"<td>{p_up} / {p_flat} / {p_down}</td>"
             f"<td class='{act_cls}'><b>{act}</b></td>"
             f"<td class='mut'>{lv_txt}</td>"
-            f"<td class='mut'>{trig}</td></tr>")
+            f"<td class='mut'>{trig}</td>"
+            f"<td class='mut'>{adj}</td></tr>")
 
 
 def _layer3_html(targets: dict) -> str:
@@ -835,8 +838,9 @@ def _layer3_html(targets: dict) -> str:
             rows.extend(_target_item_html(it, trigger_on=True) for it in seg.get("items", []))
         parts.append(f'<div class="card"><h3>🎯 {_h(sector)} · 标的匹配(三档)</h3>'
                      f'<div class="tbl"><table><tr><th>标的</th><th>档位</th><th>现价</th>'
-                     f'<th>上涨/走平/下跌概率</th><th>建议</th><th>支撑/压力/止损</th><th>触发条件</th></tr>'
-                     f"{''.join(rows) or '<tr><td colspan=7 class=mut>暂无匹配标的</td></tr>'}"
+                     f'<th>上涨/走平/下跌概率</th><th>建议</th><th>支撑/压力/止损</th><th>触发条件</th>'
+                     f'<th>信号修正说明</th></tr>'
+                     f"{''.join(rows) or '<tr><td colspan=8 class=mut>暂无匹配标的</td></tr>'}"
                      f"</table></div></div>")
     return "\n".join(parts) or '<div class="card"><h3>暂无达标主线</h3></div>'
 
@@ -857,8 +861,9 @@ def _plan_table_html(plans: dict, sector: str) -> str:
         stock = (f"<b>{_h(p.get('name'))}</b><br><span class='mut'>{_h(p.get('code'))}</span>"
                  if p.get("code") else "-")
         trig = _h(p.get("trigger")) if p.get("trigger") else "-"
+        mode_tag = f"<br><span class='mut' style='font-size:12px'>模式: {_h(p.get('mode_note') or '')}</span>"
         rows.append(
-            f"<tr><th>{lab}</th><td>{stock}</td>"
+            f"<tr><th>{lab}</th><td>{stock}{mode_tag}</td>"
             f"<td>{_h(p.get('price'))}</td>"
             f"<td>{_h(p.get('stop'))}</td>"
             f"<td>{_h(p.get('target1'))} / {_h(p.get('target2'))}</td>"
