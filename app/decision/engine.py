@@ -257,9 +257,9 @@ _TRIGGER_TPL = {
 }
 
 
-def _predict_one(code, predictor, quotes):
+def _predict_one(code, predictor, quotes, market):
     try:
-        _, pred, adv = _one(code, predictor, quotes, None, _st.load())
+        _, pred, adv = _one(code, predictor, quotes, market, _st.load())
         lv = adv.get("levels") or {}
         return {
             "p_up": round(pred["p_up"], 4), "p_flat": round(pred["p_flat"], 4),
@@ -294,13 +294,17 @@ def match_level_targets(sector_name: str) -> dict:
     mid = sorted(stocks, key=lambda s: -(s.get("amount") or 0))[:2]
     quotes = _ml.get_spot_quotes([s["code"] for s in emo + mid]) if (emo or mid) else {}
     predictor = _ml.Predictor()
+    try:
+        market = market_snapshot()
+    except Exception:  # noqa: BLE001
+        market = None
 
     for role, cands in (("aggressive", emo), ("steady", mid)):
         for rank, c in enumerate(cands[:2], 1):
             item = _base(c)
             item["rank"] = rank
             item["role"] = {"aggressive": "情绪龙头", "steady": "中军龙头"}[role]
-            item.update(_predict_one(c["code"], predictor, quotes))
+            item.update(_predict_one(c["code"], predictor, quotes, market))
             lv = item.get("levels") or {}
             item["trigger"] = _TRIGGER_TPL[role].format(
                 support=lv.get("support", "-"), resistance=lv.get("resistance", "-"),
@@ -318,8 +322,14 @@ def match_level_targets(sector_name: str) -> dict:
     matched.sort(key=lambda x: -x["amount_wan"])
     for rank, e in enumerate(matched[:2], 1):
         item = {"rank": rank, "role": "ETF", "code": e["code"], "name": e["name"],
-                "price": round(e["price"], 3), "amount_wan": round(e["amount_wan"], 0),
-                "trigger": "板块强势期间低吸对应 ETF,注意流动性"}
+                "price": round(e["price"], 3), "amount_wan": round(e["amount_wan"], 0)}
+        item.update(_predict_one(e["code"], predictor, quotes, market))
+        lv = item.get("levels") or {}
+        if lv:
+            item["trigger"] = _TRIGGER_TPL["etf"].format(
+                support=lv.get("support", "-"), resistance=lv.get("resistance", "-"))
+        else:
+            item["trigger"] = "板块强势期间低吸对应 ETF,注意流动性"
         result["etf"]["items"].append(item)
 
     for role in ("aggressive", "steady", "etf"):
@@ -365,6 +375,9 @@ def execution_plan(target: dict, total_asset: float, taste: str,
     return {
         "ok": True,
         "taste": taste,
+        "name": target.get("name"),
+        "code": target.get("code"),
+        "trigger": target.get("trigger"),
         "risk_rate": risk_rate,
         "risk_money": round(risk_money, 2),
         "price": round(price, 2),

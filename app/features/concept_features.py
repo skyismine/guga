@@ -30,6 +30,7 @@ _CONCEPT_DIR = os.path.join(config.DATA_DIR, "concept")
 _INDEX_DIR = os.path.join(_CONCEPT_DIR, "index")
 _MAP_PATH = os.path.join(_CONCEPT_DIR, "concept_map.json")
 _NAME_CODE_PATH = os.path.join(_CONCEPT_DIR, "name_code.json")
+_FLOW_PATH = os.path.join(_CONCEPT_DIR, "flow.json")
 _PROCESSED_PATH = os.path.join(_CONCEPT_DIR, "processed.json")
 _INDEX_START = "20240101"
 _A_PREFIXES = ("60", "68", "00", "30")
@@ -116,13 +117,29 @@ def _name_to_code() -> dict:
     if not merged:
         from akshare.stock_feature.stock_board_concept_ths import _get_stock_board_concept_name_ths
         merged = _get_stock_board_concept_name_ths()
-        merged.update(_flow_concepts())
+    # 合并资金流板块:本地 flow.json 优先,缺失时抓取后持久化,避免每次启动请求
+    flow = {}
+    if os.path.exists(_FLOW_PATH):
+        try:
+            with open(_FLOW_PATH, encoding="utf-8") as f:
+                flow = json.load(f)
+        except (OSError, ValueError):
+            flow = {}
+    if not flow:
+        flow = _flow_concepts()
         try:
             os.makedirs(_CONCEPT_DIR, exist_ok=True)
-            with open(_NAME_CODE_PATH, "w", encoding="utf-8") as f:
-                json.dump(merged, f, ensure_ascii=False, indent=1)
+            with open(_FLOW_PATH, "w", encoding="utf-8") as f:
+                json.dump(flow, f, ensure_ascii=False, indent=1)
         except OSError:
             pass
+    merged.update(flow)
+    try:
+        os.makedirs(_CONCEPT_DIR, exist_ok=True)
+        with open(_NAME_CODE_PATH, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
     _name_code = merged
     return _name_code
 

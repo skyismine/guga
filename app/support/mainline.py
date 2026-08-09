@@ -170,10 +170,16 @@ def _zt_pool(date=None, refresh=False) -> list:
     def _fetch():
         df = ak.stock_zt_pool_em(date=date.replace("-", ""))
         out = []
+        cols = {str(c): i for i, c in enumerate(df.columns)}
+        idx_code = cols.get("代码", 1)
+        idx_name = cols.get("名称", 2)
+        idx_pct = cols.get("涨跌幅", 3)
+        idx_reason = cols.get("涨停统计", cols.get("所属行业", -1))
         for _, r in df.iterrows():
             try:
-                out.append({"code": str(r.iloc[1]).zfill(6), "name": str(r.iloc[2]),
-                            "pct": float(r.iloc[3] or 0), "reason": str(r.iloc[16] or "")})
+                reason = str(r.iloc[idx_reason] or "") if idx_reason >= 0 else ""
+                out.append({"code": str(r.iloc[idx_code]).zfill(6), "name": str(r.iloc[idx_name]),
+                            "pct": float(r.iloc[idx_pct] or 0), "reason": reason})
             except (IndexError, TypeError, ValueError):
                 continue
         return out

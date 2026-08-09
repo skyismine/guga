@@ -785,43 +785,59 @@ def _sector_chip(it) -> str:
     lab = {"core": "核心主攻", "defensive": "防御备选", "watch": "观察", "rejected": "淘汰"}.get(it.get("level"), "")
     cls = {"core": "b-core", "defensive": "b-branch", "watch": "b-watch", "rejected": "b-wait"}.get(it.get("level"), "b-wait")
     reason = "".join(f'<div class="mut" style="font-size:12px">· {_h(r)}</div>' for r in it.get("reasons", [])[:4])
-    extra = f" · 涨停 {it.get('zt_count')} 家" if it.get("zt_count") else ""
-    return (f"<div class='line'>🔹 <b>{_h(it.get('name'))}</b> <span class='badge {cls}'>{lab}</span>"
-            f" <span class='mut'>score {it.get('score')} · 涨 {it.get('pct_chg', 0):+.2f}% · 净流入 {it.get('net_yi', 0):+.1f} 亿{extra}</span>"
-            f"<div style='margin-left:0'>{reason}</div></div>")
+    zt = f"{it.get('zt_count') or 0} 家"
+    st = it.get("stats") or {}
+    gain3 = f"{st['gain3'] * 100:+.1f}%" if st.get("gain3") is not None else "-"
+    ret20 = f"{st['ret20'] * 100:+.1f}%" if st.get("ret20") is not None else "-"
+    return (f"<tr><td><b>{_h(it.get('name'))}</b><span class='badge {cls}' style='margin-left:8px'>{lab}</span></td>"
+            f"<td>{it.get('score')}</td>"
+            f"<td class='{'up' if (it.get('pct_chg') or 0) >= 0 else 'down'}'>{it.get('pct_chg', 0):+.2f}%</td>"
+            f"<td>{it.get('net_yi', 0):+.1f} 亿</td><td>{zt}</td>"
+            f"<td class='mut'>{gain3} / {ret20}</td>"
+            f"<td class='mut'>{reason or '-'}</td></tr>")
 
 
 def _target_item_html(it, trigger_on=True) -> str:
     if it.get("error"):
-        return f'<div class="line"><span class="mut">· {_h(it["error"])}</span></div>'
+        return f'<tr><td colspan="8" class="mut">{_h(it["error"])}</td></tr>'
     lv = it.get("levels") or {}
     p_up = f"{it['p_up'] * 100:.0f}%" if it.get("p_up") is not None else "-"
-    pos = f"现价 {it.get('price')}"
-    if it.get("pct_chg") is not None:
-        pos += f' <span class="{"up" if it["pct_chg"] >= 0 else "down"}">{it["pct_chg"]:+.2f}%</span>'
-    if it.get("amount_yi"):
-        pos += f' · 成交 {it["amount_yi"]} 亿'
+    p_flat = f"{it['p_flat'] * 100:.0f}%" if it.get("p_flat") is not None else "-"
+    p_down = f"{it['p_down'] * 100:.0f}%" if it.get("p_down") is not None else "-"
+    chg = it.get("pct_chg")
+    price = (f"{it.get('price')} <span class='{'up' if chg >= 0 else 'down'}'>{chg:+.2f}%</span>"
+             if chg is not None else f"{it.get('price')}")
     if it.get("amount_wan"):
-        pos += f' · 成交 {it["amount_wan"]:,.0f} 万'
-    lv_txt = (f'支撑 {_h(lv.get("support"))} / 压力 {_h(lv.get("resistance"))}'
-              f' / 止损 {_h(lv.get("stop_loss"))}' if lv else "")
-    trig = f'<div class="mut" style="font-size:12px">触发:{_h(it.get("trigger"))}</div>' if trigger_on and it.get("trigger") else ""
-    return (f'<div class="line">★ {_h(it.get("role") or "")} 首选·{_h(it.get("name"))} ({_h(it.get("code"))}) · {pos}'
-            f' <span class="mut">上涨概率 {p_up} · 建议:{_h(it.get("action"))}</span>'
-            f'<div style="margin-left:0">{lv_txt}{trig}</div></div>')
+        price += f'<br><span class="mut">成交 {it["amount_wan"]:,.0f} 万</span>'
+    elif it.get("amount_yi"):
+        price += f'<br><span class="mut">成交 {it["amount_yi"]} 亿</span>'
+    lv_txt = (f"支撑 {_h(lv.get('support'))}<br>压力 {_h(lv.get('resistance'))}"
+              f"<br>止损 {_h(lv.get('stop_loss'))}" if lv else "-")
+    trig = _h(it.get("trigger")) if trigger_on and it.get("trigger") else "-"
+    act = it.get("action") or "-"
+    act_cls = {"买入": "up", "卖出": "down", "减仓": "down", "观望": "flat", "持有": "flat"}.get(act, "mut")
+    return (f"<tr><td><b>{_h(it.get('name'))}</b><br><span class='mut'>{_h(it.get('code'))}</span></td>"
+            f"<td>{_h(it.get('role') or '-')}</td>"
+            f"<td>{price}</td>"
+            f"<td>{p_up} / {p_flat} / {p_down}</td>"
+            f"<td class='{act_cls}'><b>{act}</b></td>"
+            f"<td class='mut'>{lv_txt}</td>"
+            f"<td class='mut'>{trig}</td></tr>")
 
 
 def _layer3_html(targets: dict) -> str:
     parts = []
     for sector, t in (targets or {}).items():
-        parts.append(f'<div class="card"><h3>🎯 {_h(sector)} · 标的匹配(三档)</h3>')
+        rows = []
         for role, seg in (("aggressive", t.get("aggressive")), ("steady", t.get("steady")), ("etf", t.get("etf"))):
             if not seg:
                 continue
-            mood = "适用评级:" + "/".join(seg.get("mood", []))
-            items = "".join(_target_item_html(it, trigger_on=(role != "etf")) for it in seg.get("items", []))
-            parts.append(f'<div class="line"><b>{_h(seg.get("label"))}</b> <span class="tag">{mood}</span></div>{items}')
-        parts.append("</div>")
+            rows.extend(_target_item_html(it, trigger_on=True) for it in seg.get("items", []))
+        parts.append(f'<div class="card"><h3>🎯 {_h(sector)} · 标的匹配(三档)</h3>'
+                     f'<div class="tbl"><table><tr><th>标的</th><th>档位</th><th>现价</th>'
+                     f'<th>上涨/走平/下跌概率</th><th>建议</th><th>支撑/压力/止损</th><th>触发条件</th></tr>'
+                     f"{''.join(rows) or '<tr><td colspan=7 class=mut>暂无匹配标的</td></tr>'}"
+                     f"</table></div></div>")
     return "\n".join(parts) or '<div class="card"><h3>暂无达标主线</h3></div>'
 
 
@@ -833,22 +849,27 @@ def _plan_table_html(plans: dict, sector: str) -> str:
     for role, lab in (("steady", "稳健首选"), ("aggressive", "激进首选"), ("etf", "ETF")):
         p = seg.get(role) or {}
         if p.get("error"):
-            rows.append(f"<tr><th>{lab}</th><td colspan='6' class='mut'>{_h(p.get('reason'))}</td></tr>")
+            rows.append(f"<tr><th>{lab}</th><td colspan='9' class='mut'>{_h(p.get('reason'))}</td></tr>")
             continue
         if not p.get("ok"):
             continue
         b = p.get("batch", {})
+        stock = (f"<b>{_h(p.get('name'))}</b><br><span class='mut'>{_h(p.get('code'))}</span>"
+                 if p.get("code") else "-")
+        trig = _h(p.get("trigger")) if p.get("trigger") else "-"
         rows.append(
-            f"<tr><th>{lab}</th>"
+            f"<tr><th>{lab}</th><td>{stock}</td>"
             f"<td>{_h(p.get('price'))}</td>"
             f"<td>{_h(p.get('stop'))}</td>"
             f"<td>{_h(p.get('target1'))} / {_h(p.get('target2'))}</td>"
             f"<td>{p.get('position_pct', 0) * 100:.1f}%<br><span class='mut'>{p.get('shares')} 股 · {_fmt(p.get('position_value'))} 元</span></td>"
             f"<td>{b.get('first', {}).get('ratio', 0) * 100:.0f}% @ {_h(b.get('first', {}).get('price'))}<br>"
             f"{b.get('second', {}).get('ratio', 0) * 100:.0f}% @ {_h(b.get('second', {}).get('price'))}</td>"
+            f"<td class='mut'>{trig}</td>"
             f"<td class='mut'>{_h(p.get('note'))}</td></tr>")
-    return ("<div class='tbl'><table><tr><th>档位</th><th>现价</th><th>止损</th><th>目标1/2</th>"
-            "<th>建议仓位</th><th>分批方案</th><th>说明</th></tr>" + "\n".join(rows) + "</table></div>")
+    return ("<div class='tbl'><table><tr><th>档位</th><th>标的</th><th>现价</th><th>止损</th><th>目标1/2</th>"
+            "<th>建议仓位</th><th>分批方案</th><th>触发条件</th><th>说明</th></tr>"
+            + "\n".join(rows) + "</table></div>")
 
 
 @app.route("/decision")
@@ -886,12 +907,10 @@ def page_decision():
     for it in ([core] if core else []) + ([defen] if defen else []) + (p2.get("watch") or []) + (p2.get("rejected") or []):
         layer2_parts.append(_sector_chip(it))
     layer2 = (f"<div class='card'><h3>准入线:{p2.get('pass_score')} 分 · 一票否决 + 分级</h3>"
-              f"{''.join(layer2_parts) or '<div class=mut>暂无板块数据</div>'}</div>")
+              f"<div class='tbl'><table><tr><th>板块</th><th>评分</th><th>当日涨跌</th><th>主力净流入</th>"
+              f"<th>涨停家数</th><th>3日/20日涨幅</th><th>入选理由 / 否决原因</th></tr>"
+              f"{''.join(layer2_parts) or '<tr><td colspan=7 class=mut>暂无板块数据</td></tr>'}</table></div></div>")
     layer3 = _layer3_html(d.get("targets"))
-
-    def _layer4(sec_t, sec_name):
-        return ("<div class='card'><h3>⚙️ 执行参数 · {}</h3>{}</div>"
-                .format(_h(sec_name), _plan_table_html(d.get("plans") or {}, sec_name)))
 
     content = [
         '<header><h1>🎯 今日决策</h1>'
@@ -904,9 +923,8 @@ def page_decision():
         '<div class="card"><h3>🧭 决策过程拆解(四层漏斗)</h3>'
         '<details open><summary><b>① 大盘开仓许可评级</b></summary>' + layer1 + '</details>'
         '<details open><summary><b>② 主线概念遴选</b></summary>' + layer2 + '</details>'
-        '<details><summary><b>③ 标的精准匹配</b></summary>' + layer3 + '</details>'
+        '<details open><summary><b>③ 标的精准匹配</b></summary>' + layer3 + '</details>'
         '<details open><summary><b>④ 执行参数</b></summary>' + core_plan + '</details></div>',
-        '<div class="card"><h3>📋 执行计划表(首选标的)</h3>' + core_plan + "</div>",
         '<div class="card"><h3>🔗 全量数据入口</h3><div class="line">'
         '<a class="btn gray" href="/analyze">📈 走势预测</a> '
         '<a class="btn gray" href="/signals">📋 今日信号单</a> '
