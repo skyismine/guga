@@ -199,6 +199,16 @@ DEFAULTS = {
     },
     # ---- 合规话术(固定,不可编辑)
     "disclaimer": "以上内容为辅助决策参考,不构成投资建议。股市有风险,入市需谨慎。",
+    # ---- 第三轮:前端体验优化开关(Web 展示/交互,不影响任何计算逻辑)
+    "web_ui": {
+        "conclusion_bar": True,     # 优化项1:顶部极简结论卡
+        "yesterday_review": True,   # 优化项2:底部昨日信号复盘
+        "rejected_collapse": True,  # 优化项3a:淘汰板块默认折叠
+        "target_tabs": True,        # 优化项3b:标的匹配 Tab 切换
+        "mood_risk_tag": True,      # 优化项3c:情绪龙头高波动风险标签
+        "delta_arrows": True,       # 优化项3d:数值字段环比箭头
+        "sector_detail": True,      # 优化项4:板块详情下钻弹窗
+    },
 }
 
 

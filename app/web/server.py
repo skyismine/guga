@@ -3,10 +3,12 @@
 启动: python run_web.py  (默认 http://127.0.0.1:8000)
 """
 import io
+import json
 import os
 import re as _re
 import sys
 import time as _time
+import datetime as _dt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -193,6 +195,26 @@ def _shell(active: str, title: str, content: str) -> str:
            background:#1a2130; border:1px solid var(--line); box-shadow:0 6px 24px rgba(0,0,0,.45); }
   .toast.ok { color:#26a69a; border-color:#26a69a66; }
   .toast.err { color:#ef5350; border-color:#ef535066; }
+  /* ---- 第三轮:前端体验 ---- */
+  details.card details, details.card > summary { outline:none; }
+  details > summary { cursor:pointer; user-select:none; }
+  .delta { color:var(--mut); }
+  .delta.up{color:#ef5350;} .delta.down{color:#26a69a;}
+  .target-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; }
+  .tabs-btn { padding:7px 16px; border-radius:8px; border:1px solid var(--line); background:#0b1018;
+              color:var(--txt); cursor:pointer; font-size:14px; }
+  .tabs-btn.on { background:#2f6fed; border-color:#2f6fed; color:#fff; }
+  .tab-pane { display:none; }
+  .tab-pane.on { display:block; }
+  .modal-mask { position:fixed; inset:0; z-index:1000; background:rgba(8,12,20,.72);
+                display:flex; align-items:center; justify-content:center; padding:20px; }
+  .modal-box { background:var(--card); border:1px solid var(--line); border-radius:14px;
+               width:100%; max-width:980px; max-height:92vh; overflow:auto; padding:18px; }
+  .modal-head { display:flex; justify-content:space-between; align-items:center;
+                border-bottom:1px solid var(--line); padding-bottom:10px; margin-bottom:12px; }
+  .modal-head h3 { margin:0; color:#7aa2ff; }
+  .modal-x { cursor:pointer; font-size:18px; color:var(--mut); }
+  .modal-x:hover { color:#fff; }
   @media(max-width:900px){ .grid,.grid3{grid-template-columns:1fr;} }
 </style>
 </head>
@@ -803,10 +825,22 @@ def _sector_chip(it) -> str:
     fund_txt = f"{rate * 100:.1f}%" if rate is not None else "-"
     rank = it.get("fund_rank_1d")
     rank_txt = f"{rank} 名" if rank else "-"
-    return (f"<tr><td><b>{_h(it.get('name'))}</b><span class='badge {cls}' style='margin-left:8px'>{lab}</span></td>"
+    # 第三轮:环比箭头(较上一交易日) + 点击下钻弹窗
+    prev_row = (_SECTOR_PREV_MAP if _SECTOR_PREV_MAP else {}).get(it.get("name")) or {}
+    delta_on = _web_ui_flag("delta_arrows")
+    pct_delta = _delta_arrow_pct(it.get("pct_chg"), prev_row.get("pct_chg")) if delta_on else ""
+    net_delta = _delta_arrow(it.get("net_yi"), prev_row.get("net_yi")) if delta_on else ""
+    detail_on = _web_ui_flag("sector_detail")
+    if detail_on:
+        name_js = _h(it.get("name"))
+        row_click = f" onclick='openSectorDetail(\"{name_js}\")' style='cursor:pointer'"
+    else:
+        row_click = ""
+    return (f"<tr{row_click}>"
+            f"<td><b>{_h(it.get('name'))}</b><span class='badge {cls}' style='margin-left:8px'>{lab}</span></td>"
             f"<td>{it.get('score')}</td>"
-            f"<td class='{'up' if (it.get('pct_chg') or 0) >= 0 else 'down'}'>{it.get('pct_chg', 0):+.2f}%</td>"
-            f"<td>{it.get('net_yi', 0):+.1f} 亿</td><td>{zt}</td>"
+            f"<td class='{'up' if (it.get('pct_chg') or 0) >= 0 else 'down'}'>{it.get('pct_chg', 0):+.2f}%{pct_delta}</td>"
+            f"<td>{it.get('net_yi', 0):+.1f} 亿{net_delta}</td><td>{zt}</td>"
             f"<td class='mut'>{gain3} / {ret20}</td>"
             f"<td class='mut'>{pos}</td>"
             f"<td class='{rr_cls}'>{rr_txt} <span style='font-size:11px'>({rr_lab})</span></td>"
@@ -829,6 +863,11 @@ def _target_item_html(it, trigger_on=True) -> str:
         price += f'<br><span class="mut">成交 {it["amount_wan"]:,.0f} 万</span>'
     elif it.get("amount_yi"):
         price += f'<br><span class="mut">成交 {it["amount_yi"]} 亿</span>'
+    # 第三轮:情绪龙头高波动风险标签
+    if _web_ui_flag("mood_risk_tag") and (it.get("role") == "情绪龙头"):
+        risk_tag = f'<br>{_MOOD_RISK_TAG}'
+    else:
+        risk_tag = ""
     lv_txt = (f"支撑 {_h(lv.get('support'))}<br>压力 {_h(lv.get('resistance'))}"
               f"<br>止损 {_h(lv.get('stop_loss'))}" if lv else "-")
     trig = _h(it.get("trigger")) if trigger_on and it.get("trigger") else "-"
@@ -836,7 +875,7 @@ def _target_item_html(it, trigger_on=True) -> str:
     act_cls = {"关注低吸": "up", "突破跟进": "up", "持有观察": "flat", "减仓兑现": "down", "观望": "flat"}.get(act, "mut")
     adj = "".join(f'<div class="mut" style="font-size:12px">· {_h(n)}</div>'
                   for n in (it.get("adj_notes") or [])[:2]) or "-"
-    return (f"<tr><td><b>{_h(it.get('name'))}</b><br><span class='mut'>{_h(it.get('code'))}</span></td>"
+    return (f"<tr><td><b>{_h(it.get('name'))}</b>{risk_tag}<br><span class='mut'>{_h(it.get('code'))}</span></td>"
             f"<td>{_h(it.get('role') or '-')}</td>"
             f"<td>{price}</td>"
             f"<td>{p_up} / {p_flat} / {p_down}</td>"
@@ -904,6 +943,474 @@ def _plan_table_html(plans: dict, sector: str) -> str:
             + "\n".join(rows) + "</table></div>")
 
 
+# ============================================================ 第三轮:前端体验优化
+from app import config as _cfg_mod
+
+_TARGET_SNAP_DIR = os.path.join(config.DATA_DIR, "review")
+_SECTOR_PREV_MAP = {}  # 每请求在 page_decision 里刷新 {name: {pct_chg, net_yi}}
+
+
+def _web_ui_flag(key: str) -> bool:
+    """读取 web_ui 开关(第三轮)。"""
+    try:
+        from app.support import settings as _st
+        return bool((_st.load().get("web_ui") or {}).get(key, True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _safe_date_str(d=None) -> str:
+    return (d or _dt.date.today()).isoformat()
+
+
+def _prev_trade_date() -> str:
+    """返回最近一个非今日的交易日(用于昨日复盘)。"""
+    from app.review.data import review_date
+    try:
+        d = review_date()
+        if str(d) < str(_dt.date.today()):
+            return str(d)
+    except Exception:  # noqa: BLE001
+        pass
+    # 兜底:往前找 data_cache 的 targets_*.json
+    import glob
+    pat = os.path.join(_TARGET_SNAP_DIR, "targets_*.json")
+    files = sorted(glob.glob(pat)) if glob.glob(pat) else []
+    return os.path.basename(files[-1])[8:-5] if files else ""
+
+
+def _save_target_snapshot(data: dict) -> None:
+    """把今日决策的推荐标的 + 板块行情快照持久化,供次日「昨日信号复盘 / 环比箭头」使用。"""
+    os.makedirs(_TARGET_SNAP_DIR, exist_ok=True)
+    date = str(data.get("date") or _dt.date.today())
+    plans = data.get("plans") or {}
+    snap = {"date": date, "sectors": []}
+    for sector, seg in plans.items():
+        for role, p in seg.items():
+            if not p.get("ok") or not p.get("code"):
+                continue
+            snap["sectors"].append({
+                "sector": sector, "role": role,
+                "code": p.get("code"), "name": p.get("name"),
+                "asset_type": p.get("asset_type"), "position_pct": p.get("position_pct"),
+            })
+    if not snap["sectors"]:  # plans 空则从 targets 提取
+        for sector, t in (data.get("targets") or {}).items():
+            for role, seg in (("aggressive", t.get("aggressive")), ("steady", t.get("steady")), ("etf", t.get("etf"))):
+                items = (seg or {}).get("items") or []
+                for it in items[:1]:
+                    if it.get("error") or not it.get("code"):
+                        continue
+                    snap["sectors"].append({"sector": sector, "role": role,
+                                            "code": it["code"], "name": it.get("name"),
+                                            "asset_type": role, "position_pct": None})
+    path = os.path.join(_TARGET_SNAP_DIR, f"targets_{date}.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+    # 板块行情快照(环比箭头数据源)
+    p2 = (data.get("layers") or {}).get("layer2") or {}
+    sectors_daily = {}
+    for it in ([p2.get("core")] if p2.get("core") else []) + \
+               ([p2.get("defensive")] if p2.get("defensive") else []) + \
+               (p2.get("watch") or []) + (p2.get("rejected") or []):
+        if it:
+            sectors_daily[it.get("name")] = {"pct_chg": it.get("pct_chg"), "net_yi": it.get("net_yi")}
+    day_path = os.path.join(_TARGET_SNAP_DIR, f"layers_{date}.json")
+    try:
+        with open(day_path, "w", encoding="utf-8") as f:
+            json.dump({"date": date, "sectors": sectors_daily}, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+
+
+# ---- 优化项1:极简结论卡
+def _conclusion_bar_html(con: dict, d: dict) -> str:
+    core = con.get("core_sector") or "-"
+    stock = con.get("core_stock") or "暂无可执行标的"
+    act = "关注主线回踩/突破机会,分批布局"
+    if con.get("grade") in ("C", "D"):
+        act = "市场偏弱,以观望/持有兑现为主"
+    risk = con.get("risk_tip") or "-"
+    grade_cls = _grade_badge(con.get("grade"))
+    return (f"<div class='card' id='conclusion-bar' style='border:0;background:linear-gradient(135deg,#1b2a63 0%,#17233f 100%);"
+            f"padding:14px 18px;margin:10px 0'><div style='display:flex;gap:14px;align-items:center;flex-wrap:wrap'>"
+            f"<div class='badge {grade_cls}' style='font-size:22px;padding:6px 16px'>{_h(con.get('grade_label') or '')}</div>"
+            f"<div style='font-size:24px;font-weight:800;color:#fff'>总仓位上限 <span style='color:#ffca28'>{con.get('cap', 0):.0%}</span></div>"
+            f"<div style='flex:1;min-width:260px;font-size:15px;line-height:1.7'>"
+            f"<b>首选方向:</b> {_h(core) or '—'} &nbsp; <b>首选标的:</b> {_h(stock)}<br>"
+            f"<span style='color:#ffd54f;font-weight:600'>操作建议:</span> {_h(act)} &nbsp;"
+            f"<span style='color:#ff8a80;font-weight:600'>核心风险:</span> {_h(risk)}</div>"
+            f"</div><div class='mut' style='font-size:12px;margin-top:6px'>盯盘速览:{_h(con.get('line') or '')}</div></div>")
+
+
+# ---- 优化项2:昨日信号复盘
+def _load_prev_targets() -> list:
+    prev = _prev_trade_date()
+    if not prev:
+        return []
+    path = os.path.join(_TARGET_SNAP_DIR, f"targets_{prev}.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("sectors") or []
+    except (OSError, ValueError):
+        return []
+
+
+def _yesterday_review_html() -> str:
+    try:
+        items = _enrich_prev_with_quotes(_load_prev_targets())
+        if not items:
+            return ('<div class="card"><h3>📋 昨日信号复盘</h3>'
+                    '<div class="mut">暂无昨日快照:今日生成决策后,次日将自动复盘昨日推荐标的今日表现。</div></div>')
+        rows = []
+        pcts = []
+        up = 0
+        for it in items:
+            pct = it.get("pct_chg")
+            label = ""
+            if pct is None:
+                label = '<span class="mut">-</span>'
+            else:
+                pcts.append(pct)
+                if pct > 0:
+                    up += 1
+                cls = "up" if pct > 0 else ("down" if pct < 0 else "flat")
+                label = f"<span class='{cls}'>{pct:+.2f}%</span>"
+            rows.append(
+                f"<tr><td>{_h(it.get('sector') or '')}</td><td>{_h(it.get('name') or '')}"
+                f"<br><span class='mut'>{_h(it.get('code') or '')}</span></td>"
+                f"<td>{_h(it.get('role') or '')}</td><td>{label}</td></tr>")
+        n = len(items)
+        avg = sum(pcts) / len(pcts) if pcts else None
+        mx = max(pcts) if pcts else None
+        mn = min(pcts) if pcts else None
+        stat = (f"昨日推荐 <b>{n}</b> 只 · 上涨 <b class='up'>{up}</b> 只 · 胜率 "
+                f"<b class='{'up' if n and up / n >= 0.5 else 'down'}'>{up / n * 100:.0f}%</b>"
+                f" · 平均 <b>{avg:+.2f}%</b>" if avg is not None else f"昨日推荐 <b>{n}</b> 只")
+        if mx is not None:
+            stat += f" · 最大涨幅 <b class='up'>{mx:+.2f}%</b> · 最大跌幅 <b class='down'>{mn:+.2f}%</b>"
+        return ('<details class="card"><summary><b>📋 昨日信号复盘</b> &nbsp;<span class="mut">'
+                + _h(f"{_prev_trade_date()} 推荐标的 → 今日表现") + '</span></summary>'
+                + f"<div class='line'>{stat}</div>"
+                + (f"<div class='tbl'><table><tr><th>板块</th><th>标的</th><th>档位</th><th>今日</th></tr>"
+                   + "".join(rows) + "</table></div>" if rows else "")
+                + "</details>")
+    except Exception as e:  # noqa: BLE001
+        return f'<div class="card"><h3>📋 昨日信号复盘</h3><div class="err">加载失败:{_h(e)}</div></div>'
+
+
+def _prev_pick_set(prev_snaps: list) -> dict:
+    """把昨日快照去重成 {code: item}。"""
+    out = {}
+    for s in prev_snaps:
+        c = s.get("code")
+        if c:
+            out[c] = s
+    return out
+
+
+def _enrich_prev_with_quotes(snaps: list) -> list:
+    """用今日实时行情填充昨日快照的 pct。"""
+    if not snaps:
+        return []
+    codes = list(dict.fromkeys(s.get("code") for s in snaps if s.get("code")))
+    if not codes:
+        return snaps
+    from app.data import fetcher as _fe
+    try:
+        quotes = _fe.get_spot_quotes(codes)
+    except Exception:  # noqa: BLE001
+        quotes = {}
+    for s in snaps:
+        q = quotes.get(s.get("code")) or {}
+        s["quoted"] = q
+        s["pct_chg"] = q.get("pct_chg")
+        s["price"] = q.get("price")
+    return snaps
+
+
+# ---- 优化项3a:淘汰板块折叠显示
+def _rejected_section_html(rejected: list, on: bool) -> str:
+    if not rejected:
+        return ""
+    if not on:
+        detail = "".join(_sector_chip(it) for it in rejected)
+        return ('<details open><summary><b>已淘汰板块</b>(<span class="mut">'
+                + str(len(rejected)) + ' 个</span>)</summary>' + detail + '</details>')
+    head = f"已淘汰 {len(rejected)} 个"
+    return (f"<details closed class='card'><summary><b>🗑 {_h(head)}</b>"
+            f"<span class='mut' style='margin-left:8px'>点击展开查看详情</span></summary>"
+            f"<div class='tbl'><table><tr><th>板块</th><th>评分</th><th>当日涨跌</th><th>主力净流入</th>"
+            f"<th>涨停家数</th><th>3日/20日涨幅</th><th>位置评级</th><th>盈亏比</th><th>优先级</th>"
+            f"<th>当日净流入率/排名</th><th>淘汰原因</th></tr>"
+            + "".join(_sector_chip(it) for it in rejected)
+            + "</table></div></details>")
+
+
+def _prev_sector_map() -> dict:
+    """读取上一交易日板块行情快照 {name: {pct_chg, net_yi}}。"""
+    prev = _prev_trade_date()
+    if not prev:
+        return {}
+    path = os.path.join(_TARGET_SNAP_DIR, f"layers_{prev}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("sectors") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+# ---- 优化项3b:标的匹配 Tab 切换
+def _target_tabs_html(data: dict) -> str:
+    targets = data.get("targets") or {}
+    sectors = list(targets.keys())
+    if not sectors:
+        return '<div class="card"><h3>🎯 标的匹配(三档)</h3><div class="mut">暂无可匹配标的</div></div>'
+    tabs = "".join(
+        f'<button class="tabs-btn{" on" if i == 0 else ""}" data-tab="tab-{i}" type="button">{_h(s)}</button>'
+        for i, s in enumerate(sectors))
+    panes = []
+    for i, s in enumerate(sectors):
+        pane = _layer3_html({s: targets[s]})
+        panes.append(f'<div class="tab-pane{" on" if i == 0 else ""}" id="tab-{i}">{pane}</div>')
+    return ('<div class="card"><h3>🎯 标的匹配(三档 · 点击板块切换)</h3>'
+            f'<div class="target-tabs">{tabs}</div>{"".join(panes)}</div>')
+
+
+# ---- 优化项4:板块详情弹窗(结构 + 前端 JS/CSS)
+def _sector_modal_html() -> str:
+    if not _web_ui_flag("sector_detail"):
+        return ""
+    return """<div id="sector-modal" class="modal-mask" style="display:none" onclick="if(event.target===this)closeSectorModal()">
+  <div class="modal-box">
+    <div class="modal-head"><h3 id="sector-modal-title">板块详情</h3>
+      <span class="modal-x" onclick="closeSectorModal()">✕</span></div>
+    <div id="sector-modal-body"><div class="mut">加载中…</div></div>
+  </div>
+</div>
+<script>
+function openSectorDetail(name){
+  var m=document.getElementById('sector-modal');
+  document.getElementById('sector-modal-title').textContent=name+' · 板块详情';
+  document.getElementById('sector-modal-body').innerHTML='<div class="mut">加载中…</div>';
+  m.style.display='flex';
+  fetch('/api/sector_detail?name='+encodeURIComponent(name)).then(function(r){return r.json()})
+   .then(function(j){
+     if(j.error){document.getElementById('sector-modal-body').innerHTML='<div class="err">'+j.error+'</div>';return;}
+     var h='<div class="line" style="font-size:14px"><b>'+j.name+'</b></div>';
+     h+='<div class="grid">'
+        +'<div><div class="mut" style="margin:6px 0">打分明细</div><div class="tbl"><table>'+(j.breakdown_html||'')+'</table></div></div>'
+        +'<div>'+(j.kline_html||'')+'</div></div>';
+     h+='<div class="mut" style="margin:6px 0">入选理由 / 否决原因</div>'+ (j.reason_html||'');
+     h+='<div class="grid"><div><div class="mut" style="margin:6px 0">成分股涨幅 Top10</div>'+(j.constituent_html||'')+'</div>'
+        +'<div><div class="mut" style="margin:6px 0">今日相关新闻</div>'+(j.news_html||'')+'</div></div>';
+     document.getElementById('sector-modal-body').innerHTML=h;
+   })
+   .catch(function(e){document.getElementById('sector-modal-body').innerHTML='<div class="err">请求失败:'+e+'</div>';});
+}
+function closeSectorModal(){document.getElementById('sector-modal').style.display='none';}
+Array.prototype.forEach.call(document.querySelectorAll('.target-tabs .tabs-btn'),function(b){
+  b.addEventListener('click',function(){
+    document.querySelectorAll('.target-tabs .tabs-btn').forEach(function(x){x.classList.remove('on');});
+    b.classList.add('on');
+    document.querySelectorAll('.tab-pane').forEach(function(p){p.classList.remove('on');});
+    document.getElementById(b.getAttribute('data-tab')).classList.add('on');
+  });
+});
+</script>"""
+
+
+# ---- 优化项3c:情绪龙头高波动风险标签
+_MOOD_RISK_TAG = '<span class="mut" style="font-size:11px;color:#8a94a8">高波动·纯情绪博弈·建议极轻仓</span>'
+
+
+# ---- 优化项3d:环比箭头
+def _delta_arrow(cur, prev, good_up: bool = True) -> str:
+    """cur/prev 为数值(可 None);返回 ↑↓ 变化值 HTML。"""
+    if cur is None or prev is None:
+        return ""
+    try:
+        cur = float(cur); prev = float(prev)
+    except (TypeError, ValueError):
+        return ""
+    delta = cur - prev
+    cls = "up" if (delta >= 0) else "down"
+    if not good_up:
+        cls = "down" if (delta >= 0) else "up"
+    arrow = "↑" if (cur >= prev) else "↓"
+    return f'<span class="delta {cls}" title="较前日" style="font-size:11px"> {arrow}{delta:+.2f}</span>'
+
+
+def _delta_arrow_pct(cur, prev) -> str:
+    if cur is None or prev is None:
+        return ""
+    try:
+        c = float(cur); p = float(prev)
+    except (TypeError, ValueError):
+        return ""
+    if p == 0:
+        return ""
+    d = c - p
+    cls = "up" if d >= 0 else "down"
+    arrow = "↑" if d >= 0 else "↓"
+    return f'<span class="delta {cls}" style="font-size:11px">({arrow}{d:+.2f})</span>'
+
+
+# ---- 优化项4:板块详情下钻
+def _sector_detail_html(it: dict) -> str:
+    """生成板块详情卡(函数内组织数据,弹窗由前端拼接)。"""
+    bd = it.get("breakdown") or {}
+    stats = it.get("stats") or {}
+    rows = []
+    def _row(k, v, fmt=None):
+        txt = fmt(v) if fmt and v is not None else ("-" if v is None else str(v))
+        rows.append(f"<tr><th>{_h(k)}</th><td>{_h(txt)}</td></tr>")
+    _row("综合评分", it.get("score"))
+    _row("资金分项(满分40)", bd.get("fund"))
+    _row("· 5日资金分项", bd.get("fund_5d"))
+    _row("· 单日资金分项", bd.get("fund_1d"))
+    _row("趋势分项(满分30)", bd.get("trend"))
+    _row("情绪分项(满分20)", bd.get("sentiment"))
+    _row("消息分项(满分10)", bd.get("news"))
+    _row("当日涨跌", it.get("pct_chg"), lambda v: f"{v:+.2f}%")
+    _row("主力净流入", it.get("net_yi"), lambda v: f"{v:+.1f} 亿")
+    _row("涨停家数", it.get("zt_count"))
+    _row("净流入率(单日)", it.get("rate_1d"), lambda v: f"{v * 100 if v is not None else 0:.1f}%")
+    _row("5日净流入率", it.get("rate_5d"), lambda v: f"{v * 100 if v is not None else 0:.1f}%")
+    _row("位置评级", it.get("pos_rating"))
+    _row("盈亏比", it.get("profit_ratio"))
+    _row("操作优先级", it.get("priority"))
+    _row("3日涨幅", stats.get("gain3"), lambda v: f"{v * 100:.1f}%")
+    _row("20日涨幅", stats.get("ret20"), lambda v: f"{v * 100:.1f}%")
+    _row("20日回撤", stats.get("dd20"), lambda v: f"{v * 100:.1f}%")
+    reasons = it.get("reasons") or []
+    reason = "".join(f"<div class='line' style='font-size:13px'>· {_h(r)}</div>" for r in reasons[:6])
+    return {"name": it.get("name"), "score": it.get("score"),
+            "breakdown_rows": rows, "reason": reason}
+
+
+def _sector_detail_kline_html(name: str) -> str:
+    """板块概念指数 K 线(Plotly 迷你图)。"""
+    import plotly.graph_objects as go
+    import plotly.io as pio
+    try:
+        from app.features.concept_features import _get_concept_close
+        s = _get_concept_close(name)
+        if s is None or len(s) < 2:
+            return '<div class="mut">暂无指数数据</div>'
+        close = s.astype(float)
+        idx = [str(x)[:10] for x in close.index]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=idx, y=close.values, mode="lines",
+                                 line=dict(color="#ef5350", width=1.5),
+                                 fill="tozeroy", fillcolor="rgba(239,83,80,0.12)"))
+        fig.update_layout(title=f"{_h(name)} 概念指数(近 {len(close)} 个交易日)",
+                          template="plotly_dark", height=240, margin=dict(l=10, r=10, t=36, b=10),
+                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                          xaxis=dict(showgrid=False), yaxis=dict(showgrid=True, gridcolor="rgba(90,110,160,0.15)"))
+        return pio.to_html(fig, full_html=False, include_plotlyjs="cdn",
+                           default_width="100%", default_height="100%")
+    except Exception as e:  # noqa: BLE001
+        return f'<div class="mut">指数不可用</div>'
+
+
+def _sector_constituent_top(name: str, n: int = 10) -> str:
+    """板块成分股当日涨幅 Top N。"""
+    try:
+        from app.support import mainline as _ml
+        spot = _ml._a_spot_map()
+        stocks = _ml._match_stocks(name, spot)
+        if not stocks:
+            return '<div class="mut">暂无成分数据</div>'
+        rows_o = sorted(stocks, key=lambda s: -(s.get("pct_chg") or -999))[:n]
+        body = "".join(
+            f"<tr><td>{i + 1}</td><td>{_h(s.get('name') or '-')}<br><span class='mut'>{_h(s.get('code') or '')}</span></td>"
+            f"<td class='{'up' if (s.get('pct_chg') or 0) >= 0 else 'down'}'>{s.get('pct_chg', 0):+.2f}%</td></tr>"
+            for i, s in enumerate(rows_o))
+        return f"<div class='tbl'><table><tr><th>#</th><th>成分股</th><th>涨跌幅</th></tr>{body}</table></div>"
+    except Exception as e:  # noqa: BLE001
+        return f'<div class="mut">成分不可用</div>'
+
+
+def _sector_news_html(name: str) -> str:
+    """板块相关新闻摘要(复用 review events)。"""
+    try:
+        from app.review.data import collect_events
+        ev = collect_events()
+        news = ev.get("news") or []
+        kw = _news_keywords(name)
+        hits = []
+        for n in news:
+            text = f"{n.get('title', '')} {n.get('summary', '')}"
+            if text and any(k and k in text for k in kw):
+                hits.append(n)
+                if len(hits) >= 6:
+                    break
+        if not hits:
+            return '<div class="mut">今日无直接相关新闻</div>'
+        rows = "".join(
+            f'<div class="line" style="font-size:13px"><span class="mut">{_h(n.get("time") or "")}</span> '
+            f'<b>{_h(n.get("title") or "")}</b><br><span class="mut">{_h(n.get("summary") or "")}</span></div>'
+            for n in hits)
+        return f'<div style="max-height:260px;overflow:auto">{rows}</div>'
+    except Exception:  # noqa: BLE001
+        return '<div class="mut">新闻数据不可用</div>'
+
+
+def _news_keywords(name: str) -> list:
+    """从板块名拆出关键词用于新闻命中。"""
+    kws = [name]
+    if len(name) >= 4:
+        kws.append(name[:4])
+    return [k for k in kws if k]
+
+
+@app.route("/api/sector_detail")
+def api_sector_detail():
+    """板块详情下钻:打分明细 + K线 + 成分TOP + 新闻。"""
+    name = (request.args.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "缺少板块名称"}), 400
+    try:
+        from app.decision import engine as _en
+        p2 = _en.mainline_select()
+        it = None
+        for grp in ("core", "defensive"):
+            if p2.get(grp) and p2[grp]["name"] == name:
+                it = p2[grp]
+                break
+        if it is None:
+            for w in (p2.get("watch") or []):
+                if w["name"] == name:
+                    it = w
+                    break
+        if it is None:
+            for rj in (p2.get("rejected") or []):
+                if rj["name"] == name:
+                    it = rj
+                    break
+        if it is None:
+            return jsonify({"error": f"未找到板块: {name}"}), 404
+        detail = _sector_detail_html(it)
+        return jsonify({
+            "name": name,
+            "breakdown_html": "".join(detail["breakdown_rows"]),
+            "kline_html": _sector_detail_kline_html(name),
+            "constituent_html": _sector_constituent_top(name),
+            "news_html": _sector_news_html(name),
+            "reason_html": detail["reason"],
+        })
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/decision")
 def page_decision():
     refresh = request.args.get("refresh") == "1"
@@ -919,10 +1426,12 @@ def page_decision():
     p1 = d["layers"]["layer1"]
     p2 = d["layers"]["layer2"]
 
+    global _SECTOR_PREV_MAP
+    _SECTOR_PREV_MAP = _prev_sector_map()
+    _save_target_snapshot(d)
+
     core = p2.get("core")
     defen = p2.get("defensive")
-    core_t = (d.get("targets") or {}).get(core["name"]) if core else None
-    def_t = (d.get("targets") or {}).get(defen["name"]) if defen else None
     plans = d.get("plans") or {}
     core_plan = _plan_table_html(plans, core["name"]) if core else '<div class="mut">无达标主线,暂无执行计划</div>'
 
@@ -936,14 +1445,25 @@ def page_decision():
 
     layer1 = _layer1_html(p1)
     layer2_parts = []
-    for it in ([core] if core else []) + ([defen] if defen else []) + (p2.get("watch") or []) + (p2.get("rejected") or []):
+    for it in ([core] if core else []) + ([defen] if defen else []) + (p2.get("watch") or []):
         layer2_parts.append(_sector_chip(it))
     layer2 = (f"<div class='card'><h3>准入线:{p2.get('pass_score')} 分 · 一票否决 + 分级</h3>"
               f"<div class='tbl'><table><tr><th>板块</th><th>评分</th><th>当日涨跌</th><th>主力净流入</th>"
               f"<th>涨停家数</th><th>3日/20日涨幅</th><th>位置评级</th><th>盈亏比</th><th>优先级</th>"
               f"<th>当日净流入率/排名</th><th>入选理由 / 否决原因</th></tr>"
-              f"{''.join(layer2_parts) or '<tr><td colspan=11 class=mut>暂无板块数据</td></tr>'}</table></div></div>")
-    layer3 = _layer3_html(d.get("targets"))
+              f"{''.join(layer2_parts) or '<tr><td colspan=11 class=mut>暂无板块数据</td></tr>'}</table></div>"
+              + _rejected_section_html(p2.get("rejected") or [], _web_ui_flag("rejected_collapse"))
+              + "</div>")
+
+    # 第三轮:极简结论卡(默认展开,叠加在原有结论卡上方)
+    bar = _conclusion_bar_html(con, d) if _web_ui_flag("conclusion_bar") else ""
+    # 第三轮:标的匹配 Tab 切换
+    if _web_ui_flag("target_tabs"):
+        layer3 = _target_tabs_html(d)
+    else:
+        layer3 = _layer3_html(d.get("targets"))
+    # 第三轮:昨日信号复盘(页面底部折叠)
+    yrev = _yesterday_review_html() if _web_ui_flag("yesterday_review") else ""
 
     content = [
         '<header><h1>🎯 今日决策</h1>'
@@ -952,6 +1472,7 @@ def page_decision():
         '<a class="btn gray" href="/settings">⚙️ 调整参数</a></header>',
         '<div class="card" style="border:1px solid #5b4231;background:#2a2017;color:#e0b27a">'
         '⚠️ 本站全部内容仅供研究参考,不构成投资建议;所有「关注/观察/建议配置」表述均为中性研究语义,不构成任何买卖指令。股市有风险,入市需谨慎。</div>',
+        bar,
         conclusion_html,
         '<div class="card"><h3>🧭 决策过程拆解(四层漏斗)</h3>'
         '<details open><summary><b>① 大盘开仓许可评级</b></summary>' + layer1 + '</details>'
@@ -965,6 +1486,8 @@ def page_decision():
         '<a class="btn gray" href="/portfolio">💼 持仓诊断</a> '
         '<a class="btn gray" href="/report">📄 复盘报告</a> '
         '<a class="btn gray" href="/alerts">🚨 盘中预警</a></div></div>',
+        yrev,
+        _sector_modal_html(),
         '<div class="footer">决策引擎由四层漏斗自动收敛:市场许可 → 主线遴选 → 标的匹配 → 执行参数。仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
     return _shell("decision", "今日决策", "\n".join(content))
@@ -1536,6 +2059,15 @@ _SETTING_FIELDS = [
         ("llm.timeout", "请求超时(秒)", "number", 10, 300, "接口响应超时上限"),
         ("llm.max_tokens", "生成长度上限", "number", 200, 4000, "单次生成最大 token"),
     ]),
+    ("前端体验", [
+        ("web_ui.conclusion_bar", "极简结论卡", "checkbox", None, None, "顶部一行浓缩结论:市场评级/仓位/首选方向/首选标的/建议/风险"),
+        ("web_ui.yesterday_review", "昨日信号复盘", "checkbox", None, None, "底部展示昨日推荐标的今日表现(胜率/涨跌幅统计)"),
+        ("web_ui.rejected_collapse", "淘汰板块折叠", "checkbox", None, None, "仅显示已淘汰数量,点击展开详情"),
+        ("web_ui.target_tabs", "标的匹配Tab切换", "checkbox", None, None, "点击板块才显示其标的列表,避免信息过载"),
+        ("web_ui.mood_risk_tag", "情绪龙头风险标签", "checkbox", None, None, "情绪龙头小票附加「高波动·纯情绪博弈·建议极轻仓」"),
+        ("web_ui.delta_arrows", "数值环比箭头", "checkbox", None, None, "关键数值对比前一交易日,标注 ↑↓ 与变化值"),
+        ("web_ui.sector_detail", "板块详情弹窗", "checkbox", None, None, "点击板块行下钻:打分明细/K线/成分TOP/新闻摘要"),
+    ]),
 ]
 
 
@@ -1606,7 +2138,7 @@ def _flatten_form(form) -> dict:
     out = {}
     for key in form:
         val = form.get(key)
-        if key.startswith("monitor.rules.") or key == "llm.enable":
+        if key.startswith("monitor.rules.") or key == "llm.enable" or key.startswith("web_ui."):
             val = True
         else:
             try:
@@ -1622,6 +2154,10 @@ def _flatten_form(form) -> dict:
         node[parts[-1]] = val
     out.setdefault("llm", {}).setdefault("enable", False)
     out.setdefault("mainline_dynamic_weight", False)
+    # web_ui 未勾选的开关回填 False(深合并会覆盖默认 True)
+    for wk in ("conclusion_bar", "yesterday_review", "rejected_collapse", "target_tabs",
+               "mood_risk_tag", "delta_arrows", "sector_detail"):
+        out.setdefault("web_ui", {}).setdefault(wk, False)
     return out
 
 

@@ -513,7 +513,15 @@ def sector_scores(use_cache=True) -> list:
         news_s = 1.0 if news.get(name) else 0.0
         score = (f["fund_score"] + w.get("trend", 30) * trend
                  + w.get("sentiment", 20) * senti + w.get("news", 10) * news_s)
-        rows.append({**f, "score": round(score, 2), "zt_count": z, "news_hits": news.get(name, 0)})
+        rows.append({**f, "score": round(score, 2), "zt_count": z, "news_hits": news.get(name, 0),
+                     "breakdown": {
+                         "fund": f["fund_score"],
+                         "fund_5d": f.get("fund_score_5d"),
+                         "fund_1d": f.get("fund_score_1d"),
+                         "trend": round(w.get("trend", 30) * trend, 2),
+                         "sentiment": round(w.get("sentiment", 20) * senti, 2),
+                         "news": round(w.get("news", 10) * news_s, 2),
+                     }})
     rows.sort(key=lambda x: x["score"], reverse=True)
     _mark_levels(rows)
     rows.extend(rejected)

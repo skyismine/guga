@@ -298,7 +298,8 @@ def mainline_select() -> dict:
             rejected.append({"name": r["industry"], "score": r.get("score", 0),
                              "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
                              "stats": stats_map.get(r["industry"]) or {},
-                             "level": "rejected", "reasons": [r["reject_reason"]]})
+                             "level": "rejected", "reasons": [r["reject_reason"]],
+                             "breakdown": r.get("breakdown") or {}})
             continue
         stats = stats_map.get(r["industry"])
         banned, why = _veto(r["industry"], r, dcfg, stats, zt_available=zt_available)
@@ -307,14 +308,16 @@ def mainline_select() -> dict:
                              "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
                              "zt_count": r["zt_count"], "leader": r.get("leader", ""),
                              "stats": stats or {},
-                             "level": "rejected", "reasons": why})
+                             "level": "rejected", "reasons": why,
+                             "breakdown": r.get("breakdown") or {}})
             continue
         item = {"name": r["industry"], "score": r["score"], "pct_chg": r["pct_chg"],
                 "net_yi": r["net_yi"], "zt_count": r["zt_count"], "leader": r.get("leader", ""),
                 "news_hits": r.get("news_hits", 0), "stats": stats or {},
                 "rate_1d": r.get("rate_1d"), "fund_rank_1d": r.get("fund_rank_1d"),
                 "fund_status": r.get("fund_status"), "rate_5d": r.get("rate_5d"),
-                "fund_rank_5d": r.get("fund_rank_5d")}
+                "fund_rank_5d": r.get("fund_rank_5d"),
+                "breakdown": r.get("breakdown") or {}}
         if r["score"] >= mline.get("pass_score", 60.0):
             item["reasons"] = _pass_reasons(r, stats)
             item["pool"] = _sector_pool(r["industry"])
