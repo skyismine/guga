@@ -1435,14 +1435,6 @@ def page_decision():
     plans = d.get("plans") or {}
     core_plan = _plan_table_html(plans, core["name"]) if core else '<div class="mut">无达标主线,暂无执行计划</div>'
 
-    conclusion_html = (
-        f"<div class='card' style='border-color:#2f6fed'><div style='display:flex;gap:18px;flex-wrap:wrap;align-items:center'>"
-        f"<div><div class='badge {_grade_badge(con['grade'])}' style='font-size:20px'>{_h(con['grade_label'])}</div>"
-        f"<div class='mut' style='margin-top:4px'>总仓位上限 <b style='font-size:20px'>{con['cap']:.0%}</b></div></div>"
-        f"<div style='flex:1;min-width:280px'><div class='line' style='font-size:15px'>{_h(con['line'])}</div>"
-        f"<div class='flat' style='margin-top:6px'>⚠️ 风险提示:{_h(con['risk_tip'])}</div></div>"
-        f"</div></div>")
-
     layer1 = _layer1_html(p1)
     layer2_parts = []
     for it in ([core] if core else []) + ([defen] if defen else []) + (p2.get("watch") or []):
@@ -1473,19 +1465,11 @@ def page_decision():
         '<div class="card" style="border:1px solid #5b4231;background:#2a2017;color:#e0b27a">'
         '⚠️ 本站全部内容仅供研究参考,不构成投资建议;所有「关注/观察/建议配置」表述均为中性研究语义,不构成任何买卖指令。股市有风险,入市需谨慎。</div>',
         bar,
-        conclusion_html,
         '<div class="card"><h3>🧭 决策过程拆解(四层漏斗)</h3>'
         '<details open><summary><b>① 大盘开仓许可评级</b></summary>' + layer1 + '</details>'
         '<details open><summary><b>② 主线概念遴选</b></summary>' + layer2 + '</details>'
         '<details open><summary><b>③ 标的精准匹配</b></summary>' + layer3 + '</details>'
         '<details open><summary><b>④ 执行参数</b></summary>' + core_plan + '</details></div>',
-        '<div class="card"><h3>🔗 全量数据入口</h3><div class="line">'
-        '<a class="btn gray" href="/analyze">📈 走势预测</a> '
-        '<a class="btn gray" href="/signals">📋 今日信号单</a> '
-        '<a class="btn gray" href="/mainline">🔥 主线板块</a> '
-        '<a class="btn gray" href="/portfolio">💼 持仓诊断</a> '
-        '<a class="btn gray" href="/report">📄 复盘报告</a> '
-        '<a class="btn gray" href="/alerts">🚨 盘中预警</a></div></div>',
         yrev,
         _sector_modal_html(),
         '<div class="footer">决策引擎由四层漏斗自动收敛:市场许可 → 主线遴选 → 标的匹配 → 执行参数。仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
