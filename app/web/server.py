@@ -789,11 +789,29 @@ def _sector_chip(it) -> str:
     st = it.get("stats") or {}
     gain3 = f"{st['gain3'] * 100:+.1f}%" if st.get("gain3") is not None else "-"
     ret20 = f"{st['ret20'] * 100:+.1f}%" if st.get("ret20") is not None else "-"
+    # 升级3:板块性价比维度(位置评级/盈亏比/操作优先级)
+    pos = _h(it.get("pos_rating") or "-")
+    rr = it.get("profit_ratio")
+    rr_txt = f"{rr:.2f}" if rr is not None else "-"
+    rr_lab = _h(it.get("rr_label") or "-")
+    rr_cls = {"高性价比": "up", "中等性价比": "flat", "追高风险": "down", "无数据": "mut"}.get(it.get("rr_label"), "mut")
+    pri = _h(it.get("priority") or "-")
+    pri_cls = {"高": "up", "中": "flat", "低": "down"}.get(it.get("priority"), "mut")
+    # 升级项1:资金面状态
+    fst = _h(it.get("fund_status") or "-")
+    rate = it.get("rate_1d")
+    fund_txt = f"{rate * 100:.1f}%" if rate is not None else "-"
+    rank = it.get("fund_rank_1d")
+    rank_txt = f"{rank} 名" if rank else "-"
     return (f"<tr><td><b>{_h(it.get('name'))}</b><span class='badge {cls}' style='margin-left:8px'>{lab}</span></td>"
             f"<td>{it.get('score')}</td>"
             f"<td class='{'up' if (it.get('pct_chg') or 0) >= 0 else 'down'}'>{it.get('pct_chg', 0):+.2f}%</td>"
             f"<td>{it.get('net_yi', 0):+.1f} 亿</td><td>{zt}</td>"
             f"<td class='mut'>{gain3} / {ret20}</td>"
+            f"<td class='mut'>{pos}</td>"
+            f"<td class='{rr_cls}'>{rr_txt} <span style='font-size:11px'>({rr_lab})</span></td>"
+            f"<td class='{pri_cls}'>{pri}</td>"
+            f"<td class='mut'>{fund_txt} / {rank_txt}<br><span style='font-size:11px'>{fst}</span></td>"
             f"<td class='mut'>{reason or '-'}</td></tr>")
 
 
@@ -852,8 +870,9 @@ def _plan_table_html(plans: dict, sector: str) -> str:
     rows = []
     for role, lab in (("steady", "稳健首选"), ("aggressive", "激进首选"), ("etf", "ETF")):
         p = seg.get(role) or {}
-        if p.get("error"):
-            rows.append(f"<tr><th>{lab}</th><td colspan='9' class='mut'>{_h(p.get('reason'))}</td></tr>")
+        if p.get("error") or (not p.get("ok") and p.get("reason")):
+            rows.append(f"<tr><th>{lab}</th><td colspan='10' class='mut'>"
+                        f"{_h(p.get('reason') or p.get('error'))}</td></tr>")
             continue
         if not p.get("ok"):
             continue
@@ -862,6 +881,13 @@ def _plan_table_html(plans: dict, sector: str) -> str:
                  if p.get("code") else "-")
         trig = _h(p.get("trigger")) if p.get("trigger") else "-"
         mode_tag = f"<br><span class='mut' style='font-size:12px'>模式: {_h(p.get('mode_note') or '')}</span>"
+        # 升级4:触发状态标签(未触发/触发中/已触发)
+        ts = p.get("trigger_status") or {}
+        ts_cls = {"trigger-on": "up", "trigger-off": "mut", "trigger-unknown": "mut"}.get(ts.get("label"), "mut")
+        ts_txt = _h(ts.get("status") or "未触发")
+        ts_note = _h(ts.get("note") or "")
+        ts_html = (f"<b class='{ts_cls}'>{ts_txt}</b><br><span class='mut' style='font-size:11px'>{ts_note}</span>"
+                   if ts else "-")
         rows.append(
             f"<tr><th>{lab}</th><td>{stock}{mode_tag}</td>"
             f"<td>{_h(p.get('price'))}</td>"
@@ -871,9 +897,10 @@ def _plan_table_html(plans: dict, sector: str) -> str:
             f"<td>{b.get('first', {}).get('ratio', 0) * 100:.0f}% @ {_h(b.get('first', {}).get('price'))}<br>"
             f"{b.get('second', {}).get('ratio', 0) * 100:.0f}% @ {_h(b.get('second', {}).get('price'))}</td>"
             f"<td class='mut'>{trig}</td>"
+            f"<td>{ts_html}</td>"
             f"<td class='mut'>{_h(p.get('note'))}</td></tr>")
     return ("<div class='tbl'><table><tr><th>档位</th><th>标的</th><th>现价</th><th>止损</th><th>目标1/2</th>"
-            "<th>建议仓位</th><th>分批方案</th><th>触发条件</th><th>说明</th></tr>"
+            "<th>建议仓位</th><th>分批方案</th><th>触发条件</th><th>触发状态</th><th>说明</th></tr>"
             + "\n".join(rows) + "</table></div>")
 
 
@@ -913,8 +940,9 @@ def page_decision():
         layer2_parts.append(_sector_chip(it))
     layer2 = (f"<div class='card'><h3>准入线:{p2.get('pass_score')} 分 · 一票否决 + 分级</h3>"
               f"<div class='tbl'><table><tr><th>板块</th><th>评分</th><th>当日涨跌</th><th>主力净流入</th>"
-              f"<th>涨停家数</th><th>3日/20日涨幅</th><th>入选理由 / 否决原因</th></tr>"
-              f"{''.join(layer2_parts) or '<tr><td colspan=7 class=mut>暂无板块数据</td></tr>'}</table></div></div>")
+              f"<th>涨停家数</th><th>3日/20日涨幅</th><th>位置评级</th><th>盈亏比</th><th>优先级</th>"
+              f"<th>当日净流入率/排名</th><th>入选理由 / 否决原因</th></tr>"
+              f"{''.join(layer2_parts) or '<tr><td colspan=11 class=mut>暂无板块数据</td></tr>'}</table></div></div>")
     layer3 = _layer3_html(d.get("targets"))
 
     content = [

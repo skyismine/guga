@@ -16,6 +16,7 @@ DEFAULTS = {
     "mainline_top_n": 2,          # Top-N 为核心主线
     "mainline_branch_top_n": 5,   # 前 N 名(含主线)标注补涨支线
     "mainline_dynamic_weight": True,  # 资金面动态权重开关:A级 5日20%/单日80%, C/D级 5日70%/单日30%
+    "mainline_fund_mode": "net_rate",  # 资金打分口径:net_rate(净流入率排名) | absolute(绝对金额排名,旧模式)
     "leader_min_market_cap": 20.0,   # 情绪龙头剔除 <20 亿小票(亿)
     "leader_exclude": ["ST", "退"],  # 龙头剔除名称关键词
     "etf_min_amount": 5000.0,        # ETF 日均成交额下限(万元)
@@ -75,6 +76,18 @@ DEFAULTS = {
         },
         # 第二层 主线准入与分级
         "mainline": {"pass_score": 60.0, "core_n": 1, "defensive_n": 1, "watch_n": 3},
+        # 第二层 资金面打分(升级1:净流入率公平性修正)
+        "fund": {
+            "admission_enabled": True,  # 5日资金准入门槛(一票否决)
+            "admission_net_5d_min": 0.0,  # 5日主力资金累计净流出<=此值 剔除
+            "admission_min_pct_5d": 0.0,  # 5日资金净流入但累计涨幅<=此值 视为量价背离剔除
+            "use_net_rate": True,         # True=净流入率打分(公平性), False=绝对金额(旧模式)
+            "rate_denom": "flow_sum",     # 净流入率分母:flow_sum(流入+流出) | amount(板块总成交额,数据缺失时回退flow_sum)
+            "out_field": True,            # 输出5日资金状态/当日净流入率/资金排名
+            "status_thresholds": {        # 5日资金状态判定
+                "sustain": 0.0,           # 5日+单日均流入 -> 持续流入
+            },
+        },
         # 第二层 板块属性池(先分池,再池内分级,禁止跨池对比)
         "pool": {
             "aggressive_kw": [  # 进攻属性池关键词(命中其一即归进攻)
@@ -128,6 +141,49 @@ DEFAULTS = {
             "target1_min_gain": 0.03,  # 第一目标价至少高于买入价 3%
             "pullback_span_max": 0.08, # 回踩区间(5日线~10日线)跨度上限 8%
             "position_check_tol": 0.05 # 仓位股数自洽校验偏差上限 5%
+        },
+        # 第四层 动态仓位矩阵(市场评级 x 标的类型),enabled=False 时回退固定 single_pct
+        "position_matrix": {
+            "enabled": True,           # 总开关:关闭则回退 risk.single_pct 固定单票仓位
+            "cap": {                   # 市场评级 x 标的类型 -> 单标的总仓位上限(占总资金)
+                "A": {"mood": 0.08, "mid": 0.12, "etf": 0.15, "def_etf": 0.10},
+                "B": {"mood": 0.05, "mid": 0.08, "etf": 0.10, "def_etf": 0.08},
+                "C": {"mood": 0.00, "mid": 0.03, "etf": 0.05, "def_etf": 0.10},
+                "D": {"mood": 0.00, "mid": 0.00, "etf": 0.00, "def_etf": 0.00},
+            },
+            "sector_cap": {            # 单板块总仓位上限(B级基准),enforce 开启时自动压缩
+                "A": 0.30, "B": 0.20, "C": 0.15, "D": 0.10,
+            },
+            "enforce": True,           # 超过单板块上限时自动压缩并给出预警
+        },
+        # 第三层 板块性价比维度(避免无脑追高)
+        "value": {
+            "enabled": True,           # 总开关
+            "pos": {                   # 位置评级阈值
+                "low_gain3": 0.05,     # 近3日涨幅<此值 视为低位
+                "mid_gain3": 0.10,     # 近3日涨幅>=此值 视为短期高位
+                "low_dd20": 0.10,      # 相对20日高点回撤>此值 视为低位(低位启动需回撤深)
+                "mid_dd20": 0.05,      # 回撤>=此值 视为中位(高位需回撤浅)
+            },
+            "profit_ratio": {          # 短期盈亏比分档
+                "high": 1.5,           # >1.5 高性价比
+                "mid": 1.0,            # 1~1.5 中等;<1 追高风险
+            },
+            "note": True,              # 入选理由输出定性结论(结论+数据支撑)
+        },
+        # 第四层 触发条件量化(可执行)
+        "trigger": {
+            "enabled": True,           # 总开关
+            "shrink": {                # 缩量企稳定义(5分钟K线)
+                "band": 0.01,          # 价格落在支撑位±1%区间内
+                "bars": 3,             # 连续3根5分钟K线
+                "vol_ratio": 0.80,     # 成交额低于日内均值80%
+            },
+            "breakout": {              # 有效突破定义
+                "above_minutes": 5,    # 站稳压力位上方>5分钟
+                "vol_mult": 2.0,       # 对应5分钟成交额是前30分钟均量2倍以上
+            },
+            "minute_period": "5",      # 分钟K线周期(5分钟)
         },
         # 大盘打分成交额满分基准(亿元)
         "min_amount_yi": 10000.0,

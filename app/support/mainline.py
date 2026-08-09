@@ -422,6 +422,7 @@ def sector_scores(use_cache=True) -> list:
     """
     from app.review.data import collect_sector_flow, collect_sector_flow_5d
     w = _st.load().get("score_weights", {})
+    fcfg = _st.load().get("decision", {}).get("fund", {})
     flows = collect_sector_flow()
     if not flows:
         return []
@@ -430,7 +431,8 @@ def sector_scores(use_cache=True) -> list:
     grade = _market_grade()
     w_5d, w_1d = _capital_split(grade)
 
-    # ---- 准入过滤(5日资金) + 合并 5日累计数据
+    # ---- 准入过滤(5日资金) + 合并 5日累计数据(可配置开关)
+    admission_enabled = fcfg.get("admission_enabled", True)
     admitted, rejected = [], []
     for f in flows:
         f5 = flows_5d.get(f["industry"])
@@ -439,14 +441,17 @@ def sector_scores(use_cache=True) -> list:
                              "reject_reason": "5日资金数据缺失,无法判定准入"})
             continue
         row = {**f, **{k: f5[k] for k in ("pct_5d", "net_5d_yi", "inflow_5d_yi", "outflow_5d_yi")}}
-        if row["net_5d_yi"] <= 0:
-            rejected.append({**row, "level": "rejected", "fund_status": "流出",
-                             "reject_reason": f"5日主力资金累计净流出 {row['net_5d_yi']:.1f} 亿(准入剔除)"})
-            continue
-        if row["pct_5d"] <= 0:
-            rejected.append({**row, "level": "rejected", "fund_status": "背离",
-                             "reject_reason": f"5日资金净流入但累计涨幅 {row['pct_5d']:+.2f}%,量价背离(准入剔除)"})
-            continue
+        if admission_enabled:
+            net_5d_min = fcfg.get("admission_net_5d_min", 0.0)
+            if row["net_5d_yi"] <= net_5d_min:
+                rejected.append({**row, "level": "rejected", "fund_status": "流出",
+                                 "reject_reason": f"5日主力资金累计净流出 {row['net_5d_yi']:.1f} 亿(准入剔除)"})
+                continue
+            pct_5d_min = fcfg.get("admission_min_pct_5d", 0.0)
+            if row["pct_5d"] <= pct_5d_min:
+                rejected.append({**row, "level": "rejected", "fund_status": "背离",
+                                 "reject_reason": f"5日资金净流入但累计涨幅 {row['pct_5d']:+.2f}%,量价背离(准入剔除)"})
+                continue
         admitted.append(row)
     if not admitted:
         _last_scores["date"] = _today()
@@ -454,15 +459,21 @@ def sector_scores(use_cache=True) -> list:
         return rejected
 
     # ---- 资金面:净流入率 + 排名(仅准入板块参与)
+    use_net_rate = fcfg.get("use_net_rate", True)
     for f in admitted:
         f["rate_5d"] = (f["net_5d_yi"] / (f["inflow_5d_yi"] + f["outflow_5d_yi"])
                         if (f["inflow_5d_yi"] + f["outflow_5d_yi"]) else 0.0)
         f["rate_1d"] = (f["net_yi"] / (f["inflow_yi"] + f["outflow_yi"])
                         if (f["inflow_yi"] + f["outflow_yi"]) else 0.0)
-    order_5d = sorted(admitted, key=lambda x: x["rate_5d"], reverse=True)
-    order_1d = sorted(admitted, key=lambda x: x["rate_1d"], reverse=True)
+    if use_net_rate:
+        order_5d = sorted(admitted, key=lambda x: x["rate_5d"], reverse=True)
+        order_1d = sorted(admitted, key=lambda x: x["rate_1d"], reverse=True)
+    else:
+        order_5d = sorted(admitted, key=lambda x: x["net_5d_yi"], reverse=True)
+        order_1d = sorted(admitted, key=lambda x: x["net_yi"], reverse=True)
     n = len(admitted)
     cap_total = w.get("capital", 40)
+    sustain_th = fcfg.get("status_thresholds", {}).get("sustain", 0.0)
     for f in admitted:
         r5 = order_5d.index(f) + 1
         r1 = order_1d.index(f) + 1
@@ -471,8 +482,10 @@ def sector_scores(use_cache=True) -> list:
         f["fund_score_5d"] = round(cap_total * w_5d * (n - r5 + 1) / n, 2)
         f["fund_score_1d"] = round(cap_total * w_1d * (n - r1 + 1) / n, 2)
         f["fund_score"] = round(f["fund_score_5d"] + f["fund_score_1d"], 2)
-        f["fund_status"] = ("持续流入" if f["rate_5d"] > 0 and f["rate_1d"] > 0
-                            else "流入转弱" if f["rate_5d"] > 0 else "流出")
+        # 5日资金状态:持续流入(5日+单日均净流入) / 流入转弱(5日净流入但当日流出) / 流出(5日净流出)
+        # 注:准入过滤已剔除 5日净流出与背离板块,故此处仅"持续流入/流入转弱"两类;背离保留在淘汰列表 fund_status
+        f["fund_status"] = ("持续流入" if f["rate_1d"] > sustain_th else "流入转弱"
+                            if f["rate_5d"] > sustain_th else "流出")
 
     fg = 50.0
     try:
@@ -543,6 +556,8 @@ def mainline_summary() -> dict:
             "zt_count": r["zt_count"], "leader": r.get("leader", ""),
             "news_hits": r["news_hits"], "fund_score": r.get("fund_score"),
             "fund_rank_1d": r.get("fund_rank_1d"), "fund_status": r.get("fund_status"),
+            "rate_1d": r.get("rate_1d"), "rate_5d": r.get("rate_5d"),
+            "fund_rank_5d": r.get("fund_rank_5d"),
             "targets": match_targets(r["industry"]),
         })
     rejected = [{"name": r["industry"], "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],

@@ -48,9 +48,16 @@ def _sector_stats_uncached(name: str) -> dict | None:
         close = _get_concept_close(name)
         if close is not None and len(close) >= 4:
             out = {"gain3": float(close.iloc[-1] / close.iloc[-4] - 1)}
+            out = {"gain3": float(close.iloc[-1] / close.iloc[-4] - 1)}
             if len(close) >= 21:
                 out["ret20"] = float(close.iloc[-1] / close.iloc[-21] - 1)
                 out["vol20"] = float(close.pct_change().tail(20).std())
+                # 近20日压力/支撑(短期性价比维度)
+                win = close.tail(20)
+                out["price"] = float(close.iloc[-1])
+                out["res20"] = float(win.max())
+                out["sup20"] = float(win.min())
+                out["dd20"] = float(close.iloc[-1] / win.max() - 1)  # 相对20日高点回撤(负值)
             return out
     except Exception:  # noqa: BLE001
         pass
@@ -196,6 +203,79 @@ def _sector_pool(name: str) -> str:
     return pool.get("default", "aggressive")
 
 
+def _pos_rating(stats: dict, vcfg: dict) -> str:
+    """位置评级:低位启动 / 中位运行 / 短期高位(基于近3日涨幅与20日回撤)。"""
+    gain3 = stats.get("gain3")
+    dd20 = stats.get("dd20")
+    if gain3 is None or dd20 is None:
+        return "位置未知"
+    p = vcfg.get("pos", {})
+    if gain3 < p.get("low_gain3", 0.05) and dd20 < -p.get("low_dd20", 0.10):
+        return "低位启动"
+    if gain3 >= p.get("mid_gain3", 0.10) or dd20 > -p.get("mid_dd20", 0.05):
+        return "短期高位"
+    return "中位运行"
+
+
+def _profit_ratio(stats: dict, price: float) -> float | None:
+    """短期盈亏比 = (第一压力位 - 现价) / (现价 - 第一支撑位)。"""
+    res = stats.get("res20")
+    sup = stats.get("sup20")
+    if res is None or sup is None or price is None or price <= sup:
+        return None
+    denom = price - sup
+    if denom <= 0:
+        return None
+    return (res - price) / denom
+
+
+def _rr_label(rr) -> str:
+    if rr is None:
+        return "无数据"
+    if rr > 1.5:
+        return "高性价比"
+    if rr >= 1.0:
+        return "中等性价比"
+    return "追高风险"
+
+
+def _priority(level: str, rr) -> str:
+    """操作优先级:高=核心+盈亏比>1.5;中=核心+盈亏比1~1.5 或 防御+盈亏比>1.5;低=盈亏比<1 或观察池。"""
+    high = 1.5
+    if rr is None:
+        return "低" if level == "watch" else "中"
+    if level == "core" and rr > 1.5:
+        return "高"
+    if (level == "core" and rr >= 1.0) or (level in ("defensive",) and rr > 1.5):
+        return "中"
+    return "低"
+
+
+def _value_notes(it: dict, vcfg: dict) -> str:
+    """入选理由定性结论:核心结论 + 数据支撑。"""
+    name = it.get("name", "")
+    lv = it.get("level", "")
+    st = it.get("stats") or {}
+    rr = it.get("profit_ratio")
+    pos = it.get("pos_rating")
+    if not vcfg.get("note", True):
+        return ""
+    # 资金面:当日净流入率 + 排名
+    rate = it.get("rate_1d")
+    rank = it.get("fund_rank_1d")
+    fund_txt = f"净流入率 {rate * 100:.1f}% 全市场第 {rank} 名" if rate is not None and rank else "资金持续净流入"
+    zt = f"{it.get('zt_count') or 0} 家涨停形成板块效应" if (it.get("zt_count") or 0) > 0 else "板块个股活跃"
+    if pos == "低位启动":
+        lead = "资金技术双共振,低位启动持续性强"
+    elif pos == "短期高位":
+        lead = "短线已进入高位,追高风险大,仅作观察"
+    elif pos == "中位运行":
+        lead = "资金技术共振,中位蓄势待突破"
+    else:
+        lead = "资金面与板块效应共振"
+    return f"{lead}——{fund_txt},{zt}"
+
+
 def mainline_select() -> dict:
     """第二层:一票否决 + 准入 + 属性池分级(核心主攻/防御备选/观察池)。
 
@@ -231,7 +311,10 @@ def mainline_select() -> dict:
             continue
         item = {"name": r["industry"], "score": r["score"], "pct_chg": r["pct_chg"],
                 "net_yi": r["net_yi"], "zt_count": r["zt_count"], "leader": r.get("leader", ""),
-                "news_hits": r.get("news_hits", 0), "stats": stats or {}}
+                "news_hits": r.get("news_hits", 0), "stats": stats or {},
+                "rate_1d": r.get("rate_1d"), "fund_rank_1d": r.get("fund_rank_1d"),
+                "fund_status": r.get("fund_status"), "rate_5d": r.get("rate_5d"),
+                "fund_rank_5d": r.get("fund_rank_5d")}
         if r["score"] >= mline.get("pass_score", 60.0):
             item["reasons"] = _pass_reasons(r, stats)
             item["pool"] = _sector_pool(r["industry"])
@@ -277,6 +360,21 @@ def mainline_select() -> dict:
         w["level"] = "watch"
         w.setdefault("reasons", _pass_reasons(w, w.get("stats") or {}))
     watch += low[: max(0, mline.get("watch_n", 3) - len(watch))]
+
+    # ---- 性价比维度(位置评级/盈亏比/操作优先级/定性结论)
+    vcfg = dcfg.get("value", {})
+    if vcfg.get("enabled", True):
+        shown = [x for x in ([core] if core else []) + ([defensive] if defensive else []) + watch if x]
+        for p in shown:
+            st = p.get("stats") or {}
+            p["pos_rating"] = _pos_rating(st, vcfg)
+            p["profit_ratio"] = _profit_ratio(st, st.get("price"))
+            p["rr_label"] = _rr_label(p["profit_ratio"])
+            p["priority"] = _priority(p.get("level", "watch"), p["profit_ratio"])
+            p["reasons"] = p.get("reasons") or []
+            # 变现为"定性结论 + 数据支撑"格式(取代纯复述数据):首行为结论总结
+            if vcfg.get("note", True) and p.get("level") != "rejected":
+                p["reasons"] = [_value_notes(p, vcfg)] + p["reasons"]
 
     return {"core": core, "defensive": defensive, "watch": watch,
             "rejected": rejected[: mline.get("watch_n", 3)],
@@ -448,12 +546,100 @@ def match_level_targets(sector_name: str, sector_level: str = "watch") -> dict:
 
 
 # ---------------------------------------------------------------- 第四层 执行参数计算
+def _trigger_status(code: str, support: float, resistance: float, mode: str,
+                    tcfg: dict) -> dict:
+    """量化触发条件判断:未触发 / 触发中 / 已触发(盘中按分钟K线判定)。
+
+    - 缩量企稳(回踩模式 pullback):最新价落在支撑位±band 区间内,且最近连续
+      bars 根5分钟K线成交额均低于当日分钟成交额均值*vol_ratio -> 触发中;
+    - 有效突破(breakout):价格站稳压力位上方超过 above_minutes 分钟,且该档
+      5分钟成交额 >= 前30分钟均量*vol_mult -> 触发中。
+    数据不可用返回 unknown(不阻塞页面)。
+    """
+    if not tcfg.get("enabled", True):
+        return {"status": "未触发", "label": "trigger-off", "note": "未启用量化触发"}
+    if mode not in ("breakout", "pullback"):
+        return {"status": "未触发", "label": "trigger-off", "note": "无量化模式对应"}
+    if (mode == "pullback" and not support) or (mode == "breakout" and not resistance):
+        return {"status": "未触发", "label": "trigger-off", "note": "无有效支撑/压力位"}
+    try:
+        import pandas as pd
+        from app.data.fetcher import get_intraday_bars
+        bars = get_intraday_bars(code, period=tcfg.get("minute_period", "5"), limit=120)
+        if bars is None or len(bars) < 5:
+            return {"status": "未知", "label": "trigger-unknown", "note": "盘中数据未就绪"}
+        if "close" not in bars.columns:
+            return {"status": "未知", "label": "trigger-unknown", "note": "分钟数据列缺失"}
+        amt = pd.to_numeric(bars["amount"] if "amount" in bars.columns else bars["volume"],
+                            errors="coerce").fillna(0.0)
+        closes = pd.to_numeric(bars["close"], errors="coerce")
+        if amt.iloc[-1] is None or pd.isna(closes.iloc[-1]):
+            return {"status": "未知", "label": "trigger-unknown", "note": "分钟数据不完整"}
+        day_avg = float(amt.mean()) if len(amt) else 0.0
+        shrink = tcfg.get("shrink", {})
+        band = float(shrink.get("band", 0.01))
+        need = int(shrink.get("bars", 3))
+        vol_r = float(shrink.get("vol_ratio", 0.80))
+        brk = tcfg.get("breakout", {})
+        above_min = int(brk.get("above_minutes", 5))
+        mult = float(brk.get("vol_mult", 2.0))
+
+        if mode == "pullback":
+            in_band = (support * (1 - band) <= closes) & (closes <= support * (1 + band))
+            low_vol = (amt < day_avg * vol_r) if day_avg else pd.Series([False] * len(amt), index=amt.index)
+            seq = 0
+            for i in range(len(amt) - 1, -1, -1):
+                seq = seq + 1 if bool(in_band.iloc[i] and low_vol.iloc[i]) else 0
+                if seq >= need:
+                    return {"status": "触发中", "label": "trigger-on",
+                            "note": f"缩量企稳:支撑±{band:.0%}内连续{need}根低量"}
+            return {"status": "未触发", "label": "trigger-off",
+                    "note": f"未满足缩量企稳(需支撑±{band:.0%}内连续{need}根低量)"}
+        else:
+            above = (closes > resistance).tolist()
+            seq = 0
+            for i in range(len(above) - 1, -1, -1):
+                seq = seq + 1 if above[i] else 0
+                if seq * 5 >= above_min:
+                    base = amt.iloc[max(0, i - 6): i]  # 前30分钟约6根5分钟K线
+                    base_avg = float(base.mean()) if len(base) else 0.0
+                    if base_avg > 0 and float(amt.iloc[i]) >= base_avg * mult:
+                        return {"status": "触发中", "label": "trigger-on",
+                                "note": f"放量突破:站稳{above_min}分钟,量达前30分钟均量{mult:.1f}倍"}
+            return {"status": "未触发", "label": "trigger-off",
+                    "note": f"未满足有效突破(需站稳{above_min}分钟且放量{mult:.1f}倍)"}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "未知", "label": "trigger-unknown", "note": f"触发判定异常:{e}"}
+
+
+def _matrix_cap(grade: str, asset_type: str, dcfg: dict) -> float | None:
+    """动态仓位矩阵:市场评级 x 标的类型 -> 单标的总仓位上限(占总资金)。未启用返回 None。"""
+    pm = dcfg.get("position_matrix", {})
+    if not pm.get("enabled", True):
+        return None
+    grade = grade or "B"
+    row = pm.get("cap", {}).get(grade) or {}
+    if not row:
+        return None
+    val = row.get(asset_type)
+    if val is None:
+        val = row.get("mid")
+    if val is None:
+        return None
+    return float(val)
+
+
 def execution_plan(target: dict, total_asset: float, taste: str,
-                   market_cap: float = None, single_cap: float = None) -> dict:
+                   market_cap: float = None, single_cap: float = None,
+                   grade: str = None, asset_type: str = None,
+                   sector_used_pct: float = 0.0, sector_cap_pct: float = None) -> dict:
     """第四层:单标的精确执行参数(ATR止损 / 分批建仓 / 目标价 / 仓位)。
 
-    market_cap:市场评级总仓位上限;single_cap:单只标的上限。
-    建议仓位取「风险倒推仓位」与风控上限的较小者。
+    market_cap:市场评级总仓位上限;single_cap:单只标的上限(旧模式)。
+    grade:市场评级(A/B/C/D);asset_type:标的类型(mood|mid|etf|def_etf),动态仓位矩阵。
+    sector_used_pct:本板块已用仓位占比;sector_cap_pct:单板块总仓位上限(超出则压缩+预警)。
+
+    建议仓位取「风险倒推仓位」与「风控上限(总仓位/单票/矩阵/板块)」的较小者。
 
     全链路自洽约束:
     - 第一目标价 = 现价 x (1 + 0.5 x ATR),且至少高于现价 3%;
@@ -543,9 +729,35 @@ def execution_plan(target: dict, total_asset: float, taste: str,
     risk_money = total_asset * risk_rate
     loss_per_share = max(avg_cost - stop, price * 0.01)  # 每股最大亏损(基于加权成本)
     risk_shares = risk_money / loss_per_share          # 风险公式推股数
-    single_cap = single_cap if single_cap is not None else _st.load().get("risk", {}).get("single_pct", 0.10)
+
+    # ---- 单标的上限:动态仓位矩阵优先(升级2),否则回退固定 single_pct
+    pm = dcfg.get("position_matrix", {})
+    use_matrix = (pm.get("enabled", True) and asset_type is not None and single_cap is None)
+    matrix_cap = _matrix_cap(grade, asset_type, dcfg) if use_matrix else None
+    matrix_note = ""
+    if matrix_cap is not None:
+        single_cap = matrix_cap            # 矩阵覆盖率旧参数
+        matrix_note = f"(仓位矩阵 {grade}级上限 {matrix_cap:.0%})"
+        if matrix_cap <= 0:
+            return {"ok": False,
+                    "name": target.get("name"), "code": target.get("code"),
+                    "reason": f"{grade} 级市场下「{asset_type}」类型禁止新开仓(仓位矩阵 0%)"}
+    else:
+        single_cap = single_cap if single_cap is not None else _st.load().get("risk", {}).get("single_pct", 0.10)
     max_mv = total_asset * min(market_cap or 1.0, single_cap)
-    pos_value = min(risk_shares * avg_cost, max_mv)    # 同时受单票上限约束
+
+    # ---- 单板块总仓位上限(超出则压缩 + 预警)
+    pm_block = pm if use_matrix else {}
+    if pm_block and sector_cap_pct is None:
+        sector_cap_pct = pm.get("sector_cap", {}).get(grade or "B", 0.20)
+    block_note = ""
+    if pm_block and sector_cap_pct and pm.get("enforce", True):
+        remaining = max(0.0, sector_cap_pct - (sector_used_pct or 0.0))
+        max_blk = total_asset * remaining
+        max_mv = min(max_mv, max_blk)
+        block_note = f";板块已用 {sector_used_pct or 0:.1%},上限 {sector_cap_pct:.0%},本票最多 {remaining:.1%}"
+
+    pos_value = min(risk_shares * avg_cost, max_mv)    # 同时受全部风控上限约束
     shares = int(pos_value / avg_cost // 100) * 100
     shares = max(shares, 100)
     pos_value = shares * avg_cost
@@ -563,14 +775,25 @@ def execution_plan(target: dict, total_asset: float, taste: str,
     second = shares - first
     max_loss = shares * loss_per_share
 
+    # ---- 触发条件量化(升级4):盘中按分钟K线判定当前触发状态
+    tcfg = dcfg.get("trigger", {})
+    trigger_state = {"status": "未触发", "label": "trigger-off", "note": ""}
+    if tcfg.get("enabled", True) and target.get("code"):
+        st = _trigger_status(str(target.get("code")), float(lv.get("support") or 0) or None,
+                             float(resistance or 0) or None, mode, tcfg)
+        trigger_state = st if st else trigger_state
+
     return {
         "ok": True,
         "taste": taste,
         "name": target.get("name"),
         "code": target.get("code"),
         "trigger": trigger,
+        "trigger_status": trigger_state,
         "mode": mode,
         "mode_note": mode_note,
+        "asset_type": asset_type,
+        "matrix_cap": matrix_cap,
         "risk_rate": risk_rate,
         "risk_money": round(risk_money, 2),
         "price": round(price, 2),
@@ -592,7 +815,8 @@ def execution_plan(target: dict, total_asset: float, taste: str,
         },
         "note": (f"单笔风险 {risk_money:,.0f} 元(总资金 {risk_rate:.1%}),预计最大亏损 {max_loss:,.0f} 元"
                  f"({max_loss / total_asset:.2%} 占总资金),止损 {stop:.2f}(亏 {loss_per_share:.2f}/股),"
-                 f"建议仓位 {shares} 股 / {pos_value:,.0f} 元({pos_value / total_asset:.1%})。{mode_note}"),
+                 f"建议仓位 {shares} 股 / {pos_value:,.0f} 元({pos_value / total_asset:.1%})。{mode_note}"
+                 f"{matrix_note}{block_note}"),
     }
 
 
@@ -614,17 +838,38 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     if core:
         t = match_level_targets(core["name"], sector_level="core")
         targets[core["name"]] = t
-        for role, seg in (("aggressive", t["aggressive"]), ("steady", t["steady"]), ("etf", t["etf"])):
+        role_slots = (("steady", "mid"), ("aggressive", "mood"), ("etf", "etf"))
+        blk_used = 0.0
+        for role, atype in role_slots:
+            seg = t[role]
+            if not seg:
+                continue
             item = seg["items"][0]
             if item.get("error"):
                 plans.setdefault(core["name"], {})[role] = {"ok": False, "reason": item["error"]}
-            else:
-                plans.setdefault(core["name"], {})[role] = execution_plan(
-                    item, total_asset, taste, market_cap=p1["cap"],
-                    single_cap=_st.load().get("risk", {}).get("single_pct", 0.10))
+                continue
+            p = execution_plan(
+                item, total_asset, taste, market_cap=p1["cap"],
+                grade=p1["grade"], asset_type=atype, sector_used_pct=blk_used)
+            plans.setdefault(core["name"], {})[role] = p
+            if p.get("ok"):
+                blk_used = min(1.0, blk_used + (p.get("position_pct") or 0.0))
     if defensive:
         t = match_level_targets(defensive["name"], sector_level="defensive")
         targets[defensive["name"]] = t
+        # 防御备选 ETF:单独一档(防御备选ETF),计入防御板块总仓位
+        seg = t.get("etf")
+        if seg:
+            item = seg["items"][0]
+            if item.get("error"):
+                plans.setdefault(defensive["name"], {})["etf"] = {"ok": False, "reason": item["error"]}
+            else:
+                p = execution_plan(
+                    item, total_asset, taste, market_cap=p1["cap"],
+                    single_cap=_st.load().get("risk", {}).get("single_pct", 0.10),
+                    grade=p1["grade"], asset_type="def_etf",
+                    sector_used_pct=0.0)
+                plans.setdefault(defensive["name"], {})["etf"] = p
 
     # 极简结论
     core_stock = ""

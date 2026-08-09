@@ -314,3 +314,35 @@ def get_spot_quotes(codes: List[str]) -> Dict[str, Dict]:
         q["pct_chg"] = (q["price"] - q["prev_close"]) / q["prev_close"] if q["prev_close"] else 0.0
         result[symbol_to_code(symbol)] = q
     return result
+
+
+# ---------------------------------------------------------------- 分钟K线(触发量化)
+def get_intraday_bars(code: str, period: str = "5", limit: int = 48) -> pd.DataFrame:
+    """当日分钟K线(东财),返回 index=time 的 DataFrame(open/high/low/close/amount)。
+
+    用于盘中触发状态量化判断;非交易时段或失败返回空 DataFrame(不抛错)。
+    默认 5 分钟周期取当日最近 48 根(约覆盖全天 4 小时)。
+    """
+    code = str(code).zfill(6)
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_hist_min_em(symbol=code, period=period, adjust="")
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.rename(columns={c: str(c) for c in df.columns})
+        keep = {k: v for k, v in {
+            "时间": "time", "开盘": "open", "最高": "high", "最低": "low",
+            "收盘": "close", "成交量": "volume", "成交额": "amount",
+        }.items() if k in df.columns}
+        df = df.rename(columns=keep)
+        if "time" not in df.columns or "amount" not in df.columns:
+            return pd.DataFrame()
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df = df.dropna(subset=["time"])
+        for c in ("open", "high", "low", "close", "amount"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.set_index("time").sort_index().tail(limit)
+        return df
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
