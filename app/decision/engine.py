@@ -27,8 +27,22 @@ def _today() -> str:
     return dt.date.today().strftime("%Y-%m-%d")
 
 
+_sector_stats_cache = {}  # name -> (date, result)
+
+
 def _sector_stats(name: str) -> dict | None:
-    """近3日累计涨幅 / 20日涨幅 / 20日波动(概念指数)。无指数数据返回 None。"""
+    """近3日累计涨幅 / 20日涨幅 / 20日波动(概念指数)。无指数数据返回 None。
+    进程内按日缓存,避免同一天对同一板块重复抓取/重复加载概念指数。"""
+    today = _today()
+    hit = _sector_stats_cache.get(name)
+    if hit and hit[0] == today:
+        return hit[1]
+    result = _sector_stats_uncached(name)
+    _sector_stats_cache[name] = (today, result)
+    return result
+
+
+def _sector_stats_uncached(name: str) -> dict | None:
     try:
         from app.features.concept_features import _get_concept_close
         close = _get_concept_close(name)
@@ -41,6 +55,18 @@ def _sector_stats(name: str) -> dict | None:
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+def _sector_stats_many(names: list, max_workers: int = 8) -> dict:
+    """并发预取多个板块统计(概念指数本地缓存命中时极快,冷缓存网络抓取时并发加速)。"""
+    from concurrent.futures import ThreadPoolExecutor
+    result = {}
+    if not names:
+        return result
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for name, stats in zip(names, ex.map(_sector_stats, names)):
+            result[name] = stats
+    return result
 
 
 # ---------------------------------------------------------------- 第一层 大盘开仓许可评级
@@ -166,13 +192,15 @@ def mainline_select() -> dict:
     zt_pool = _ml._zt_pool()
     zt_available = len(zt_pool) > 0  # 涨停池为空视为数据缺失,跳过涨停家数否决项
     passed, rejected, low = [], [], []
+    names = [r["industry"] for r in rows if r.get("level") != "rejected"]
+    stats_map = {r["industry"]: _sector_stats(r["industry"]) for r in rows} if len(rows) <= 30 else _sector_stats_many(names)
     for r in rows:
         if r.get("level") == "rejected":
             rejected.append({"name": r["industry"], "score": r.get("score", 0),
                              "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
                              "level": "rejected", "reasons": [r["reject_reason"]]})
             continue
-        stats = _sector_stats(r["industry"])
+        stats = stats_map.get(r["industry"])
         banned, why = _veto(r["industry"], r, dcfg, stats, zt_available=zt_available)
         if banned:
             rejected.append({"name": r["industry"], "score": r["score"],

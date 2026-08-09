@@ -1597,6 +1597,23 @@ def api_settings_reset():
     return jsonify({"ok": True})
 
 
+def _warm_startup_cache():
+    """服务启动后后台预热今日决策与主线,避免用户首次访问触发慢速冷计算。"""
+    import threading as _th
+    import time as _t
+    _t.sleep(2)
+    try:
+        _get_decision(refresh=True)
+        print("[预热] 今日决策缓存已就绪")
+    except Exception as e:  # noqa: BLE001
+        print(f"[预热] 今日决策预热失败: {e}")
+    try:
+        _get_mainline(refresh=True)
+        print("[预热] 主线回顾缓存已就绪")
+    except Exception as e:  # noqa: BLE001
+        print(f"[预热] 主线回顾预热失败: {e}")
+
+
 def main():
     if getattr(config, "RETRAIN_WEB_AUTO", True):
         from app.scheduler import start_daemon
@@ -1607,6 +1624,11 @@ def main():
         print("  每日复盘报告调度已启动(到点自动生成并直接展示于页面)\n")
     except Exception as e:  # noqa: BLE001
         print(f"  报告调度启动失败: {e}")
+    if getattr(config, "WARM_STARTUP", True):
+        _th = __import__("threading")
+        _t = _th.Thread(target=_warm_startup_cache, daemon=True)
+        _t.start()
+        print("  启动预热线程已启动(后台生成今日决策与主线缓存)\n")
     host = os.environ.get("GUGA_HOST", "127.0.0.1")
     port = int(os.environ.get("GUGA_PORT", "8000"))
     print(f"\n  量化决策仪表盘(今日决策为默认首页): http://{host}:{port}/decision\n")
