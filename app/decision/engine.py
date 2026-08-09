@@ -198,6 +198,7 @@ def mainline_select() -> dict:
         if r.get("level") == "rejected":
             rejected.append({"name": r["industry"], "score": r.get("score", 0),
                              "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
+                             "stats": stats_map.get(r["industry"]) or {},
                              "level": "rejected", "reasons": [r["reject_reason"]]})
             continue
         stats = stats_map.get(r["industry"])
@@ -205,6 +206,8 @@ def mainline_select() -> dict:
         if banned:
             rejected.append({"name": r["industry"], "score": r["score"],
                              "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
+                             "zt_count": r["zt_count"], "leader": r.get("leader", ""),
+                             "stats": stats or {},
                              "level": "rejected", "reasons": why})
             continue
         item = {"name": r["industry"], "score": r["score"], "pct_chg": r["pct_chg"],
