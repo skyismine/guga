@@ -264,6 +264,29 @@ def collect_sector_flow() -> list:
     return rows
 
 
+def collect_sector_flow_5d() -> list:
+    """概念板块 5 日主力资金流(5日累计净流入/流入/流出,亿元)+ 5日累计涨跌幅。"""
+    import akshare as ak
+    df = _retry(lambda: ak.stock_fund_flow_concept(symbol="5日排行"))
+    df = df.rename(columns={df.columns[i]: c for i, c in enumerate(
+        ["no", "industry", "num", "index_name", "pct", "inflow", "outflow", "net"])})
+    net = pd.to_numeric(df["net"], errors="coerce")
+    inflow = pd.to_numeric(df["inflow"], errors="coerce")
+    outflow = pd.to_numeric(df["outflow"], errors="coerce")
+    pct = pd.to_numeric(df["pct"].astype(str).str.replace("%", "", regex=False), errors="coerce")
+    rows = []
+    for _, r in df.iterrows():
+        rows.append({
+            "industry": str(r["industry"]),
+            "pct_5d": round(float(pct.get(r.name, 0) or 0), 2),      # 5日累计涨跌幅(%)
+            "inflow_5d_yi": round(float(inflow.get(r.name, 0) or 0), 2),
+            "outflow_5d_yi": round(float(outflow.get(r.name, 0) or 0), 2),
+            "net_5d_yi": round(float(net.get(r.name, 0) or 0), 2),   # 5日累计净流入(亿元)
+        })
+    rows.sort(key=lambda x: x["net_5d_yi"], reverse=True)
+    return rows
+
+
 # ---------------------------------------------------------------- 北向资金
 def collect_north(date: dt.date = None) -> Dict:
     """沪深港通北向/南向资金。注:2024 年起交易所停止披露北向单日实时净买入,

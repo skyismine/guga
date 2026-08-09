@@ -15,6 +15,7 @@ DEFAULTS = {
     "score_weights": {"capital": 40, "trend": 30, "sentiment": 20, "news": 10},
     "mainline_top_n": 2,          # Top-N 为核心主线
     "mainline_branch_top_n": 5,   # 前 N 名(含主线)标注补涨支线
+    "mainline_dynamic_weight": True,  # 资金面动态权重开关:A级 5日20%/单日80%, C/D级 5日70%/单日30%
     "leader_min_market_cap": 20.0,   # 情绪龙头剔除 <20 亿小票(亿)
     "leader_exclude": ["ST", "退"],  # 龙头剔除名称关键词
     "etf_min_amount": 5000.0,        # ETF 日均成交额下限(万元)

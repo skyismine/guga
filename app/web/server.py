@@ -1056,20 +1056,41 @@ def page_mainline():
         lab = {"core": "核心主线", "branch": "补涨支线", "watch": "观察"}.get(it["level"], "观察")
         zt = f"涨停 {it.get('zt_count', 0)} 家" if it.get("zt_count") else ""
         news = f'<span class="tag">📰 电报 {it["news_hits"]} 次</span>' if it.get("news_hits") else ""
+        fund = ""
+        if it.get("fund_score") is not None:
+            st = {"持续流入": "up", "流入转弱": "down", "流出": "down"}.get(it.get("fund_status"), "mut")
+            fund = (f"<div class='line'>资金面 <b>{it['fund_score']}分</b> · "
+                    f"5日/单日排名 {it.get('fund_rank_1d')} · "
+                    f"<span class='{st}'>{_h(it.get('fund_status') or '')}</span></div>")
         cards.append(
             f"<div class='card'><h3>#{it['rank']} {_h(it['name'])} "
             f"<span class='badge {lv}'>{lab}</span> <span class='mut'>score {it['score']}</span></h3>"
             f"<div class='line'>板块涨跌 <b class='{'up' if it['pct_chg'] >= 0 else 'down'}'>{it['pct_chg']:+.2f}%</b> · "
             f"主力净流入 {it['net_yi']:+.1f} 亿 · {zt}</div>"
+            f"{fund}"
             f"<div class='line'>领涨股:{_h(it.get('leader') or '-')} {news}</div>"
             f"{_targets_html(it.get('targets'))}</div>")
+    rejected_html = ""
+    if d.get("rejected"):
+        rows = "".join(
+            f"<tr><td>{_h(r['name'])}</td>"
+            f"<td class='{'up' if r['pct_chg'] >= 0 else 'down'}'>{r['pct_chg']:+.2f}%</td>"
+            f"<td>{r['net_yi']:+.1f} 亿</td>"
+            f"<td><span class='tag'>{_h(r.get('fund_status') or '-')}</span></td>"
+            f"<td class='mut'>{_h(r['reason'])}</td></tr>"
+            for r in d["rejected"][:15])
+        rejected_html = ("<div class='card'><h3>🚫 准入淘汰板块(5日资金规则)</h3>"
+                         "<div class='tbl'><table><tr><th>板块</th><th>5日累计涨幅</th>"
+                         "<th>当日净流入</th><th>5日资金状态</th><th>淘汰理由</th></tr>" + rows + "</table></div></div>")
     content = [
         f"<header><h1>🔥 主线板块识别与龙头匹配</h1>"
-        f'<span class="mut">{_h(d.get("date"))} · Top{d.get("top_n")} 为核心主线</span>'
+        f'<span class="mut">{_h(d.get("date"))} · Top{d.get("top_n")} 为核心主线 · '
+        f'市场评级 {_h(d.get("market_grade"))}</span>'
         f'<a class="btn" href="/mainline?refresh=1">🔄 刷新</a></header>',
-        f'<div class="grid">{mood}<div class="card"><h3>说明</h3><div class="line">打分 = 资金强度40 + 趋势30(涨幅+涨停家数) + 情绪共振20 + 消息催化10,权重可在系统设置调整。</div></div></div>',
+        f'<div class="grid">{mood}<div class="card"><h3>说明</h3><div class="line">打分 = 资金面40(5日+单日,权重随市场评级切换) + 趋势30(涨幅+涨停家数) + 情绪共振20 + 消息催化10,权重可在系统设置调整。</div></div></div>',
         f'<div class="card">{_mainline_chart(d.get("items", []))}</div>',
         "\n".join(cards),
+        rejected_html,
         '<div class="card"><h3>📉 超跌强承接池(近30日超跌 + 放量企稳)</h3>' + _oversold_html(d.get("oversold") or []) + "</div>",
         '<div class="footer">主线识别基于当日资金/涨停/情绪/新闻规则打分,仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
@@ -1414,6 +1435,7 @@ _SETTING_FIELDS = [
     ("主线识别", [
         ("mainline_top_n", "核心主线数量", "number", 1, 10, "评分前 N 名为核心主线"),
         ("mainline_branch_top_n", "补涨支线数量", "number", 3, 20, "评分前 M 名(含核心)标注支线"),
+        ("mainline_dynamic_weight", "资金面动态权重", "checkbox", None, None, "开启:A级 5日20%+单日80%, C/D级 5日70%+单日30%;关闭固定 5日40%+单日60%"),
         ("leader_min_market_cap", "龙头最小流通市值(亿)", "number", 0, 1000, "低于该值剔除"),
         ("etf_min_amount", "ETF 最低成交额(万)", "number", 0, 100000, "低于该值不推荐"),
         ("oversold_pool_size", "超跌池数量", "number", 5, 50, "输出 Top N"),
@@ -1548,6 +1570,7 @@ def _flatten_form(form) -> dict:
             node = node.setdefault(p, {})
         node[parts[-1]] = val
     out.setdefault("llm", {}).setdefault("enable", False)
+    out.setdefault("mainline_dynamic_weight", False)
     return out
 
 

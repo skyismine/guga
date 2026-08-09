@@ -1,10 +1,14 @@
 """模块1 主线板块识别与龙头/中军/ETF 匹配 + 超跌强承接池。
 
 打分维度(权重可配置,默认合计 100):
-- 资金强度 40:板块净流入量级(今日实时资金流)
+- 资金面 40:拆为 5日资金强度 + 单日资金强度,按准入板块净流入率排名线性递减打分;
+  权重随市场评级动态切换(A级 5日20%+单日80%, C/D级 5日70%+单日30%, 默认 40%/60%)
 - 趋势强度 30:板块涨跌幅 + 涨停家数
 - 情绪共振 20:市场恐贪指数档位
 - 消息催化 10:财联社电报标题命中概念关键词
+
+准入规则:剔除 5日主力资金累计净流出的板块,以及 5日资金净流入但股价累计涨幅≤0 的量价背离板块,
+淘汰板块附带 reject_reason。
 
 输出:核心主线(Top N)/ 补涨支线(Top M)/ 观察,并匹配三类标的:
 情绪龙头 / 中军(成交额最大) / 对应 ETF,附带预测概率、操作信号、支撑压力位。
@@ -24,6 +28,7 @@ from app.support import settings as _st
 from app.support.portfolio import _one
 
 _last_scores = {"date": None, "items": {}}
+_grade_cache = {"date": None, "grade": "B"}
 
 
 # ---------------------------------------------------------------- 数据源(带缓存)
@@ -376,13 +381,92 @@ def _minmax(vals: list) -> dict:
     return {v: (v - lo) / rng if rng else 0.0 for v in vals}
 
 
+def _market_grade() -> str:
+    """市场评级(A/B/C/D),按日缓存,驱动资金面动态权重。"""
+    if _grade_cache["date"] == _today() and _grade_cache["grade"]:
+        return _grade_cache["grade"]
+    grade = "B"
+    try:
+        from app.decision.engine import market_permit
+        grade = market_permit().get("grade", "B")
+    except Exception:  # noqa: BLE001
+        pass
+    _grade_cache["date"] = _today()
+    _grade_cache["grade"] = grade
+    return grade
+
+
+def _capital_split(grade: str) -> tuple:
+    """资金面拆分(5日, 单日)权重。A级 5日20%/单日80%, C/D级 5日70%/单日30%, 默认(含B级) 5日40%/单日60%。
+    开关 mainline_dynamic_weight 关闭时固定为 5日40%/单日60%。"""
+    if not _st.load().get("mainline_dynamic_weight", True):
+        return 0.40, 0.60
+    return {"A": (0.20, 0.80), "C": (0.70, 0.30), "D": (0.70, 0.30)}.get(grade, (0.40, 0.60))
+
+
 def sector_scores(use_cache=True) -> list:
-    """概念板块打分,返回按分数降序列表(含 level)。"""
-    from app.review.data import collect_sector_flow
+    """概念板块打分,返回按分数降序列表(含 level)。
+
+    新增准入规则 + 资金面拆分:
+    - 准入:剔除 5日主力资金累计净流出、以及 5日资金净流入但股价累计涨幅≤0 的量价背离板块;
+    - 资金面(原 40 分)拆为 5日资金强度 + 单日资金强度,按准入板块的净流入率排名,第 1 名得满分、线性递减;
+    - 动态权重:市场评级 A 级切换为 5日20%+单日80%,C/D 级切换为 5日70%+单日30%,其余默认 5日40%+单日60%。
+    淘汰板块附 reject_reason,保留在返回列表尾部并标记 level='rejected'。
+    """
+    from app.review.data import collect_sector_flow, collect_sector_flow_5d
     w = _st.load().get("score_weights", {})
     flows = collect_sector_flow()
     if not flows:
         return []
+    flows_5d = {f["industry"]: f for f in collect_sector_flow_5d()}
+
+    grade = _market_grade()
+    w_5d, w_1d = _capital_split(grade)
+
+    # ---- 准入过滤(5日资金) + 合并 5日累计数据
+    admitted, rejected = [], []
+    for f in flows:
+        f5 = flows_5d.get(f["industry"])
+        if f5 is None:
+            rejected.append({**f, "level": "rejected", "fund_status": "数据缺失",
+                             "reject_reason": "5日资金数据缺失,无法判定准入"})
+            continue
+        row = {**f, **{k: f5[k] for k in ("pct_5d", "net_5d_yi", "inflow_5d_yi", "outflow_5d_yi")}}
+        if row["net_5d_yi"] <= 0:
+            rejected.append({**row, "level": "rejected", "fund_status": "流出",
+                             "reject_reason": f"5日主力资金累计净流出 {row['net_5d_yi']:.1f} 亿(准入剔除)"})
+            continue
+        if row["pct_5d"] <= 0:
+            rejected.append({**row, "level": "rejected", "fund_status": "背离",
+                             "reject_reason": f"5日资金净流入但累计涨幅 {row['pct_5d']:+.2f}%,量价背离(准入剔除)"})
+            continue
+        admitted.append(row)
+    if not admitted:
+        _last_scores["date"] = _today()
+        _last_scores["items"] = {}
+        return rejected
+
+    # ---- 资金面:净流入率 + 排名(仅准入板块参与)
+    for f in admitted:
+        f["rate_5d"] = (f["net_5d_yi"] / (f["inflow_5d_yi"] + f["outflow_5d_yi"])
+                        if (f["inflow_5d_yi"] + f["outflow_5d_yi"]) else 0.0)
+        f["rate_1d"] = (f["net_yi"] / (f["inflow_yi"] + f["outflow_yi"])
+                        if (f["inflow_yi"] + f["outflow_yi"]) else 0.0)
+    order_5d = sorted(admitted, key=lambda x: x["rate_5d"], reverse=True)
+    order_1d = sorted(admitted, key=lambda x: x["rate_1d"], reverse=True)
+    n = len(admitted)
+    cap_total = w.get("capital", 40)
+    for f in admitted:
+        r5 = order_5d.index(f) + 1
+        r1 = order_1d.index(f) + 1
+        f["fund_rank_5d"] = r5
+        f["fund_rank_1d"] = r1
+        f["fund_score_5d"] = round(cap_total * w_5d * (n - r5 + 1) / n, 2)
+        f["fund_score_1d"] = round(cap_total * w_1d * (n - r1 + 1) / n, 2)
+        f["fund_score"] = round(f["fund_score_5d"] + f["fund_score_1d"], 2)
+        f["fund_status"] = ("持续流入" if f["rate_5d"] > 0 and f["rate_1d"] > 0
+                            else "流入转弱" if f["rate_5d"] > 0 else "流出")
+
     fg = 50.0
     try:
         fg = float((market_snapshot() or {}).get("market", {}).get("market_fear_greed") or 50)
@@ -391,30 +475,28 @@ def sector_scores(use_cache=True) -> list:
     zt = _zt_pool()
     zt_set = {z["code"] for z in zt}
     zt_cnt = {f["industry"]: len(set(_concept_cons(f["industry"], allow_net=False)) & zt_set)
-              for f in flows}
+              for f in admitted}
     news = _news_mentions()
 
-    names = [f["industry"] for f in flows]
-    nets = [f["net_yi"] for f in flows]
-    pcts = [f["pct_chg"] for f in flows]
-    net_map = _minmax(nets)
+    names = [f["industry"] for f in admitted]
+    pcts = [f["pct_chg"] for f in admitted]
     pct_map = _minmax(pcts)
 
     rows = []
-    for f in flows:
+    for f in admitted:
         name = f["industry"]
-        net = net_map[f["net_yi"]]
         pct = pct_map[f["pct_chg"]]
         z = zt_cnt.get(name, 0)
         trend = pct * 0.8 + (0.2 * (min(z, 8) / 8.0 if zt else pct))
         direction = 1.0 if f["pct_chg"] >= 0 else 0.5
         senti = (fg / 100.0) * direction
         news_s = 1.0 if news.get(name) else 0.0
-        score = (w.get("capital", 40) * net + w.get("trend", 30) * trend
+        score = (f["fund_score"] + w.get("trend", 30) * trend
                  + w.get("sentiment", 20) * senti + w.get("news", 10) * news_s)
         rows.append({**f, "score": round(score, 2), "zt_count": z, "news_hits": news.get(name, 0)})
     rows.sort(key=lambda x: x["score"], reverse=True)
     _mark_levels(rows)
+    rows.extend(rejected)
     _last_scores["date"] = _today()
     _last_scores["items"] = {r["industry"]: r["level"] for r in rows}
     return rows
@@ -444,7 +526,7 @@ def sector_level(name: str) -> str:
 
 
 def mainline_summary() -> dict:
-    """Web 展示:主线列表 + 三类标的 + 超跌池。"""
+    """Web 展示:主线列表 + 三类标的 + 超跌池 + 准入淘汰板块。"""
     scores = sector_scores(use_cache=True)
     items = []
     for r in scores[: max(_st.load().get("mainline_branch_top_n", 5), 5)]:
@@ -452,9 +534,13 @@ def mainline_summary() -> dict:
             "rank": r["rank"], "name": r["industry"], "level": r["level"],
             "score": r["score"], "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
             "zt_count": r["zt_count"], "leader": r.get("leader", ""),
-            "news_hits": r["news_hits"],
+            "news_hits": r["news_hits"], "fund_score": r.get("fund_score"),
+            "fund_rank_1d": r.get("fund_rank_1d"), "fund_status": r.get("fund_status"),
             "targets": match_targets(r["industry"]),
         })
+    rejected = [{"name": r["industry"], "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
+                  "fund_status": r.get("fund_status"), "reason": r["reject_reason"]}
+                 for r in scores if r.get("level") == "rejected"]
     try:
         fg = float((market_snapshot() or {}).get("market", {}).get("market_fear_greed") or 50)
     except Exception:  # noqa: BLE001
@@ -464,7 +550,9 @@ def mainline_summary() -> dict:
         "fear_greed": fg,
         "fear_greed_label": fear_greed_label(fg) if fg is not None else None,
         "top_n": _st.load().get("mainline_top_n", 2),
+        "market_grade": _grade_cache.get("grade", "B"),
         "items": items,
+        "rejected": rejected,
         "oversold": oversold_pool(),
     }
 

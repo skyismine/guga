@@ -167,6 +167,11 @@ def mainline_select() -> dict:
     zt_available = len(zt_pool) > 0  # 涨停池为空视为数据缺失,跳过涨停家数否决项
     passed, rejected, low = [], [], []
     for r in rows:
+        if r.get("level") == "rejected":
+            rejected.append({"name": r["industry"], "score": r.get("score", 0),
+                             "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
+                             "level": "rejected", "reasons": [r["reject_reason"]]})
+            continue
         stats = _sector_stats(r["industry"])
         banned, why = _veto(r["industry"], r, dcfg, stats, zt_available=zt_available)
         if banned:
