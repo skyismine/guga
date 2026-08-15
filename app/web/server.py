@@ -1474,6 +1474,30 @@ def api_sector_detail():
                     it = rj
                     break
         if it is None:
+            # 稳定器输出(stable:core/defensive/watch/rejected/candidate)兜底,
+            # 页面显示的是稳定结果,raw 与 stable 名单可能不一致
+            from app.support import mainline_stabilizer as _stab
+            st = _stab.get_output().get("stable") or {}
+            for grp in ("core", "defensive"):
+                if st.get(grp) and st[grp]["name"] == name:
+                    it = st[grp]
+                    break
+            if it is None:
+                for w in (st.get("watch") or []):
+                    if w["name"] == name:
+                        it = w
+                        break
+            if it is None:
+                for rj in (st.get("rejected") or []):
+                    if rj["name"] == name:
+                        it = rj
+                        break
+            if it is None:
+                for cd in (st.get("candidate") or []):
+                    if cd["name"] == name:
+                        it = cd
+                        break
+        if it is None:
             return jsonify({"error": f"未找到板块: {name}"}), 404
         detail = _sector_detail_html(it)
         return jsonify({
