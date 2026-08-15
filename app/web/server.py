@@ -793,14 +793,60 @@ def _grade_badge(g):
     return {"A": "b-core", "B": "b-branch", "C": "b-watch", "D": "b-wait"}.get(g, "b-wait")
 
 
-def _layer1_html(p1) -> str:
+# ---- 第五轮:全市场风格偏转信息(顶部结论卡 + 大盘开仓许可评级展示)
+_STYLE_CLS = {"小盘风格": "b-core", "大盘风格": "b-branch", "均衡": "b-watch"}
+
+
+def _market_style_of(d: dict) -> dict:
+    """从决策包提取全市场风格信息(优先 raw 的 market_style,兜底取 stable 条目标签)。"""
+    layers = (d or {}).get("layers") or {}
+    st = ((layers.get("layer2_raw") or {}) or {}).get("market_style")
+    if not st:
+        for it in (layers.get("layer2") or {}).get("watch") or []:
+            tag = it.get("market_style_tag")
+            if tag:
+                return {"bias": {"大盘风格": -1, "均衡": 0, "小盘风格": 1}.get(tag, 0),
+                        "tag": tag, "from": "stable"}
+        return {}
+    return st
+
+
+def _style_badge_html(style: dict) -> str:
+    """全市场风格徽标(带相对动量提示)。"""
+    tag = (style or {}).get("tag", "")
+    if not tag:
+        return ""
+    mom = (style or {}).get("mom") or {}
+    mom_txt = " / ".join(f"{k.replace('d', '日')} 小盘 {v * 100:+.2f}%" for k, v in mom.items()) if mom else ""
+    title = f"大小盘相对动量: {mom_txt}" if mom_txt else "沪深300 vs 小盘指数相对动量"
+    cls = _STYLE_CLS.get(tag, "b-watch")
+    return f'<span class="badge {cls}" style="font-size:13px" title="{_h(title)}">{_h(tag)}</span>'
+
+
+def _layer1_html(p1, style=None) -> str:
     rows = []
     for k, c in (p1.get("checks") or {}).items():
         state = "✅" if c.get("ok") else ("🟡" if c.get("ok_min") else "❌")
         rows.append(f"<tr><th>{_h(k)}</th><td>{_h(c.get('value'))}</td><td>{state} {_h(p1.get('grade_label'))}</td></tr>")
+    style_line = f'<div class="line" style="font-size:13px">🧭 市场风格: {_style_badge_html(style)}</div>' if style else ""
     tips = "".join(f'<div class="line">· {_h(r)}</div>' for r in p1.get("reasons", []))
     return (f"<div class='card'><h3>评级:{_h(p1.get('grade_label'))} · 总仓位上限 <b>{p1['cap']:.0%}</b></h3>"
-            f"<div class='tbl'><table><tr><th>因子</th><th>现值</th><th>达标</th></tr>{''.join(rows)}</table></div>{tips}</div>")
+            f"{style_line}<div class='tbl'><table><tr><th>因子</th><th>现值</th><th>达标</th></tr>{''.join(rows)}</table></div>{tips}</div>")
+
+
+def _ext_tag_html(it) -> str:
+    """第五轮扩展因子标签(梯队/涨停股市值结构,仅人工复盘展示,不参与打分;全市场风格移入顶部结论卡)。"""
+    tags = []
+    if it.get("ladder_tag"):
+        tags.append(f'<span class="badge b-watch" style="margin-left:4px;font-size:10px">{_h(it["ladder_tag"])}</span>')
+    # 涨停股市值结构:板块内涨停股流通市值中位数(≥100亿大盘 / ≤50亿小盘),用于风格偏转排序
+    if it.get("size_bias") == 1:
+        tags.append('<span class="badge b-watch" style="margin-left:4px;font-size:10px" title="涨停股以中小市值为主(流通中位≤50亿)">涨停偏小盘</span>')
+    elif it.get("size_bias") == -1:
+        tags.append('<span class="badge b-branch" style="margin-left:4px;font-size:10px" title="涨停股以大中市值为主(流通中位≥100亿)">涨停偏大盘</span>')
+    elif it.get("size_bias") == 0:
+        tags.append('<span class="badge b-watch" style="margin-left:4px;font-size:10px" title="涨停股市值结构均衡(50~100亿)">涨停均衡</span>')
+    return "".join(tags)
 
 
 def _sector_chip(it) -> str:
@@ -839,7 +885,8 @@ def _sector_chip(it) -> str:
     else:
         row_click = ""
     return (f"<tr{row_click}>"
-            f"<td><b>{_h(it.get('name'))}</b><span class='badge {cls}' style='margin-left:8px'>{lab}</span></td>"
+            f"<td><b>{_h(it.get('name'))}</b><span class='badge {cls}' style='margin-left:8px'>{lab}</span>"
+            f"{_ext_tag_html(it)}</td>"
             f"<td>{it.get('score')}</td>"
             f"<td class='{'up' if (it.get('pct_chg') or 0) >= 0 else 'down'}'>{it.get('pct_chg', 0):+.2f}%{pct_delta}</td>"
             f"<td>{it.get('net_yi', 0):+.1f} 亿{net_delta}</td><td>{zt}</td>"
@@ -1032,10 +1079,13 @@ def _conclusion_bar_html(con: dict, d: dict) -> str:
         act = "市场偏弱,以观望/持有兑现为主"
     risk = con.get("risk_tip") or "-"
     grade_cls = _grade_badge(con.get("grade"))
+    style = _market_style_of(d)
+    style_badge = _style_badge_html(style)
     return (f"<div class='card' id='conclusion-bar' style='border:0;background:linear-gradient(135deg,#1b2a63 0%,#17233f 100%);"
             f"padding:14px 18px;margin:10px 0'><div style='display:flex;gap:14px;align-items:center;flex-wrap:wrap'>"
             f"<div class='badge {grade_cls}' style='font-size:22px;padding:6px 16px'>{_h(con.get('grade_label') or '')}</div>"
             f"<div style='font-size:24px;font-weight:800;color:#fff'>总仓位上限 <span style='color:#ffca28'>{con.get('cap', 0):.0%}</span></div>"
+            f"{style_badge}"
             f"<div style='flex:1;min-width:260px;font-size:15px;line-height:1.7'>"
             f"<b>首选方向:</b> {_h(core) or '—'} &nbsp; <b>首选标的:</b> {_h(stock)}<br>"
             f"<span style='color:#ffd54f;font-weight:600'>操作建议:</span> {_h(act)} &nbsp;"
@@ -1462,7 +1512,8 @@ def page_decision():
     plans = d.get("plans") or {}
     core_plan = _plan_table_html(plans, core["name"]) if core else '<div class="mut">无达标主线,暂无执行计划</div>'
 
-    layer1 = _layer1_html(p1)
+    style = _market_style_of(d)
+    layer1 = _layer1_html(p1, style)
     layer2_parts = []
     for it in ([core] if core else []) + ([defen] if defen else []) + (p2.get("watch") or []):
         layer2_parts.append(_sector_chip(it))
@@ -2097,6 +2148,20 @@ _SETTING_FIELDS = [
         ("decision.mainline.poll_interval_sec", "后台轮询间隔(秒)", "number", 0, 3600, "稳定器按此间隔推进一个周期;0=关闭后台轮询(仅访问时推进)"),
         ("decision.mainline.poll_trading_hours_only", "仅交易时段轮询", "checkbox", None, None, "工作日 9:30-11:30 / 13:00-15:00 轮询,节省接口调用"),
     ]),
+    ("扩展因子", [
+        ("decision.mainline.enable_extend_factor", "启用扩展因子", "checkbox", None, None, "连板梯队 + 大小盘风格偏转;默认关闭(回测保持原逻辑)"),
+        ("decision.mainline.extend_factor.ladder.enabled", "梯队因子启用", "checkbox", None, None, "trend 内部重组为 涨跌归一0.6 + 涨停0.2 + 梯队0.2,trend 总权重30不变"),
+        ("decision.mainline.extend_factor.ladder.pct_w", "梯队:涨跌权重", "number", 0, 1, "当日涨跌幅归一在 trend 内权重"),
+        ("decision.mainline.extend_factor.ladder.zt_w", "梯队:涨停权重", "number", 0, 1, "涨停家数在 trend 内权重"),
+        ("decision.mainline.extend_factor.ladder.ladder_w", "梯队:梯队权重", "number", 0, 1, "ladder_score 在 trend 内权重(三者合计≈1)"),
+        ("decision.mainline.extend_factor.ladder.zhongjun_float_yi", "中军流通市值(亿)", "number", 10, 2000, "板块内涨停股流通市值>=此值视为中军涨停背书"),
+        ("decision.mainline.extend_factor.ladder.gap_from_board", "断层判定起板位", "number", 2, 6, "最高连板>=此值才检查梯队断层"),
+        ("decision.mainline.extend_factor.ladder.drop_confirm", "梯队变差确认周期N", "number", 1, 20, "盘中炸板导致梯队变差需连续N个快照周期确认(稳定器内生效)"),
+        ("decision.mainline.extend_factor.ladder.drop_delta", "梯队变差判定阈值", "number", 0, 1, "ladder_score 降幅>=此值判定为梯队变差"),
+        ("decision.mainline.extend_factor.style.enabled", "风格偏转启用", "checkbox", None, None, "仅同池板块分数差<=阈值时按大小盘风格调整排序,不改板块原始score"),
+        ("decision.mainline.extend_factor.style.bias_thresh", "风格判定阈值", "number", 0, 0.1, "中证2000-沪深300相对动量差(小数,如0.02=2%)判定大盘/均衡/小盘"),
+        ("decision.mainline.extend_factor.style.sort_bias_thresh", "偏转排序分差阈值", "number", 0, 20, "同池板块分数差<=此值(分)才启用风格偏转排序"),
+    ]),
 ]
 
 
@@ -2170,7 +2235,10 @@ def _flatten_form(form) -> dict:
         if key.startswith("monitor.rules.") or key == "llm.enable" or key.startswith("web_ui.") \
                 or key in ("decision.mainline.enable_stabilizer",
                            "decision.mainline.weaken_news_on_no_5d_money",
-                           "decision.mainline.poll_trading_hours_only"):
+                           "decision.mainline.poll_trading_hours_only",
+                           "decision.mainline.enable_extend_factor",
+                           "decision.mainline.extend_factor.ladder.enabled",
+                           "decision.mainline.extend_factor.style.enabled"):
             val = True
         else:
             try:
@@ -2191,10 +2259,15 @@ def _flatten_form(form) -> dict:
                "mood_risk_tag", "delta_arrows", "sector_detail",
                "candidate_list", "raw_debug"):
         out.setdefault("web_ui", {}).setdefault(wk, False)
-    # 防抖稳定器未勾选的布尔开关回填 False
+    # 防抖稳定器/扩展因子未勾选的布尔开关回填 False
     for mk in ("enable_stabilizer", "weaken_news_on_no_5d_money",
-               "poll_trading_hours_only"):
+               "poll_trading_hours_only", "enable_extend_factor"):
         out.setdefault("decision", {}).setdefault("mainline", {}).setdefault(mk, False)
+    for ek in ("enabled",):
+        out.setdefault("decision", {}).setdefault("mainline", {}) \
+           .setdefault("extend_factor", {}).setdefault("ladder", {}).setdefault(ek, False)
+        out.setdefault("decision", {}).setdefault("mainline", {}) \
+           .setdefault("extend_factor", {}).setdefault("style", {}).setdefault(ek, False)
     return out
 
 

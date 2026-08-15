@@ -179,7 +179,9 @@ def _smoothed_flows() -> list:
 # ------------------------------------------------------------------ 状态机工具
 def _new_state() -> dict:
     return {"valid_cycles": 0, "veto_hits": 0, "lead_cycles": 0,
-            "inv_cycles": 0, "in_passed": False, "cool_until": 0.0}
+            "inv_cycles": 0, "in_passed": False, "cool_until": 0.0,
+            # 第五轮:梯队变差确认(连续N周期)状态
+            "ladder_score": None, "ladder_bad": 0, "ladder_hold": False}
 
 
 def _cooling(st, now) -> bool:
@@ -195,6 +197,9 @@ def _mark_removed(st, now, cool_min: int) -> None:
     st["in_passed"] = False
     st["valid_cycles"] = 0
     st["veto_hits"] = 0
+    st["ladder_score"] = None
+    st["ladder_bad"] = 0
+    st["ladder_hold"] = False
 
 
 def _log_fields(st, now, trigger: str) -> dict:
@@ -212,6 +217,50 @@ def _stamp(item, st, now, trigger: str) -> None:
     item["hysteresis_trigger"] = trigger
 
 
+# ---------------------------------------------------------------- 第五轮:梯队变差确认
+def _ladder_hold(r, st, cfg, dcfg) -> dict:
+    """盘中炸板导致梯队变差不立即生效:连续 N 个快照周期确认后才按新梯队计分。
+
+    只对已在正式池(in_passed)的板块生效(驻留校验);确认期内按持有梯队回补分数,
+    梯队恢复则清零计数。返回(可能被替换的)行。
+    """
+    if r.get("ladder_score") is None or not st.get("in_passed"):
+        return r
+    lcfg = (cfg.get("extend_factor") or {}).get("ladder") or {}
+    N = int(lcfg.get("drop_confirm", cfg.get("STABILIZE_CYCLE", 3)))
+    drop_delta = float(lcfg.get("drop_delta", 0.25))
+    if N <= 0 or drop_delta <= 0:
+        return r
+    new = float(r.get("ladder_score") or 0.0)
+    held = st.get("ladder_score")
+    if held is None:
+        st["ladder_score"] = new
+        return r
+    drop = float(held) - new
+    if drop >= drop_delta:
+        st["ladder_bad"] = st.get("ladder_bad", 0) + 1
+        if st["ladder_bad"] >= N:
+            st["ladder_bad"] = 0
+            st["ladder_score"] = new
+            st["ladder_hold"] = False
+            return r
+        # 确认期内:score 回补 ladder 降幅(避免瞬时炸板直接掉分出池)
+        from app.support import settings as _st
+        w_trend = float((_st.load().get("score_weights") or {}).get("trend", 30))
+        ladder_w = float(lcfg.get("ladder_w", 0.2))
+        r = dict(r)
+        r["score"] = round(float(r["score"]) + w_trend * ladder_w * drop, 2)
+        r["ladder_score"] = float(held)
+        r["_ladder_note"] = (f"梯队变差确认中(炸板未连续 {N} 个周期确认),"
+                             f"按持有梯队 {held:.2f} 计分")
+        st["ladder_hold"] = True
+        return r
+    st["ladder_bad"] = 0
+    st["ladder_score"] = new
+    st["ladder_hold"] = False
+    return r
+
+
 # ------------------------------------------------------------------ 条目构造
 def _mk_item(r, stats, level, reasons, pool=None, extra=None) -> dict:
     it = {"name": r["industry"], "score": r["score"], "pct_chg": r["pct_chg"],
@@ -222,6 +271,13 @@ def _mk_item(r, stats, level, reasons, pool=None, extra=None) -> dict:
           "fund_rank_5d": r.get("fund_rank_5d"),
           "breakdown": r.get("breakdown") or {}, "level": level,
           "reasons": list(reasons)}
+    if r.get("ladder_score") is not None:      # 第五轮:梯队标签(复盘展示)
+        it["ladder_score"] = r["ladder_score"]
+        it["ladder_tag"] = r.get("ladder_tag")
+        it["size_bias"] = r.get("size_bias", 0)
+    note = r.get("_ladder_note")               # 梯队变差确认中的计分说明
+    if note:
+        it["reasons"] = it["reasons"] + [note]
     if pool:
         it["pool"] = pool
     if extra:
@@ -230,11 +286,15 @@ def _mk_item(r, stats, level, reasons, pool=None, extra=None) -> dict:
 
 
 def _mk_rejected(r, stats, reasons) -> dict:
-    return {"name": r["industry"], "score": r.get("score", 0),
-            "pct_chg": r.get("pct_chg", 0), "net_yi": r.get("net_yi", 0),
-            "zt_count": r.get("zt_count", 0), "leader": r.get("leader", ""),
-            "stats": stats or {}, "level": "rejected", "reasons": list(reasons),
-            "breakdown": r.get("breakdown") or {}}
+    it = {"name": r["industry"], "score": r.get("score", 0),
+          "pct_chg": r.get("pct_chg", 0), "net_yi": r.get("net_yi", 0),
+          "zt_count": r.get("zt_count", 0), "leader": r.get("leader", ""),
+          "stats": stats or {}, "level": "rejected", "reasons": list(reasons),
+          "breakdown": r.get("breakdown") or {}}
+    if r.get("ladder_score") is not None:
+        it["ladder_tag"] = r.get("ladder_tag")
+        it["size_bias"] = r.get("size_bias", 0)
+    return it
 
 
 # ------------------------------------------------------------------ 核心稳定逻辑
@@ -276,6 +336,8 @@ def _build_stable(cfg: dict) -> dict:
     pass_score = float(cfg.get("pass_score", 60.0))
     watch_n = int(cfg.get("watch_n", 3))
     now = time.time()
+    # 第五轮:全局风格偏转标签(复盘展示,不参与打分)
+    style_tag = _ml.market_style_bias().get("tag", "") if cfg.get("enable_extend_factor") else ""
 
     # 平滑单日资金 + 5日表原样(稳定器不参与 5 日平滑)
     flows = _smoothed_flows()
@@ -325,6 +387,8 @@ def _build_stable(cfg: dict) -> dict:
             continue
         st["veto_hits"] = 0
 
+        # 第五轮:梯队变差确认(盘中炸板不立即生效,连续 N 周期才反映到分数)
+        r = _ladder_hold(r, st, cfg, dcfg)
         score = r["score"]
         if st.get("in_passed"):
             # 已在正式池:滞回保级
@@ -351,6 +415,9 @@ def _build_stable(cfg: dict) -> dict:
                             pool=pool, extra=_log_fields(st, now, "cool_down")))
                     else:
                         st["in_passed"] = True
+                        # 第五轮:入池即初始化梯队跟踪基准(后续周期梯队变差需连续N周期确认)
+                        if r.get("ladder_score") is not None:
+                            st["ladder_score"] = float(r["ladder_score"])
                         passed.append(_mk_item(r, stats, "passed", _en._pass_reasons(r, stats), pool=pool))
                 else:
                     candidate.append(_mk_item(
@@ -438,6 +505,11 @@ def _build_stable(cfg: dict) -> dict:
 
     _LAST_OUT["stable_core"] = core["name"] if core else None
     _LAST_OUT["stable_def"] = defen["name"] if defen else None
+
+    if style_tag:      # 第五轮:风格标签透传到全部稳定条目(复盘展示)
+        for it in ([core] if core else []) + ([defen] if defen else []) \
+                  + watch + rejected + candidate:
+            it["market_style_tag"] = style_tag
 
     return {"core": core, "defensive": defen, "watch": watch,
             "rejected": rejected[:max(watch_n, 5)],

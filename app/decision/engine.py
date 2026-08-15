@@ -203,6 +203,36 @@ def _sector_pool(name: str) -> str:
     return pool.get("default", "aggressive")
 
 
+def _style_order(items: list, style: dict, thresh: float) -> list:
+    """同池板块按风格偏转微调排序(第五轮扩展因子)。
+
+    仅当:风格明确(style_bias≠0)、同池相邻板块分数差<=thresh 时,
+    将与本轮风格(大盘/小盘)对齐的板块提前;分数差距大时保持原始 score 排序。
+    不修改任何板块 score,仅调整池内先后顺序(影响 leader 选任)。
+    """
+    if not items or not style or thresh <= 0:
+        return items
+    bias = style.get("bias")
+    if bias not in (-1, 1):
+        return items
+    out = list(items)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(out) - 1):
+            a, b = out[i], out[i + 1]
+            if abs((a["score"] or 0) - (b["score"] or 0)) > thresh:
+                continue
+            sa = a.get("size_bias", 0)
+            sb = b.get("size_bias", 0)
+            va = 1 if sa == bias else 0
+            vb = 1 if sb == bias else 0
+            if vb > va:
+                out[i], out[i + 1] = out[i + 1], out[i]
+                changed = True
+    return out
+
+
 def _pos_rating(stats: dict, vcfg: dict) -> str:
     """位置评级:低位启动 / 中位运行 / 短期高位(基于近3日涨幅与20日回撤)。"""
     gain3 = stats.get("gain3")
@@ -290,6 +320,11 @@ def mainline_select() -> dict:
     rows = _ml.sector_scores(use_cache=True)
     zt_pool = _ml._zt_pool()
     zt_available = len(zt_pool) > 0  # 涨停池为空视为数据缺失,跳过涨停家数否决项
+    # ---- 第五轮:扩展因子(风格偏转排序 + 标签字段) ----
+    ext_cfg = _ml._extend_cfg()
+    style = _ml.market_style_bias() if ext_cfg else None
+    style_tag = (style or {}).get("tag", "") if ext_cfg else ""
+    style_thresh = float((ext_cfg.get("style") or {}).get("sort_bias_thresh", 3.0)) if ext_cfg else 0.0
     passed, rejected, low = [], [], []
     names = [r["industry"] for r in rows if r.get("level") != "rejected"]
     stats_map = {r["industry"]: _sector_stats(r["industry"]) for r in rows} if len(rows) <= 30 else _sector_stats_many(names)
@@ -318,6 +353,12 @@ def mainline_select() -> dict:
                 "fund_status": r.get("fund_status"), "rate_5d": r.get("rate_5d"),
                 "fund_rank_5d": r.get("fund_rank_5d"),
                 "breakdown": r.get("breakdown") or {}}
+        if ext_cfg:
+            # 第五轮:梯队/市值风格标签字段(仅复盘展示,不参与打分)
+            item["ladder_score"] = r.get("ladder_score")
+            item["ladder_tag"] = r.get("ladder_tag")
+            item["size_bias"] = r.get("size_bias", 0)
+            item["market_style_tag"] = style_tag
         if r["score"] >= mline.get("pass_score", 60.0):
             item["reasons"] = _pass_reasons(r, stats)
             item["pool"] = _sector_pool(r["industry"])
@@ -327,9 +368,12 @@ def mainline_select() -> dict:
             item["reasons"] = [f"综合评分 {r['score']} 分,低于准入线 {mline.get('pass_score', 60.0)} 分,仅跟踪"]
             low.append(item)
 
-    # ---- 属性池内分级(禁止跨池对比)
+    # ---- 属性池内分级(禁止跨池对比);第五轮:风格偏转仅调整同池相邻且分差小的排序
     aggressive = sorted([p for p in passed if p.get("pool") == "aggressive"], key=lambda x: -x["score"])
     defensive_pool = sorted([p for p in passed if p.get("pool") == "defensive"], key=lambda x: -x["score"])
+    if ext_cfg and style:
+        aggressive = _style_order(aggressive, style, style_thresh)
+        defensive_pool = _style_order(defensive_pool, style, style_thresh)
     core = aggressive[0] if aggressive else None
     if core:
         core["level"] = "core"
@@ -379,9 +423,13 @@ def mainline_select() -> dict:
             if vcfg.get("note", True) and p.get("level") != "rejected":
                 p["reasons"] = [_value_notes(p, vcfg)] + p["reasons"]
 
-    return {"core": core, "defensive": defensive, "watch": watch,
-            "rejected": rejected[: mline.get("watch_n", 3)],
-            "pass_score": mline.get("pass_score", 60.0)}
+    out = {"core": core, "defensive": defensive, "watch": watch,
+           "rejected": rejected[: mline.get("watch_n", 3)],
+           "pass_score": mline.get("pass_score", 60.0)}
+    if ext_cfg:
+        # 第五轮:全局风格偏转信息(复盘展示,不参与打分)
+        out["market_style"] = style or _ml.market_style_bias()
+    return out
 
 
 # ---------------------------------------------------------------- 第三层 标的精准匹配

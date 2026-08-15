@@ -156,7 +156,11 @@ def _a_spot_map(refresh=False) -> dict:
 
 
 def _zt_pool(date=None, refresh=False) -> list:
-    """当日涨停池个股:[{code, name, pct, reason}]。"""
+    """当日涨停池个股:[{code, name, pct, reason, boards, float_yi}]。
+
+    boards=连板数(炸板重来按当前连板), float_yi=流通市值(亿)。
+    旧缓存文件缺字段时按 boards=1 / float_yi=0 兜底,不阻塞读取。
+    """
     date = date or _try_trade_date()
     path = os.path.join(config.DATA_DIR, f"zt_{date}.json")
     if not refresh and os.path.exists(path):
@@ -175,11 +179,16 @@ def _zt_pool(date=None, refresh=False) -> list:
         idx_name = cols.get("名称", 2)
         idx_pct = cols.get("涨跌幅", 3)
         idx_reason = cols.get("涨停统计", cols.get("所属行业", -1))
+        idx_board = cols.get("连板数", -1)
+        idx_float = cols.get("流通市值", -1)
         for _, r in df.iterrows():
             try:
                 reason = str(r.iloc[idx_reason] or "") if idx_reason >= 0 else ""
+                board = int(float(r.iloc[idx_board] or 0)) if idx_board >= 0 else 1
+                float_yi = float(r.iloc[idx_float] or 0) / 1e8 if idx_float >= 0 else 0.0
                 out.append({"code": str(r.iloc[idx_code]).zfill(6), "name": str(r.iloc[idx_name]),
-                            "pct": float(r.iloc[idx_pct] or 0), "reason": reason})
+                            "pct": float(r.iloc[idx_pct] or 0), "reason": reason,
+                            "boards": board, "float_yi": round(float_yi, 2)})
             except (IndexError, TypeError, ValueError):
                 continue
         return out
@@ -388,6 +397,153 @@ def _minmax(vals: list) -> dict:
     return {v: (v - lo) / rng if rng else 0.0 for v in vals}
 
 
+# ---------------------------------------------------------------- 第五轮:扩展因子
+def _extend_cfg() -> dict:
+    """扩展因子配置(读取 settings.decision.mainline.extend_factor,缺省返回空)。"""
+    ml = (_st.load().get("decision", {}).get("mainline", {}) or {})
+    if not ml.get("enable_extend_factor", False):
+        return {}
+    return ml.get("extend_factor") or {}
+
+
+def _zt_of_sector(name: str, zt: list, cons: list) -> list:
+    """板块内涨停个股列表(code 命中成分)。"""
+    cons_set = set(cons)
+    return [z for z in zt if z.get("code") in cons_set]
+
+
+def _sector_ladder(name: str, zt: list, cons: list, lcfg: dict) -> dict:
+    """板块连板梯队:统计最高连板/各板位/断层/中军,输出 ladder_score(0~1) 与 tag。
+
+    ladder_score = base(最高连板) + tier_bonus(板位覆盖) + zhongjun_bonus(中军涨停)
+                   - gap_penalty(断层), 截断到 [0,1]。
+    无连板时基础分很低但不为 0,允许趋势类机构赛道低分存续(禁止一票否决)。
+    """
+    stocks = _zt_of_sector(name, zt, cons)
+    boards = [z.get("boards", 1) for z in stocks]
+    max_b = max(boards) if boards else 0
+    tiers = sorted({min(b, 4) for b in boards}) if boards else []
+    zhongjun = any((z.get("float_yi") or 0) >= float(lcfg.get("zhongjun_float_yi", 100.0))
+                   for z in stocks)
+    gap = False
+    if max_b >= int(lcfg.get("gap_from_board", 3)):
+        # 有高位板但缺中间某板位 => 断层(如 3板却无 2板)
+        gap = any(t not in tiers for t in range(1, max_b))
+    base_map = lcfg.get("base_board") or {0: 0.10, 1: 0.50, 2: 0.75, 3: 0.88, 4: 1.00}
+    base = float(base_map.get(min(max_b, 4), 0.10))
+    tier = float(lcfg.get("tier_bonus", 0.06)) * max(0, len(tiers) - 1)
+    zj = float(lcfg.get("zhongjun_bonus", 0.12)) if zhongjun else 0.0
+    gap_pen = float(lcfg.get("gap_penalty", 0.10)) if gap else 0.0
+    score = max(0.0, min(1.0, base + tier + zj - gap_pen))
+    return {"score": round(score, 3), "max_board": max_b, "tiers": tiers,
+            "gap": gap, "zhongjun": zhongjun,
+            "tag": _ladder_tag(max_b, gap, zhongjun)}
+
+
+def _ladder_tag(max_b: int, gap: bool, zhongjun: bool) -> str:
+    parts = []
+    if max_b <= 0:
+        parts.append("无连板")
+    else:
+        parts.append(f"{max_b}板梯队")
+    if gap:
+        parts.append("断层")
+    if zhongjun:
+        parts.append("有中军")
+    return "·".join(parts)
+
+
+def _sector_size_bias(name: str, zt: list, cons: list, lcfg: dict) -> int:
+    """板块市值风格:按板块内涨停股流通市值中位数判定 -1大盘 / 0均衡 / 1小盘。
+    无涨停数据时返回 0(不参与风格偏转排序)。"""
+    stocks = _zt_of_sector(name, zt, cons)
+    if not stocks:
+        return 0
+    fv = sorted((z.get("float_yi") or 0) for z in stocks)
+    med = fv[len(fv) // 2]
+    th = float(lcfg.get("zhongjun_float_yi", 100.0))
+    if med >= th:
+        return -1
+    if med <= th * 0.5:
+        return 1
+    return 0
+
+
+_style_cache = {"date": None, "data": None}
+
+
+def market_style_bias(refresh: bool = False) -> dict:
+    """全局大小盘风格偏转(沪深300 vs 中证2000 相对动量)。
+
+    返回 {bias, tag, mom, rel_score, date}:bias∈{-1,0,1} = 大盘/均衡/小盘。
+    数据源:小盘指数优先中证2000(东财 932000);东财被限流/新浪无该指数时,
+    依次退化为中证1000(sh000852)/中证500(sh000905)作小盘代理(输出 small_symbol 标注),
+    大盘指数为沪深300(sh000300)。全部不可用时降级为 0(均衡),不影响打分。
+    """
+    global _style_cache
+    today = _today()
+    if not refresh and _style_cache["date"] == today and _style_cache["data"]:
+        return _style_cache["data"]
+    out = {"bias": 0, "tag": "均衡", "mom": {}, "rel_score": 0.0, "date": today,
+           "big_symbol": "", "small_symbol": ""}
+    try:
+        import akshare as ak
+        scfg = _extend_cfg().get("style") or {}
+        if not scfg.get("enabled", True):
+            _style_cache.update(date=today, data=out)
+            return out
+        days = scfg.get("mom_days") or [10, 20]
+        weights = scfg.get("mom_weight") or [0.5] * len(days)
+
+        def _em_close(symbol: str):
+            df = ak.index_zh_a_hist(symbol=symbol, period="daily")
+            return pd.to_numeric(df["收盘"], errors="coerce").dropna()
+
+        def _sina_close(symbol: str):
+            from app.data.market import get_index_history
+            return get_index_history(symbol)["close"]
+
+        def _close_chain(em: tuple, sinas: tuple):
+            for s in em:
+                try:
+                    return _em_close(s), s
+                except Exception:  # noqa: BLE001
+                    continue
+            for s in sinas:
+                try:
+                    return _sina_close(s), s
+                except Exception:  # noqa: BLE001
+                    continue
+            return None, None
+
+        big, bsym = _close_chain(("000300",), ("sh000300",))
+        small, ssym = _close_chain(("932000",),
+                                   ("sh932000", "sz932000", "sh000852", "sh000905"))
+        need = max(days) + 1
+        if big is None or small is None or len(big) < need or len(small) < need:
+            _style_cache.update(date=today, data=out)
+            return out
+        out["big_symbol"], out["small_symbol"] = bsym, ssym
+        rel = {}
+        for nd, wt in zip(days, weights):
+            r_big = big.iloc[-1] / big.iloc[-1 - nd] - 1
+            r_small = small.iloc[-1] / small.iloc[-1 - nd] - 1
+            rel[f"{nd}d"] = round(float(r_small - r_big), 4)   # 正=小盘强
+        score = sum(float(wt) * rel[f"{nd}d"] for nd, wt in zip(days, weights))
+        thresh = float(scfg.get("bias_thresh", 0.02))
+        if score >= thresh:
+            out["bias"], out["tag"] = 1, "小盘风格"
+        elif score <= -thresh:
+            out["bias"], out["tag"] = -1, "大盘风格"
+        else:
+            out["bias"], out["tag"] = 0, "均衡"
+        out["mom"], out["rel_score"] = rel, round(score, 4)
+    except Exception as e:  # noqa: BLE001
+        print(f"[mainline] market_style_bias 降级为均衡: {e}")
+    _style_cache.update(date=today, data=out)
+    return out
+
+
 def _market_grade() -> str:
     """市场评级(A/B/C/D),按日缓存,驱动资金面动态权重。"""
     if _grade_cache["date"] == _today() and _grade_cache["grade"]:
@@ -531,6 +687,19 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
               for f in admitted}
     news = _news_mentions()
 
+    # ---- 第五轮:扩展因子(连板梯队 + 板块市值风格) ----
+    ext_cfg = _extend_cfg()
+    lcfg = ext_cfg.get("ladder") or {}
+    ladder_on = bool(lcfg.get("enabled", True) and ext_cfg)
+    cons_cache = {f["industry"]: _concept_cons(f["industry"], allow_net=False) for f in admitted}
+    ladder_map = {}
+    size_map = {}
+    if ladder_on:
+        for f in admitted:
+            name = f["industry"]
+            ladder_map[name] = _sector_ladder(name, zt, cons_cache[name], lcfg)
+            size_map[name] = _sector_size_bias(name, zt, cons_cache[name], lcfg)
+
     names = [f["industry"] for f in admitted]
     pcts = [f["pct_chg"] for f in admitted]
     pct_map = _minmax(pcts)
@@ -540,7 +709,16 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
         name = f["industry"]
         pct = pct_map[f["pct_chg"]]
         z = zt_cnt.get(name, 0)
-        trend = pct * 0.8 + (0.2 * (min(z, 8) / 8.0 if zt else pct))
+        zt_norm = min(z, 8) / 8.0 if zt else pct
+        if ladder_on:
+            # trend = 当日涨跌幅归一*0.6 + 涨停家数*0.2 + ladder_score*0.2
+            pct_w = float(lcfg.get("pct_w", 0.6))
+            zt_w = float(lcfg.get("zt_w", 0.2))
+            ld_w = float(lcfg.get("ladder_w", 0.2))
+            ladder_score = ladder_map[name]["score"]
+            trend = pct * pct_w + zt_norm * zt_w + ladder_score * ld_w
+        else:
+            trend = pct * 0.8 + 0.2 * zt_norm
         direction = 1.0 if f["pct_chg"] >= 0 else 0.5
         senti = (fg / 100.0) * direction
         news_s = 1.0 if news.get(name) else 0.0
@@ -550,15 +728,21 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
             news_s = news_weak_ratio
         score = (f["fund_score"] + w.get("trend", 30) * trend
                  + w.get("sentiment", 20) * senti + w.get("news", 10) * news_s)
-        rows.append({**f, "score": round(score, 2), "zt_count": z, "news_hits": news.get(name, 0),
-                     "breakdown": {
-                         "fund": f["fund_score"],
-                         "fund_5d": f.get("fund_score_5d"),
-                         "fund_1d": f.get("fund_score_1d"),
-                         "trend": round(w.get("trend", 30) * trend, 2),
-                         "sentiment": round(w.get("sentiment", 20) * senti, 2),
-                         "news": round(w.get("news", 10) * news_s, 2),
-                     }})
+        row = {**f, "score": round(score, 2), "zt_count": z, "news_hits": news.get(name, 0),
+               "breakdown": {
+                   "fund": f["fund_score"],
+                   "fund_5d": f.get("fund_score_5d"),
+                   "fund_1d": f.get("fund_score_1d"),
+                   "trend": round(w.get("trend", 30) * trend, 2),
+                   "sentiment": round(w.get("sentiment", 20) * senti, 2),
+                   "news": round(w.get("news", 10) * news_s, 2),
+               }}
+        if ladder_on:
+            row["ladder_score"] = ladder_map[name]["score"]
+            row["ladder_tag"] = ladder_map[name]["tag"]
+            row["ladder_detail"] = {k: ladder_map[name][k] for k in ("max_board", "tiers", "gap", "zhongjun")}
+            row["size_bias"] = size_map[name]
+        rows.append(row)
     rows.sort(key=lambda x: x["score"], reverse=True)
     _mark_levels(rows)
     rows.extend(rejected)

@@ -87,6 +87,29 @@ DEFAULTS = {
             "PASS_HYSTERESIS_UP": 62.0,     # 新板块进入正式池(passed)的分数门槛
             "PASS_HYSTERESIS_DOWN": 58.0,   # 已在正式池内的板块,分数低于此值才允许移出(滞回)
             "weaken_news_on_no_5d_money": True,  # 无5日资金净流入时,新闻催化满分降为低档(防消息脉冲)
+            # ---- 第五轮:扩展因子(可配置开关,默认开启;回测可关闭保持原逻辑) ----
+            "enable_extend_factor": True,   # 扩展因子总开关(连板梯队 + 大小盘风格偏转)
+            "extend_factor": {
+                "ladder": {                  # 板块连板梯队因子(trend 内部重组,trend 总权重30不变)
+                    "enabled": True,
+                    "pct_w": 0.6, "zt_w": 0.2, "ladder_w": 0.2,   # trend = 涨跌归一*0.6 + 涨停*0.2 + 梯队*0.2
+                    "base_board": {0: 0.10, 1: 0.50, 2: 0.75, 3: 0.88, 4: 1.00},  # 最高连板->基础分
+                    "tier_bonus": 0.06,      # 每个额外板位覆盖加分(梯队越完整越高)
+                    "gap_penalty": 0.10,     # 梯队断层惩罚(有高位板缺相邻低板位)
+                    "zhongjun_bonus": 0.12,  # 中军涨停加分(板块内大市值涨停股背书)
+                    "zhongjun_float_yi": 100.0,  # 中军判定流通市值下限(亿)
+                    "gap_from_board": 3,     # 最高连板>=此值才参与断层判定
+                    "drop_confirm": 3,       # 梯队变差需连续N个快照周期确认(稳定器内生效)
+                    "drop_delta": 0.25,      # ladder_score 降幅>=此值判定为梯队变差
+                },
+                "style": {                   # 全局大小盘风格偏转(仅池内排序,不改板块原始score)
+                    "enabled": True,
+                    "mom_days": [10, 20],    # 相对动量窗口(日)
+                    "mom_weight": [0.5, 0.5],# 窗口权重(与 mom_days 对齐)
+                    "bias_thresh": 0.02,     # 小盘-大盘相对动量差(小数,2%)判定风格
+                    "sort_bias_thresh": 3.0, # 同池板块分数差<=此值才启用风格偏转排序
+                },
+            },
             # ---- 第四轮:后台定时轮询(独立于网页访问,推进平滑与N周期确认) ----
             "poll_interval_sec": 300,       # 稳定器后台轮询间隔(秒); 0=关闭后台轮询(退回"仅访问时推进")
             "poll_trading_hours_only": True,  # 仅交易时段(工作日 9:30-11:30 / 13:00-15:00)轮询,省接口调用
