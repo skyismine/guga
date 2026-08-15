@@ -963,20 +963,15 @@ def _safe_date_str(d=None) -> str:
     return (d or _dt.date.today()).isoformat()
 
 
-def _prev_trade_date() -> str:
-    """返回最近一个非今日的交易日(用于昨日复盘)。"""
-    from app.review.data import review_date
-    try:
-        d = review_date()
-        if str(d) < str(_dt.date.today()):
-            return str(d)
-    except Exception:  # noqa: BLE001
-        pass
-    # 兜底:往前找 data_cache 的 targets_*.json
+def _prev_trade_date(cur: str = None) -> str:
+    """返回严格早于 cur(默认今日)的最近一次决策快照日期,供「昨日信号复盘 / 环比箭头」使用。
+    只认已落盘的 targets_*.json,避免把本次请求刚写入的今日快照误当成昨日。"""
+    cur = cur or str(_dt.date.today())
     import glob
     pat = os.path.join(_TARGET_SNAP_DIR, "targets_*.json")
-    files = sorted(glob.glob(pat)) if glob.glob(pat) else []
-    return os.path.basename(files[-1])[8:-5] if files else ""
+    dates = [os.path.basename(p)[8:-5] for p in glob.glob(pat)]
+    dates = [d for d in dates if d < cur]
+    return max(dates) if dates else ""
 
 
 def _save_target_snapshot(data: dict) -> None:
@@ -1047,8 +1042,8 @@ def _conclusion_bar_html(con: dict, d: dict) -> str:
 
 
 # ---- 优化项2:昨日信号复盘
-def _load_prev_targets() -> list:
-    prev = _prev_trade_date()
+def _load_prev_targets(cur: str = None) -> list:
+    prev = _prev_trade_date(cur)
     if not prev:
         return []
     path = os.path.join(_TARGET_SNAP_DIR, f"targets_{prev}.json")
@@ -1061,9 +1056,9 @@ def _load_prev_targets() -> list:
         return []
 
 
-def _yesterday_review_html() -> str:
+def _yesterday_review_html(cur: str = None) -> str:
     try:
-        items = _enrich_prev_with_quotes(_load_prev_targets())
+        items = _enrich_prev_with_quotes(_load_prev_targets(cur))
         if not items:
             return ('<div class="card"><h3>📋 昨日信号复盘</h3>'
                     '<div class="mut">暂无昨日快照:今日生成决策后,次日将自动复盘昨日推荐标的今日表现。</div></div>')
@@ -1095,7 +1090,7 @@ def _yesterday_review_html() -> str:
         if mx is not None:
             stat += f" · 最大涨幅 <b class='up'>{mx:+.2f}%</b> · 最大跌幅 <b class='down'>{mn:+.2f}%</b>"
         return ('<details class="card"><summary><b>📋 昨日信号复盘</b> &nbsp;<span class="mut">'
-                + _h(f"{_prev_trade_date()} 推荐标的 → 今日表现") + '</span></summary>'
+                + _h(f"{_prev_trade_date(cur)} 推荐标的 → 今日表现") + '</span></summary>'
                 + f"<div class='line'>{stat}</div>"
                 + (f"<div class='tbl'><table><tr><th>板块</th><th>标的</th><th>档位</th><th>今日</th></tr>"
                    + "".join(rows) + "</table></div>" if rows else "")
@@ -1152,9 +1147,9 @@ def _rejected_section_html(rejected: list, on: bool) -> str:
             + "</table></div></details>")
 
 
-def _prev_sector_map() -> dict:
+def _prev_sector_map(cur: str = None) -> dict:
     """读取上一交易日板块行情快照 {name: {pct_chg, net_yi}}。"""
-    prev = _prev_trade_date()
+    prev = _prev_trade_date(cur)
     if not prev:
         return {}
     path = os.path.join(_TARGET_SNAP_DIR, f"layers_{prev}.json")
@@ -1427,7 +1422,7 @@ def page_decision():
     p2 = d["layers"]["layer2"]
 
     global _SECTOR_PREV_MAP
-    _SECTOR_PREV_MAP = _prev_sector_map()
+    _SECTOR_PREV_MAP = _prev_sector_map(d["date"])
     _save_target_snapshot(d)
 
     core = p2.get("core")
@@ -1455,7 +1450,7 @@ def page_decision():
     else:
         layer3 = _layer3_html(d.get("targets"))
     # 第三轮:昨日信号复盘(页面底部折叠)
-    yrev = _yesterday_review_html() if _web_ui_flag("yesterday_review") else ""
+    yrev = _yesterday_review_html(d["date"]) if _web_ui_flag("yesterday_review") else ""
 
     content = [
         '<header><h1>🎯 今日决策</h1>'
