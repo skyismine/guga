@@ -75,7 +75,22 @@ DEFAULTS = {
                             "质押平仓", "风险警示", "违规"],  # 名称/领涨股利空关键词
         },
         # 第二层 主线准入与分级
-        "mainline": {"pass_score": 60.0, "core_n": 1, "defensive_n": 1, "watch_n": 3},
+        # 主线的定量分数阈值口径统一:80+非常强势(龙头),60-79强势,50-59蓄势,<50弱势
+        "mainline": {
+            "pass_score": 60.0, "core_n": 1, "defensive_n": 1, "watch_n": 3,
+            # ---- 第四轮:盘中防抖稳定器(外层独立模块,不改动内部打分公式) ----
+            "enable_stabilizer": True,      # 总开关; False=关闭防抖,直接透传原始流水线结果(兼容历史回测)
+            "intraday_smooth_window": 25,   # 单日资金平滑窗口(分钟), 0=关闭平滑; 5分钟轮询下=约5个样本(仅稳定器内生效,5日表完全不改动)
+            "rank_delta_thresh": 0.002,     # 排名打分阻尼阈值:相邻板块净流入率差<此值视为同档位,不做阶梯扣分
+            "STABILIZE_CYCLE": 3,           # 连续N个快照周期驻留/冷却/替换确认
+            "COOL_DOWN_MINUTE": 20,         # 被移出正式池后的冷却分钟数,冷却中只能进入 candidate
+            "PASS_HYSTERESIS_UP": 62.0,     # 新板块进入正式池(passed)的分数门槛
+            "PASS_HYSTERESIS_DOWN": 58.0,   # 已在正式池内的板块,分数低于此值才允许移出(滞回)
+            "weaken_news_on_no_5d_money": True,  # 无5日资金净流入时,新闻催化满分降为低档(防消息脉冲)
+            # ---- 第四轮:后台定时轮询(独立于网页访问,推进平滑与N周期确认) ----
+            "poll_interval_sec": 300,       # 稳定器后台轮询间隔(秒); 0=关闭后台轮询(退回"仅访问时推进")
+            "poll_trading_hours_only": True,  # 仅交易时段(工作日 9:30-11:30 / 13:00-15:00)轮询,省接口调用
+        },
         # 第二层 资金面打分(升级1:净流入率公平性修正)
         "fund": {
             "admission_enabled": True,  # 5日资金准入门槛(一票否决)
@@ -208,6 +223,9 @@ DEFAULTS = {
         "mood_risk_tag": True,      # 优化项3c:情绪龙头高波动风险标签
         "delta_arrows": True,       # 优化项3d:数值字段环比箭头
         "sector_detail": True,      # 优化项4:板块详情下钻弹窗
+        # ---- 第四轮:防抖稳定器前端展示 ----
+        "candidate_list": True,     # 稳定器异动候选列表(candidate)
+        "raw_debug": False,         # 原始未防抖信号(raw)调试展示(默认折叠)
     },
 }
 

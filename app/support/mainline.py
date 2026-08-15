@@ -411,7 +411,9 @@ def _capital_split(grade: str) -> tuple:
     return {"A": (0.20, 0.80), "C": (0.70, 0.30), "D": (0.70, 0.30)}.get(grade, (0.40, 0.60))
 
 
-def sector_scores(use_cache=True) -> list:
+def sector_scores(use_cache=True, flows=None, flows_5d=None,
+                  rank_delta_thresh=None, weaken_news_on_no_5d_money=False,
+                  news_weak_ratio=0.25) -> list:
     """概念板块打分,返回按分数降序列表(含 level)。
 
     新增准入规则 + 资金面拆分:
@@ -419,14 +421,23 @@ def sector_scores(use_cache=True) -> list:
     - 资金面(原 40 分)拆为 5日资金强度 + 单日资金强度,按准入板块的净流入率排名,第 1 名得满分、线性递减;
     - 动态权重:市场评级 A 级切换为 5日20%+单日80%,C/D 级切换为 5日70%+单日30%,其余默认 5日40%+单日60%。
     淘汰板块附 reject_reason,保留在返回列表尾部并标记 level='rejected'。
+
+    防抖稳定器可选注入参数(均为追加式,不影响原逻辑;默认 None/False 时行为与原版完全一致):
+    - flows: 单日资金流数据列表,为 None 时内部实时抓取(原逻辑);由稳定器注入「窗口平滑」后的单日资金
+    - flows_5d: 5日资金流数据(列表或 {industry: row} 字典),为 None 时内部实时抓取;5日表稳定器不参与平滑
+    - rank_delta_thresh: 排名打分阻尼阈值;相邻板块净流入率差 < 此值视为同档位、不做阶梯扣分,防微小抖动造成排名跳变
+    - weaken_news_on_no_5d_money: 无5日资金净流入(net_5d_yi<=0)时,新闻催化满分降为低档位 news_weak_ratio,防消息脉冲
     """
     from app.review.data import collect_sector_flow, collect_sector_flow_5d
     w = _st.load().get("score_weights", {})
     fcfg = _st.load().get("decision", {}).get("fund", {})
-    flows = collect_sector_flow()
+    flows = collect_sector_flow() if flows is None else flows
     if not flows:
         return []
-    flows_5d = {f["industry"]: f for f in collect_sector_flow_5d()}
+    if flows_5d is None:
+        flows_5d = {f["industry"]: f for f in collect_sector_flow_5d()}
+    elif not isinstance(flows_5d, dict):
+        flows_5d = {f["industry"]: f for f in flows_5d}
 
     grade = _market_grade()
     w_5d, w_1d = _capital_split(grade)
@@ -474,9 +485,31 @@ def sector_scores(use_cache=True) -> list:
     n = len(admitted)
     cap_total = w.get("capital", 40)
     sustain_th = fcfg.get("status_thresholds", {}).get("sustain", 0.0)
+
+    # 排名打分阻尼:相邻板块净流入率差 < rank_delta_thresh 视为同档位(取前一档名次),
+    # 不做阶梯扣分,防止盘中微小抖动造成名次互换、分数跳变。
+    def _eff_rank(order, key):
+        out, prev_val, prev_rank = {}, None, None
+        for i, f in enumerate(order, 1):
+            v = f.get(key)
+            if (rank_delta_thresh and prev_val is not None and v is not None
+                    and (prev_val - v) < rank_delta_thresh):
+                out[f["industry"]] = prev_rank
+            else:
+                out[f["industry"]] = i
+                prev_rank = i
+            prev_val = v
+        return out
+
+    if rank_delta_thresh:
+        rank5 = _eff_rank(order_5d, "rate_5d" if use_net_rate else "net_5d_yi")
+        rank1 = _eff_rank(order_1d, "rate_1d" if use_net_rate else "net_yi")
+    else:
+        rank5 = {f["industry"]: i + 1 for i, f in enumerate(order_5d)}
+        rank1 = {f["industry"]: i + 1 for i, f in enumerate(order_1d)}
     for f in admitted:
-        r5 = order_5d.index(f) + 1
-        r1 = order_1d.index(f) + 1
+        r5 = rank5.get(f["industry"], order_5d.index(f) + 1)
+        r1 = rank1.get(f["industry"], order_1d.index(f) + 1)
         f["fund_rank_5d"] = r5
         f["fund_rank_1d"] = r1
         f["fund_score_5d"] = round(cap_total * w_5d * (n - r5 + 1) / n, 2)
@@ -511,6 +544,10 @@ def sector_scores(use_cache=True) -> list:
         direction = 1.0 if f["pct_chg"] >= 0 else 0.5
         senti = (fg / 100.0) * direction
         news_s = 1.0 if news.get(name) else 0.0
+        if (weaken_news_on_no_5d_money and news.get(name)
+                and f.get("net_5d_yi", 0) <= 0):
+            # 消息脉冲削弱:无5日资金净流入时,单日利好消息不配满分(防一日游行情抬升分数)
+            news_s = news_weak_ratio
         score = (f["fund_score"] + w.get("trend", 30) * trend
                  + w.get("sentiment", 20) * senti + w.get("news", 10) * news_s)
         rows.append({**f, "score": round(score, 2), "zt_count": z, "news_hits": news.get(name, 0),

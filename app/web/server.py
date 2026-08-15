@@ -804,8 +804,10 @@ def _layer1_html(p1) -> str:
 
 
 def _sector_chip(it) -> str:
-    lab = {"core": "核心主攻", "defensive": "防御备选", "watch": "观察", "rejected": "淘汰"}.get(it.get("level"), "")
-    cls = {"core": "b-core", "defensive": "b-branch", "watch": "b-watch", "rejected": "b-wait"}.get(it.get("level"), "b-wait")
+    lab = {"core": "核心主攻", "defensive": "防御备选", "watch": "观察",
+           "rejected": "淘汰", "candidate": "异动候选"}.get(it.get("level"), "")
+    cls = {"core": "b-core", "defensive": "b-branch", "watch": "b-watch",
+           "rejected": "b-wait", "candidate": "b-watch"}.get(it.get("level"), "b-wait")
     reason = "".join(f'<div class="mut" style="font-size:12px">· {_h(r)}</div>' for r in it.get("reasons", [])[:4])
     zt = f"{it.get('zt_count') or 0} 家"
     st = it.get("stats") or {}
@@ -1147,6 +1149,36 @@ def _rejected_section_html(rejected: list, on: bool) -> str:
             + "</table></div></details>")
 
 
+def _candidate_section_html(candidate: list, on: bool) -> str:
+    """稳定器异动候选列表(candidate):打分达标但驻留/冷却/同池替换确认中,未计入正式主线。"""
+    if not candidate or not on:
+        return ""
+    rows = "".join(_sector_chip(it) for it in candidate)
+    return ('<details closed><summary><b>🔥 异动候选</b>'
+            f'(<span class="mut">{len(candidate)} 个 · 达标但防抖确认中,暂不计入正式主线</span>)</summary>'
+            "<div class='tbl'><table><tr><th>板块</th><th>评分</th><th>当日涨跌</th><th>主力净流入</th>"
+            "<th>涨停家数</th><th>3日/20日涨幅</th><th>位置评级</th><th>盈亏比</th><th>优先级</th>"
+            "<th>当日净流入率/排名</th><th>状态说明</th></tr>"
+            + rows
+            + "</table></div></details>")
+
+
+def _raw_debug_html(raw: dict, stats: dict, on: bool) -> str:
+    """原始未防抖信号(raw)调试展示:仅供与 stable 对比,今日决策以 stable 为准。"""
+    if not raw or not on:
+        return ""
+    raw_core = raw.get("core")
+    raw_def = raw.get("defensive")
+    core_txt = (f"{_h(raw_core['name'])} ({raw_core['score']} 分)" if raw_core else "无")
+    def_txt = (f"{_h(raw_def['name'])} ({raw_def['score']} 分)" if raw_def else "无")
+    switch_txt = (f"主线切换(raw {stats.get('raw_switches', 0)} 次 / stable "
+                  f"{stats.get('stable_switches', 0)} 次)" if stats else "切换统计不可用")
+    return ('<details closed><summary class="mut"><b>🛠 原始未防抖信号(raw · 调试)</b>'
+            f'<span class="mut" style="margin-left:8px">raw核心:{core_txt} · raw防御:{def_txt} · {switch_txt}</span></summary>'
+            '<div class="mut" style="font-size:12px">原始流水线直接输出,未经防抖稳定器;'
+            '今日决策以 stable 稳定输出为准(避免盘中微小资金抖动造成主线反复横跳)。</div></details>')
+
+
 def _prev_sector_map(cur: str = None) -> dict:
     """读取上一交易日板块行情快照 {name: {pct_chg, net_yi}}。"""
     prev = _prev_trade_date(cur)
@@ -1434,12 +1466,16 @@ def page_decision():
     layer2_parts = []
     for it in ([core] if core else []) + ([defen] if defen else []) + (p2.get("watch") or []):
         layer2_parts.append(_sector_chip(it))
-    layer2 = (f"<div class='card'><h3>准入线:{p2.get('pass_score')} 分 · 一票否决 + 分级</h3>"
+    layer2 = (f"<div class='card'><h3>准入线:{p2.get('pass_score')} 分 · 一票否决 + 分级"
+              f"{' · 已启用防抖稳定器' if d['layers'].get('stabilizer_stats') else ''}</h3>"
               f"<div class='tbl'><table><tr><th>板块</th><th>评分</th><th>当日涨跌</th><th>主力净流入</th>"
               f"<th>涨停家数</th><th>3日/20日涨幅</th><th>位置评级</th><th>盈亏比</th><th>优先级</th>"
               f"<th>当日净流入率/排名</th><th>入选理由 / 否决原因</th></tr>"
               f"{''.join(layer2_parts) or '<tr><td colspan=11 class=mut>暂无板块数据</td></tr>'}</table></div>"
+              + _candidate_section_html(p2.get("candidate") or [], _web_ui_flag("candidate_list"))
               + _rejected_section_html(p2.get("rejected") or [], _web_ui_flag("rejected_collapse"))
+              + _raw_debug_html(d["layers"].get("layer2_raw"), d["layers"].get("stabilizer_stats"),
+                                _web_ui_flag("raw_debug"))
               + "</div>")
 
     # 第三轮:极简结论卡(默认展开,叠加在原有结论卡上方)
@@ -2046,6 +2082,20 @@ _SETTING_FIELDS = [
         ("web_ui.mood_risk_tag", "情绪龙头风险标签", "checkbox", None, None, "情绪龙头小票附加「高波动·纯情绪博弈·建议极轻仓」"),
         ("web_ui.delta_arrows", "数值环比箭头", "checkbox", None, None, "关键数值对比前一交易日,标注 ↑↓ 与变化值"),
         ("web_ui.sector_detail", "板块详情弹窗", "checkbox", None, None, "点击板块行下钻:打分明细/K线/成分TOP/新闻摘要"),
+        ("web_ui.candidate_list", "异动候选列表", "checkbox", None, None, "稳定器候选(candidate)展示于决策页"),
+        ("web_ui.raw_debug", "原始信号调试", "checkbox", None, None, "原始未防抖(raw)主线信号调试展示(默认折叠)"),
+    ]),
+    ("防抖稳定器", [
+        ("decision.mainline.enable_stabilizer", "启用防抖稳定器", "checkbox", None, None, "关闭时直接透传原始流水线结果,兼容历史回测"),
+        ("decision.mainline.intraday_smooth_window", "单日资金平滑窗口(分钟)", "number", 0, 240, "0=关闭平滑;仅稳定器内生效,5日资金表不参与"),
+        ("decision.mainline.rank_delta_thresh", "排名阻尼阈值", "number", 0, 0.01, "相邻板块净流入率差<此值视为同档位,不做阶梯扣分"),
+        ("decision.mainline.STABILIZE_CYCLE", "驻留确认周期N", "number", 1, 20, "连续N个快照周期驻留/冷却/替换确认"),
+        ("decision.mainline.COOL_DOWN_MINUTE", "冷却分钟数", "number", 0, 240, "被移出正式池后的冷却时长,冷却中只能进入candidate"),
+        ("decision.mainline.PASS_HYSTERESIS_UP", "进入正式池分数", "number", 0, 100, "新板块进入正式池(passed)的门槛分数"),
+        ("decision.mainline.PASS_HYSTERESIS_DOWN", "移出正式池分数", "number", 0, 100, "已在池内板块分数低于此值才允许移出(滞回)"),
+        ("decision.mainline.weaken_news_on_no_5d_money", "消息脉冲削弱", "checkbox", None, None, "无5日资金净流入时,新闻催化满分降为低档"),
+        ("decision.mainline.poll_interval_sec", "后台轮询间隔(秒)", "number", 0, 3600, "稳定器按此间隔推进一个周期;0=关闭后台轮询(仅访问时推进)"),
+        ("decision.mainline.poll_trading_hours_only", "仅交易时段轮询", "checkbox", None, None, "工作日 9:30-11:30 / 13:00-15:00 轮询,节省接口调用"),
     ]),
 ]
 
@@ -2117,7 +2167,10 @@ def _flatten_form(form) -> dict:
     out = {}
     for key in form:
         val = form.get(key)
-        if key.startswith("monitor.rules.") or key == "llm.enable" or key.startswith("web_ui."):
+        if key.startswith("monitor.rules.") or key == "llm.enable" or key.startswith("web_ui.") \
+                or key in ("decision.mainline.enable_stabilizer",
+                           "decision.mainline.weaken_news_on_no_5d_money",
+                           "decision.mainline.poll_trading_hours_only"):
             val = True
         else:
             try:
@@ -2135,8 +2188,13 @@ def _flatten_form(form) -> dict:
     out.setdefault("mainline_dynamic_weight", False)
     # web_ui 未勾选的开关回填 False(深合并会覆盖默认 True)
     for wk in ("conclusion_bar", "yesterday_review", "rejected_collapse", "target_tabs",
-               "mood_risk_tag", "delta_arrows", "sector_detail"):
+               "mood_risk_tag", "delta_arrows", "sector_detail",
+               "candidate_list", "raw_debug"):
         out.setdefault("web_ui", {}).setdefault(wk, False)
+    # 防抖稳定器未勾选的布尔开关回填 False
+    for mk in ("enable_stabilizer", "weaken_news_on_no_5d_money",
+               "poll_trading_hours_only"):
+        out.setdefault("decision", {}).setdefault("mainline", {}).setdefault(mk, False)
     return out
 
 
@@ -2195,6 +2253,12 @@ def main():
         _t = _th.Thread(target=_warm_startup_cache, daemon=True)
         _t.start()
         print("  启动预热线程已启动(后台生成今日决策与主线缓存)\n")
+    try:
+        from app.support.mainline_stabilizer import start_polling
+        if start_polling() is not None:
+            print("  主线防抖稳定器每5分钟轮询已启动(平滑与N周期确认独立于网页访问)\n")
+    except Exception as e:  # noqa: BLE001
+        print(f"  主线稳定器轮询启动失败(不影响主流程): {e}\n")
     host = os.environ.get("GUGA_HOST", "127.0.0.1")
     port = int(os.environ.get("GUGA_PORT", "8000"))
     print(f"\n  量化决策仪表盘(今日决策为默认首页): http://{host}:{port}/decision\n")

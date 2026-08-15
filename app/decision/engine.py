@@ -831,11 +831,19 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     taste = taste or dcfg.get("taste", "balanced")
 
     p1 = market_permit()
-    p2 = mainline_select()
+    # 第四轮改造:主线输出统一经外层防抖稳定器取「stable」稳定结果;
+    # 原始流水线结果进 layer2_raw 仅作调试/回测,不再直接驱动今日决策。
+    # 惰性导入避免 engine->mainline_stabilizer->engine 的循环依赖。
+    # get_output() 优先复用后台定时轮询的最近结果,页面访问不重复抓取数据。
+    from app.support import mainline_stabilizer as _stab
+    mout = _stab.get_output()
+    p2 = mout["stable"]
     core = p2.get("core")
     defensive = p2.get("defensive")
 
-    layers = {"layer1": p1, "layer2": p2}
+    layers = {"layer1": p1, "layer2": p2,
+              "layer2_raw": mout.get("raw"),
+              "stabilizer_stats": mout.get("stats")}
     targets = {}
     plans = {}
     if core:
@@ -904,7 +912,7 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
             "core_sector": core and core["name"], "core_stock": core_stock,
             "risk_tip": _risk_tip(p1["grade"]),
         },
-        "layers": {"layer1": p1, "layer2": p2},
+        "layers": layers,
         "targets": targets,
         "plans": plans,
     }
