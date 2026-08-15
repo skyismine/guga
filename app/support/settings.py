@@ -226,6 +226,35 @@ DEFAULTS = {
         # 大盘打分成交额满分基准(亿元)
         "min_amount_yi": 10000.0,
     },
+    # ---- 第六轮:标的精准匹配优化(外挂模块,全部默认关闭,关闭时输出与原始逻辑100%一致)
+    "target_match": {
+        "enable_target_stabilizer": False,  # P0.1 标的驻留防抖:连续N周期前2才晋升正式,避免盘中频繁切换
+        "enable_tradable_filter": False,    # P0.2 可交易性基础过滤:一字板/停牌/次新/流动性/溢价剔除
+        "enable_advanced_rank": False,      # P1 分档选股升级:情绪龙头用情绪综合得分,中军用中军属性得分
+        "enable_excess_return_adjust": False,  # P2.1 个股超额收益修正:持续跑赢/跑输板块调整动作优先级
+        "enable_sector_boost_stable": False,   # P2.2 板块溢价联动防抖:仅正式core/defensive给板块溢价,候选/观察不给
+        "enable_fallback_match": False,        # P2.3 匹配失败降级兜底:档位内补选->跨档位->关联板块->error
+        "stabilizer": {                        # P0.1 参数
+            "TARGET_STABILIZE_CYCLE": 3,       # 连续N个快照周期保持前2才晋升正式推荐
+            "TARGET_COOLDOWN_MINUTE": 15,      # 被剔除正式推荐后的冷却分钟数
+            "TARGET_KEEP_RANK": 5,             # 正式标的跌出前2但仍在前5内,暂不剔除
+        },
+        "tradable_filter": {                   # P0.2 参数
+            "min_list_days": 60,               # 上市天数<此值视为次新股剔除
+            "aggressive_min_avg_amount": 30000000,  # 情绪龙头20日日均成交额下限(元)
+            "steady_min_avg_amount": 100000000,     # 中军龙头20日日均成交额下限(元)
+            "etf_min_avg_amount": 80000000,         # ETF 20日日均成交额下限(元)
+            "etf_max_premium": 0.005,               # ETF 场内溢价率上限(5%)
+        },
+        "advanced_rank": {                   # P1 权重(维度缺失时自动归一化到可用维度)
+            "aggressive_weights": {
+                "ladder": 0.4, "pct_chg": 0.3, "correlation": 0.2, "amount": 0.1,
+            },
+            "steady_weights": {
+                "market_cap": 0.4, "avg_amount": 0.3, "trend": 0.2, "amount": 0.1,
+            },
+        },
+    },
     # ---- 大模型文案(可选接入,OpenAI 兼容接口)
     "llm": {
         "enable": False,             # 总开关:关闭时报告用规则话术兜底

@@ -872,6 +872,29 @@ def execution_plan(target: dict, total_asset: float, taste: str,
 
 
 # ---------------------------------------------------------------- 聚合
+def _match_targets(sector_name: str, sector_level: str = "watch",
+                   sector_status: str = "core") -> dict:
+    """第三层标的匹配入口(第六轮外挂接入点)。
+
+    全关时输出与 match_level_targets 逐字段一致(兼容历史回测);
+    开启优化时 aggressive/steady/etf 为稳定输出正式标的,并附加
+    raw_targets / stable_targets / candidate_targets / fallback_targets 分层字段。
+    """
+    from app.support import target_match as _tm
+    res = _tm.match_targets_v2(sector_name, sector_level, sector_status)
+    raw = res.get("raw_targets") or {}
+    st = res.get("stable_targets") or {}
+    # 兼容视图:保留原有 per-role 结构(供 plan/页面按原方式读取),items 用稳定输出
+    out = {"sector": sector_name, "raw_targets": raw, "stable_targets": st}
+    for role in ("aggressive", "steady", "etf"):
+        seg = raw.get(role) or {}
+        out[role] = {"label": seg.get("label", ""), "mood": seg.get("mood", []),
+                     "items": st.get(role, [])}
+    out["candidate_targets"] = st.get("candidate", [])
+    out["fallback_targets"] = st.get("fallback", [])
+    return out
+
+
 def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     """四层聚合,输出完整决策包。默认参数取自 settings.decision(可配置)。"""
     dcfg = _cfg()
@@ -895,7 +918,7 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     targets = {}
     plans = {}
     if core:
-        t = match_level_targets(core["name"], sector_level="core")
+        t = _match_targets(core["name"], sector_level="core", sector_status="core")
         targets[core["name"]] = t
         role_slots = (("steady", "mid"), ("aggressive", "mood"), ("etf", "etf"))
         blk_used = 0.0
@@ -914,7 +937,7 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
             if p.get("ok"):
                 blk_used = min(1.0, blk_used + (p.get("position_pct") or 0.0))
     if defensive:
-        t = match_level_targets(defensive["name"], sector_level="defensive")
+        t = _match_targets(defensive["name"], sector_level="defensive", sector_status="defensive")
         targets[defensive["name"]] = t
         # 防御备选 ETF:单独一档(防御备选ETF),计入防御板块总仓位
         seg = t.get("etf")

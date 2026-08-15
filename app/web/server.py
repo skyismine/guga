@@ -924,7 +924,14 @@ def _target_item_html(it, trigger_on=True) -> str:
     act_cls = {"关注低吸": "up", "突破跟进": "up", "持有观察": "flat", "减仓兑现": "down", "观望": "flat"}.get(act, "mut")
     adj = "".join(f'<div class="mut" style="font-size:12px">· {_h(n)}</div>'
                   for n in (it.get("adj_notes") or [])[:2]) or "-"
-    return (f"<tr><td><b>{_h(it.get('name'))}</b>{risk_tag}<br><span class='mut'>{_h(it.get('code'))}</span></td>"
+    # 第六轮:正式/候选/降级 标识
+    src = it.get("match_source") or ""
+    stab = ""
+    if it.get("is_stable") and (src and src != "normal"):
+        stab = f'<br><span class="badge b-watch" style="font-size:10px">{_h(src)}</span>'
+    elif not it.get("is_stable") and src:
+        stab = f'<br><span class="badge b-wait" style="font-size:10px">{_h(src)}</span>'
+    return (f"<tr><td><b>{_h(it.get('name'))}</b>{stab}{risk_tag}<br><span class='mut'>{_h(it.get('code'))}</span></td>"
             f"<td>{_h(it.get('role') or '-')}</td>"
             f"<td>{price}</td>"
             f"<td>{p_up} / {p_flat} / {p_down}</td>"
@@ -947,8 +954,38 @@ def _layer3_html(targets: dict) -> str:
                      f'<th>上涨/走平/下跌概率</th><th>建议</th><th>支撑/压力/止损</th><th>触发条件</th>'
                      f'<th>信号修正说明</th></tr>'
                      f"{''.join(rows) or '<tr><td colspan=8 class=mut>暂无匹配标的</td></tr>'}"
-                     f"</table></div></div>")
+                     f"</table></div>"
+                     f"{_candidate_fallback_html(t)}</div>")
     return "\n".join(parts) or '<div class="card"><h3>暂无达标主线</h3></div>'
+
+
+def _candidate_fallback_html(t: dict) -> str:
+    """第六轮:候选观察 / 降级兜底 分层展示(仅当外挂优化开启时非空)。"""
+    cand = t.get("candidate_targets") or []
+    fb = t.get("fallback_targets") or []
+    if not cand and not fb:
+        return ""
+    html = ""
+    if cand:
+        rows = "".join(f'<tr><td>{_h(it.get("name"))}</td><td>{_h(it.get("code"))}</td>'
+                       f'<td>{_h(it.get("role") or "-")}</td>'
+                       f'<td>{it.get("pct_chg") if it.get("pct_chg") is not None else "-"}%</td>'
+                       f'<td class="mut">{_h(it.get("match_source") or "candidate")}</td></tr>'
+                       for it in cand if not it.get("error"))
+        html += ("<details><summary style='font-size:12px;color:#8a94a8'>"
+                 f"候选观察标的(驻留确认中/冷却中,仅展示不参与执行计划)· {len(cand)} 只</summary>"
+                 "<div class='tbl'><table><tr><th>名称</th><th>代码</th><th>档位</th><th>涨幅</th>"
+                 f"<th>来源</th></tr>{rows}</table></div></details>")
+    if fb:
+        rows = "".join(f'<tr><td>{_h(it.get("name"))}</td><td>{_h(it.get("code"))}</td>'
+                       f'<td>{_h(it.get("role") or "-")}</td>'
+                       f'<td class="mut">{_h(it.get("match_source") or "fallback")}</td></tr>'
+                       for it in fb if not it.get("error"))
+        html += ("<details><summary style='font-size:12px;color:#c29b62'>"
+                 f"降级兜底匹配(原档位失败自动补选)· {len(fb)} 只</summary>"
+                 "<div class='tbl'><table><tr><th>名称</th><th>代码</th><th>档位</th>"
+                 f"<th>来源</th></tr>{rows}</table></div></details>")
+    return html
 
 
 def _plan_table_html(plans: dict, sector: str) -> str:
@@ -2186,6 +2223,30 @@ _SETTING_FIELDS = [
         ("decision.mainline.extend_factor.style.bias_thresh", "风格判定阈值", "number", 0, 0.1, "中证2000-沪深300相对动量差(小数,如0.02=2%)判定大盘/均衡/小盘"),
         ("decision.mainline.extend_factor.style.sort_bias_thresh", "偏转排序分差阈值", "number", 0, 20, "同池板块分数差<=此值(分)才启用风格偏转排序"),
     ]),
+    ("标的匹配优化(第六轮)", [
+        ("target_match.enable_target_stabilizer", "标的驻留防抖", "checkbox", None, None, "P0.1 连续N周期保持前2才晋升正式推荐,避免盘中标的频繁切换"),
+        ("target_match.enable_tradable_filter", "可交易性过滤", "checkbox", None, None, "P0.2 剔除一字板/停牌/次新/流动性不足/ETF高溢价标的"),
+        ("target_match.enable_advanced_rank", "分档选股升级", "checkbox", None, None, "P1 情绪龙头用情绪综合得分,中军用中军属性综合得分(替代单一指标)"),
+        ("target_match.enable_excess_return_adjust", "超额收益修正", "checkbox", None, None, "P2.1 持续跑赢/跑输板块时调整动作优先级(不改GBM概率)"),
+        ("target_match.enable_sector_boost_stable", "板块溢价联动防抖", "checkbox", None, None, "P2.2 仅正式core/defensive给板块溢价上修,候选/观察不给"),
+        ("target_match.enable_fallback_match", "匹配失败降级兜底", "checkbox", None, None, "P2.3 档位内补选->跨档位->关联板块->error,不阻塞页面"),
+        ("target_match.stabilizer.TARGET_STABILIZE_CYCLE", "驻留确认周期N", "number", 1, 20, "连续N个快照周期保持前2才晋升正式推荐"),
+        ("target_match.stabilizer.TARGET_COOLDOWN_MINUTE", "剔除后冷却(分钟)", "number", 0, 240, "被剔除正式推荐后的冷却时间,冷却中仅作候选"),
+        ("target_match.stabilizer.TARGET_KEEP_RANK", "保级排名范围", "number", 2, 20, "正式标的跌出前2但仍在前N内暂不剔除"),
+        ("target_match.tradable_filter.min_list_days", "次新上市天数下限", "number", 1, 250, "上市天数<此值视为次新股剔除"),
+        ("target_match.tradable_filter.aggressive_min_avg_amount", "情绪龙头20日均额(元)", "number", 0, 1000000000, "低于此值剔除(流动性过滤)"),
+        ("target_match.tradable_filter.steady_min_avg_amount", "中军20日均额(元)", "number", 0, 1000000000, "低于此值剔除(流动性过滤)"),
+        ("target_match.tradable_filter.etf_min_avg_amount", "ETF 20日均额(元)", "number", 0, 1000000000, "低于此值剔除"),
+        ("target_match.tradable_filter.etf_max_premium", "ETF 溢价上限(小数)", "number", 0, 0.1, "场内溢价率高于此值剔除(如 0.005=0.5%)"),
+        ("target_match.advanced_rank.aggressive_weights.ladder", "情绪权重:连板", "number", 0, 1, "连板高度/封单强度维度权重"),
+        ("target_match.advanced_rank.aggressive_weights.pct_chg", "情绪权重:涨幅", "number", 0, 1, "10/20cm归一化涨幅权重"),
+        ("target_match.advanced_rank.aggressive_weights.correlation", "情绪权重:相关性", "number", 0, 1, "个股与板块指数相关性权重(排除庄股)"),
+        ("target_match.advanced_rank.aggressive_weights.amount", "情绪权重:成交额", "number", 0, 1, "当日成交额权重(保证流动性)"),
+        ("target_match.advanced_rank.steady_weights.market_cap", "中军权重:市值", "number", 0, 1, "流通/总市值权重(行业地位)"),
+        ("target_match.advanced_rank.steady_weights.avg_amount", "中军权重:20日均额", "number", 0, 1, "长期流动性权重"),
+        ("target_match.advanced_rank.steady_weights.trend", "中军权重:趋势", "number", 0, 1, "MA20斜率趋势强度权重"),
+        ("target_match.advanced_rank.steady_weights.amount", "中军权重:当日成交", "number", 0, 1, "当日成交额权重"),
+    ]),
 ]
 
 
@@ -2262,7 +2323,13 @@ def _flatten_form(form) -> dict:
                            "decision.mainline.poll_trading_hours_only",
                            "decision.mainline.enable_extend_factor",
                            "decision.mainline.extend_factor.ladder.enabled",
-                           "decision.mainline.extend_factor.style.enabled"):
+                           "decision.mainline.extend_factor.style.enabled",
+                           "target_match.enable_target_stabilizer",
+                           "target_match.enable_tradable_filter",
+                           "target_match.enable_advanced_rank",
+                           "target_match.enable_excess_return_adjust",
+                           "target_match.enable_sector_boost_stable",
+                           "target_match.enable_fallback_match"):
             val = True
         else:
             try:
@@ -2292,6 +2359,11 @@ def _flatten_form(form) -> dict:
            .setdefault("extend_factor", {}).setdefault("ladder", {}).setdefault(ek, False)
         out.setdefault("decision", {}).setdefault("mainline", {}) \
            .setdefault("extend_factor", {}).setdefault("style", {}).setdefault(ek, False)
+    # 标的匹配优化(第六轮)未勾选的布尔开关回填 False
+    for tmk in ("enable_target_stabilizer", "enable_tradable_filter",
+                "enable_advanced_rank", "enable_excess_return_adjust",
+                "enable_sector_boost_stable", "enable_fallback_match"):
+        out.setdefault("target_match", {}).setdefault(tmk, False)
     return out
 
 
