@@ -277,20 +277,34 @@ def _all_concepts() -> list:
 
 
 _ALL_CONCEPTS = None
+_ALL_CONCEPTS_MTIME = None
 
 
 def _concepts_cached() -> list:
-    global _ALL_CONCEPTS
-    if _ALL_CONCEPTS is None:
+    global _ALL_CONCEPTS, _ALL_CONCEPTS_MTIME
+    from app.features.concept_features import map_mtime
+    mtime = map_mtime()
+    if _ALL_CONCEPTS is None or mtime != _ALL_CONCEPTS_MTIME:
         _ALL_CONCEPTS = _all_concepts()
+        _ALL_CONCEPTS_MTIME = mtime
     return _ALL_CONCEPTS
 
 
 _cons_cache = {}
+_cons_cache_mtime = None
 
 
 def _concept_cons(name: str, allow_net: bool = True) -> list:
-    """板块成分股(多策略):concept_map 精确 → 双向子串 → 东财概念成分接口兜底。"""
+    """板块成分股(多策略):concept_map 精确 → 双向子串 → 东财概念成分接口兜底。
+
+    概念映射按日重抓,缓存按 map_mtime 失效,映射变动后自动用新成分。
+    """
+    global _cons_cache, _cons_cache_mtime
+    from app.features.concept_features import map_mtime
+    mtime = map_mtime()
+    if mtime != _cons_cache_mtime:
+        _cons_cache.clear()
+        _cons_cache_mtime = mtime
     if name in _cons_cache:
         return _cons_cache[name]
     codes = _concept_stocks(name)

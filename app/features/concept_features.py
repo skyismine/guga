@@ -13,6 +13,7 @@ import json
 import os
 import pickle
 import re
+import threading
 import time
 from datetime import datetime
 
@@ -39,7 +40,16 @@ _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 _name_code = None
 _v_code = None
 _map = None
+_map_mtime = None
 _idx_fail = set()
+
+
+def map_mtime() -> float:
+    """concept_map.json 的文件修改时间(不存在返回 0),供下游缓存按版本失效。"""
+    try:
+        return os.path.getmtime(_MAP_PATH)
+    except OSError:
+        return 0.0
 
 
 def _get_ths_js() -> str:
@@ -188,22 +198,28 @@ def _fetch_concept_stocks(code: str) -> dict:
 
 
 def _load_map() -> dict:
-    global _map
-    if _map is None:
+    global _map, _map_mtime
+    try:
+        cur = os.path.getmtime(_MAP_PATH)
+    except OSError:
+        cur = 0.0
+    if _map is None or cur != _map_mtime:
         try:
             with open(_MAP_PATH, encoding="utf-8") as f:
                 _map = json.load(f)
         except (OSError, ValueError):
             _map = {}
+        _map_mtime = cur
     return _map
 
 
 def _save_map():
-    global _map
+    global _map, _map_mtime
     try:
         os.makedirs(_CONCEPT_DIR, exist_ok=True)
         with open(_MAP_PATH, "w", encoding="utf-8") as f:
             json.dump(_map, f, ensure_ascii=False)
+        _map_mtime = map_mtime()
     except OSError:
         pass
 
@@ -391,11 +407,20 @@ def prepare_features(df: pd.DataFrame, code: str = None) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- 全量预取
 def prefetch_concepts(sleep: float = 0.2) -> None:
-    """全量预取:概念成分映射(概念名录+资金流板块分页抓取)+ 各概念指数历史(本地缓存)。"""
+    """全量预取:概念成分映射(按日重抓)+ 各概念指数历史(本地缓存)。
+
+    成分映射按日重抓:processed.json 记录每个概念最近成功抓取日期(YYYY-MM-DD),
+    当日已抓的直接跳过,隔日自动重抓并重建该概念成分(移除已调出个股、补入新调入),
+    保证同花顺概念包含个股变动按日同步到 concept_map.json。
+    """
+    import datetime as _dt
+    global _map, _map_mtime
+    today = _dt.date.today().strftime("%Y-%m-%d")
     os.makedirs(_CONCEPT_DIR, exist_ok=True)
     os.makedirs(_INDEX_DIR, exist_ok=True)
     cm = _name_to_code()
     _load_map()
+    mapping = {k: list(v) for k, v in _map.items()}   # 工作副本,完成后原子替换
     processed = {}
     if os.path.exists(_PROCESSED_PATH):
         try:
@@ -405,23 +430,31 @@ def prefetch_concepts(sleep: float = 0.2) -> None:
             pass
     n_concept = len(cm)
     for i, (name, code) in enumerate(cm.items(), 1):
-        if name not in processed:
-            try:
-                stocks = _fetch_concept_stocks(code)
-                for c in stocks:
-                    lst = _map.setdefault(c, [])
-                    if name not in lst:
-                        lst.append(name)
-                processed[name] = 1
-                print(f"  [成分] {i}/{n_concept} {name}({code}): {len(stocks)} 只")
-            except Exception as e:  # noqa: BLE001
-                print(f"  [成分] {i}/{n_concept} {name} 失败: {e}")
-            _save_map()
-            with open(_PROCESSED_PATH, "w", encoding="utf-8") as f:
-                json.dump(processed, f)
-            time.sleep(sleep)
-        else:
-            print(f"  [成分] {i}/{n_concept} {name} 已缓存")
+        if processed.get(name) == today:
+            print(f"  [成分] {i}/{n_concept} {name} 今日已抓,跳过")
+            continue
+        try:
+            stocks = _fetch_concept_stocks(code)
+            new_set = set(stocks)
+            # 重建该概念成分:先移除旧归属(不在新成分中的个股),再写入新成分
+            for c, cs in list(mapping.items()):
+                if name in cs and c not in new_set:
+                    cs.remove(name)
+                    if not cs:
+                        del mapping[c]
+            for c in stocks:
+                lst = mapping.setdefault(c, [])
+                if name not in lst:
+                    lst.append(name)
+            processed[name] = today
+            print(f"  [成分] {i}/{n_concept} {name}({code}): {len(stocks)} 只")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [成分] {i}/{n_concept} {name} 失败: {e}")
+        _map = mapping
+        _save_map()
+        with open(_PROCESSED_PATH, "w", encoding="utf-8") as f:
+            json.dump(processed, f)
+        time.sleep(sleep)
     for i, (name, code) in enumerate(cm.items(), 1):
         try:
             close = _get_concept_close(name)
@@ -430,6 +463,41 @@ def prefetch_concepts(sleep: float = 0.2) -> None:
             print(f"  [指数] {i}/{n_concept} {name} 失败: {e}")
         time.sleep(sleep)
     print(f"\n概念映射 {len(_map)} 只股票,指数 {len(cm)} 个概念")
+
+
+_concept_refresh_started = False
+
+
+def start_concept_refresh(interval_sec: int = 3600) -> threading.Thread:
+    """后台线程:交易日收盘后每日重抓概念成分映射(幂等,当日已抓自动跳过)。
+
+    每 interval_sec 检查一次;当"今天还没重抓过"且当前时刻已过 15:35 时执行一次
+    prefetch_concepts()(内部按日去重,不会在同一天重复抓取)。返回线程对象。
+    """
+    import datetime as _dt
+    global _concept_refresh_started
+    if _concept_refresh_started:
+        return None
+    _concept_refresh_started = True
+    last_day = None
+
+    def _loop():
+        nonlocal last_day
+        while True:
+            try:
+                now = _dt.datetime.now()
+                today = now.strftime("%Y-%m-%d")
+                if last_day != today and now.weekday() < 5 and (now.hour, now.minute) >= (15, 35):
+                    last_day = today
+                    print(f"[概念成分] {today} 开始按日重抓成分映射...")
+                    prefetch_concepts()
+            except Exception as e:  # noqa: BLE001
+                print(f"[概念成分] 按日重抓失败: {e}")
+            time.sleep(interval_sec)
+
+    t = threading.Thread(target=_loop, name="concept-refresh", daemon=True)
+    t.start()
+    return t
 
 
 if __name__ == "__main__":

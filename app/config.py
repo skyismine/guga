@@ -19,6 +19,9 @@ for _d in (DATA_DIR, HIST_DIR, MODEL_DIR, REPORT_DIR):
 # 缓存 TTL:日内行情刷新用 4 小时;历史数据 1 天
 CACHE_TTL_SECONDS = 4 * 3600
 
+# 概念成分按日重抓:每日收盘后自动重抓同花顺概念成分映射(概念增减个股自动同步)
+CONCEPT_REFRESH_DAILY = True
+
 # ---------------------------------------------------------------- 数据
 HIST_DAYS = 600            # 训练/分析使用的历史交易日数量
 MIN_HIST_DAYS = 120        # 少于该数量无法计算特征

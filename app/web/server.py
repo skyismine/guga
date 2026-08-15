@@ -2321,6 +2321,13 @@ def main():
         print("  每日复盘报告调度已启动(到点自动生成并直接展示于页面)\n")
     except Exception as e:  # noqa: BLE001
         print(f"  报告调度启动失败: {e}")
+    if getattr(config, "CONCEPT_REFRESH_DAILY", True):
+        try:
+            from app.features.concept_features import start_concept_refresh
+            start_concept_refresh()
+            print("  概念成分按日重抓调度已启动(收盘后自动同步同花顺成分变动)\n")
+        except Exception as e:  # noqa: BLE001
+            print(f"  概念成分重抓调度启动失败: {e}")
     if getattr(config, "WARM_STARTUP", True):
         _th = __import__("threading")
         _t = _th.Thread(target=_warm_startup_cache, daemon=True)
