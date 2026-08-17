@@ -17,6 +17,7 @@
 import os
 import pickle
 import time
+import datetime as dt
 
 import numpy as np
 import pandas as pd
@@ -134,11 +135,115 @@ def attach_market_features(features: pd.DataFrame, frame: pd.DataFrame = None) -
     return out
 
 
+def _is_trading_time(now=None) -> bool:
+    """是否处于交易时段(工作日 9:30-11:30 / 13:00-15:00)。"""
+    now = now or dt.datetime.now()
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    return (9 * 60 + 30) <= hm <= (11 * 60 + 30) or (13 * 60) <= hm <= (15 * 60)
+
+
+def _today_str() -> str:
+    return dt.date.today().isoformat()
+
+
+def _realtime_market_row() -> dict:
+    """交易时段实时市场特征行(基于日线帧末行 + 实时覆盖,无前视)。
+
+    仅覆盖能从实时接口算出的分量,其余沿用最近日线帧末行:
+    - 实时涨跌家数 -> market_adv_ratio(宽度)
+    - 实时期指基差 -> market_basis_* / market_basis_avg
+    - 实时沪深300指数 -> market_index_ret_5 / ret_20 / rsi14(追加实时价重算)
+    恐贪由上层用该行重新合成(_fear_greed)。
+    """
+    frame = build_market_frame()
+    last = frame.iloc[-1]
+    row = {c: float(last[c]) for c in frame.columns}
+
+    # 1) 实时涨跌家数宽度(乐咕当日快照,非缓存日线)
+    try:
+        act = mk.get_market_activity(use_cache=True)
+        up = act.get("advance")
+        dn = act.get("decline")
+        if up is not None and dn is not None and (up + dn) > 0:
+            row["market_adv_ratio"] = up / (up + dn)
+    except Exception as e:  # noqa: BLE001
+        print(f"[market_features] 实时宽度注入失败: {e}")
+
+    # 2) 实时期指基差(四大期指实时快照)
+    try:
+        fut = mk.get_futures_quotes(use_cache=True)
+        bases = [v["basis"] for v in fut.values()
+                 if isinstance(v, dict) and v.get("basis") is not None]
+        if bases:
+            for key, v in fut.items():
+                if isinstance(v, dict) and v.get("basis") is not None:
+                    row[f"market_basis_{key}"] = v["basis"]
+            row["market_basis_avg"] = float(np.mean(bases))
+    except Exception as e:  # noqa: BLE001
+        print(f"[market_features] 实时期指基差注入失败: {e}")
+
+    # 3) 实时指数:追加今日实时价重算动量/RSI(仅用历史+实时,无前视)
+    try:
+        spot = mk.get_index_spot(config.MARKET_INDEX)
+        px = spot.get("price")
+        if px and px > 0:
+            idx = mk.get_index_history(config.MARKET_INDEX, days=120)
+            close = idx["close"]
+            today = pd.Timestamp(_today_str())
+            if today in close.index:
+                close = close.copy()
+                close.loc[today] = px
+            else:
+                close = pd.concat([close, pd.Series([px], index=[today])])
+            last_px = float(close.iloc[-1])
+            prev5 = float(close.iloc[-6]) if len(close) >= 6 else None
+            prev20 = float(close.iloc[-21]) if len(close) >= 21 else None
+            if prev5:
+                row["market_index_ret_5"] = last_px / prev5 - 1
+            if prev20:
+                row["market_index_ret_20"] = last_px / prev20 - 1
+            rsi = _rsi14(close)
+            if rsi is not None:
+                row["market_index_rsi14"] = rsi
+    except Exception as e:  # noqa: BLE001
+        print(f"[market_features] 实时指数注入失败: {e}")
+
+    return row
+
+
+def _rsi14(close: pd.Series) -> float | None:
+    """RSI(14),基于收盘序列(含实时追加行),失败返回 None。"""
+    try:
+        import vectorbt as vbt
+        rsi = vbt.indicators.RSI.run(close, window=14).rsi
+        v = float(rsi.iloc[-1])
+        return v if not pd.isna(v) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def market_snapshot() -> dict:
-    """最新市场快照:最近交易日市场特征 + 当日涨跌家数(乐咕) + 期指实时基差。"""
+    """最新市场快照:最近交易日市场特征 + 当日涨跌家数(乐咕) + 期指实时基差。
+
+    交易时段:注入实时特征(market_date 置为当日,恐贪/宽度/动量/RSI/基差用实时分量),
+    使大盘开仓许可评级在盘中跟随实时数据;非交易时段:返回最近日线帧末行(收盘快照)。
+    """
     frame = build_market_frame()
     row = frame.iloc[-1]
-    snap = {"market_date": str(row.name.date()),
+    market_date = str(row.name.date())
+    if _is_trading_time():
+        try:
+            rt = _realtime_market_row()
+            rt_frame = pd.DataFrame([rt])[frame.columns]
+            fg = _fear_greed(rt_frame).iloc[0]
+            rt["market_fear_greed"] = float(fg) if not pd.isna(fg) else float(row["market_fear_greed"])
+            row = pd.Series(rt)
+            market_date = _today_str()
+        except Exception as e:  # noqa: BLE001
+            print(f"[market_features] 实时市场快照降级为日线: {e}")
+    snap = {"market_date": market_date,
             "market": {c: (None if pd.isna(row[c]) else round(float(row[c]), 4))
                        for c in frame.columns}}
     try:
