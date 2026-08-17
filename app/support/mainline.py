@@ -638,8 +638,9 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
     grade = _market_grade()
     w_5d, w_1d = _capital_split(grade)
 
-    # ---- 准入过滤(5日资金) + 合并 5日累计数据(可配置开关)
+    # ---- 准入过滤(5日资金/综合加权) + 合并 5日累计数据(可配置开关)
     admission_enabled = fcfg.get("admission_enabled", True)
+    admission_blend = fcfg.get("admission_blend", True)
     admitted, rejected = [], []
     for f in flows:
         f5 = flows_5d.get(f["industry"])
@@ -650,15 +651,33 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
         row = {**f, **{k: f5[k] for k in ("pct_5d", "net_5d_yi", "inflow_5d_yi", "outflow_5d_yi")}}
         if admission_enabled:
             net_5d_min = fcfg.get("admission_net_5d_min", 0.0)
-            if row["net_5d_yi"] <= net_5d_min:
-                rejected.append({**row, "level": "rejected", "fund_status": "流出",
-                                 "reject_reason": f"5日主力资金累计净流出 {row['net_5d_yi']:.1f} 亿(准入剔除)"})
-                continue
             pct_5d_min = fcfg.get("admission_min_pct_5d", 0.0)
-            if row["pct_5d"] <= pct_5d_min:
-                rejected.append({**row, "level": "rejected", "fund_status": "背离",
-                                 "reject_reason": f"5日资金净流入但累计涨幅 {row['pct_5d']:+.2f}%,量价背离(准入剔除)"})
-                continue
+            if admission_blend:
+                # 综合加权:当日与5日资金/涨幅按市场评级权重合并,放行"当日强回流"反转板块,
+                # 而非一刀切只看5日累计(否则大涨+净流入的 CPO/PCB/先进封装等会被误杀)。
+                blend_net = w_5d * row["net_5d_yi"] + w_1d * row["net_yi"]
+                blend_pct = w_5d * row["pct_5d"] + w_1d * row["pct_chg"]
+                if blend_net <= net_5d_min:
+                    rejected.append({**row, "level": "rejected", "fund_status": "流出",
+                                     "reject_reason": (f"综合资金净流入 {blend_net:.1f} 亿"
+                                                       f"(当日 {row['net_yi']:+.1f} + 5日 {row['net_5d_yi']:+.1f}),"
+                                                       f"未达准入门槛(准入剔除)")})
+                    continue
+                if blend_pct <= pct_5d_min:
+                    rejected.append({**row, "level": "rejected", "fund_status": "背离",
+                                     "reject_reason": (f"综合涨幅 {blend_pct:+.2f}%"
+                                                       f"(当日 {row['pct_chg']:+.2f} + 5日 {row['pct_5d']:+.2f}),"
+                                                       f"量价背离(准入剔除)")})
+                    continue
+            else:
+                if row["net_5d_yi"] <= net_5d_min:
+                    rejected.append({**row, "level": "rejected", "fund_status": "流出",
+                                     "reject_reason": f"5日主力资金累计净流出 {row['net_5d_yi']:.1f} 亿(准入剔除)"})
+                    continue
+                if row["pct_5d"] <= pct_5d_min:
+                    rejected.append({**row, "level": "rejected", "fund_status": "背离",
+                                     "reject_reason": f"5日资金净流入但累计涨幅 {row['pct_5d']:+.2f}%,量价背离(准入剔除)"})
+                    continue
         admitted.append(row)
     if not admitted:
         _last_scores["date"] = _today()

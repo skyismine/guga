@@ -117,8 +117,9 @@ DEFAULTS = {
         # 第二层 资金面打分(升级1:净流入率公平性修正)
         "fund": {
             "admission_enabled": True,  # 5日资金准入门槛(一票否决)
-            "admission_net_5d_min": 0.0,  # 5日主力资金累计净流出<=此值 剔除
-            "admission_min_pct_5d": 0.0,  # 5日资金净流入但累计涨幅<=此值 视为量价背离剔除
+            "admission_blend": True,    # True=按(当日,5日)动态权重综合判定准入, 放行当日强回流反转板块; False=只看5日累计
+            "admission_net_5d_min": 0.0,  # 综合资金净流入<=此值 剔除(原:仅5日累计)
+            "admission_min_pct_5d": 0.0,  # 综合涨幅<=此值 视为量价背离剔除(原:仅5日累计涨幅)
             "use_net_rate": True,         # True=净流入率打分(公平性), False=绝对金额(旧模式)
             "rate_denom": "flow_sum",     # 净流入率分母:flow_sum(流入+流出) | amount(板块总成交额,数据缺失时回退flow_sum)
             "out_field": True,            # 输出5日资金状态/当日净流入率/资金排名
