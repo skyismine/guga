@@ -239,10 +239,45 @@ def _summarize_zt(df: pd.DataFrame) -> Dict:
 
 
 # ---------------------------------------------------------------- 板块资金流(同花顺概念板块)
-def collect_sector_flow() -> list:
-    """概念板块资金净流入(净额,亿元)+ 涨跌幅 + 领涨股。"""
+_SF_FLOW_TTL = 120   # 秒:单日概念资金流快照缓存有效期(短,保证盘中较新)
+_SF_FLOW5_TTL = 300  # 秒:5日概念资金流缓存有效期(5日数据盘中变化小)
+
+def _sf_load(key: str, ttl: int) -> Optional[list]:
+    """读取板块资金流缓存;命中则直接返回(不触发网络)。"""
+    return _load_cache(key, ttl=ttl)
+
+
+def _sf_save(key: str, rows: list) -> None:
+    try:
+        _save_cache(key, rows)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sf_fallback(key: str, src: str, err) -> list:
+    """实时抓取失败时回退最近一次成功快照(任意年龄,含盘中),并告警。"""
+    stale = _load_cache(key, ttl=None)
+    if stale:
+        print(f"[review] {src} 实时抓取失败,回退最近快照({len(stale)} 条): {err}")
+        return stale
+    raise err
+
+
+def collect_sector_flow(use_cache: bool = True) -> list:
+    """概念板块资金净流入(净额,亿元)+ 涨跌幅 + 领涨股。
+
+    带本地快照缓存(_SF_FLOW_TTL)+ 失败回退最近快照:同花顺限流/抖动时
+    不阻塞整个轮询周期(稳定器依赖此数据,失败会整轮失败)。
+    """
+    if use_cache:
+        hit = _sf_load("sector_flow", _SF_FLOW_TTL)
+        if hit is not None:
+            return hit
     import akshare as ak
-    df = _retry(lambda: ak.stock_fund_flow_concept(symbol="即时"))
+    try:
+        df = _retry(lambda: ak.stock_fund_flow_concept(symbol="即时"), n=2, slp=0.8)
+    except Exception as e:  # noqa: BLE001
+        return _sf_fallback("sector_flow", "同花顺概念资金流", e)
     df = df.rename(columns={df.columns[i]: c for i, c in enumerate(
         ["no", "industry", "index_name", "pct", "inflow", "outflow",
          "net", "num", "leader", "leader_pct", "leader_price"])})
@@ -261,13 +296,21 @@ def collect_sector_flow() -> list:
             "leader_pct": float(r["leader_pct"]) if pd.notna(r["leader_pct"]) else 0.0,
         })
     rows.sort(key=lambda x: x["net_yi"], reverse=True)
+    _sf_save("sector_flow", rows)
     return rows
 
 
-def collect_sector_flow_5d() -> list:
+def collect_sector_flow_5d(use_cache: bool = True) -> list:
     """概念板块 5 日主力资金流(5日累计净流入/流入/流出,亿元)+ 5日累计涨跌幅。"""
+    if use_cache:
+        hit = _sf_load("sector_flow_5d", _SF_FLOW5_TTL)
+        if hit is not None:
+            return hit
     import akshare as ak
-    df = _retry(lambda: ak.stock_fund_flow_concept(symbol="5日排行"))
+    try:
+        df = _retry(lambda: ak.stock_fund_flow_concept(symbol="5日排行"), n=2, slp=0.8)
+    except Exception as e:  # noqa: BLE001
+        return _sf_fallback("sector_flow_5d", "同花顺5日概念资金流", e)
     df = df.rename(columns={df.columns[i]: c for i, c in enumerate(
         ["no", "industry", "num", "index_name", "pct", "inflow", "outflow", "net"])})
     net = pd.to_numeric(df["net"], errors="coerce")
@@ -284,6 +327,7 @@ def collect_sector_flow_5d() -> list:
             "net_5d_yi": round(float(net.get(r.name, 0) or 0), 2),   # 5日累计净流入(亿元)
         })
     rows.sort(key=lambda x: x["net_5d_yi"], reverse=True)
+    _sf_save("sector_flow_5d", rows)
     return rows
 
 
