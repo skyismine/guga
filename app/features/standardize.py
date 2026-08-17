@@ -14,7 +14,9 @@ import pandas as pd
 from app import config
 
 # 已在源端标准化的前缀,个股维度标准化时跳过
-SKIP_PREFIX = ("market_", "ind_")
+# market_*/ind_*:数据源端(市场/行业)标准化;theme_*/style_*:advanced_features
+# 按全市场序列标准化,跨截面可比,不做个股维度二次标准化。
+SKIP_PREFIX = ("market_", "ind_", "theme_", "style_")
 
 
 def is_per_stock(col: str) -> bool:

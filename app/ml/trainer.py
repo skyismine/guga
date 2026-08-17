@@ -21,18 +21,37 @@ from sklearn.metrics import (accuracy_score, confusion_matrix,
 from app import config
 from app.data.fetcher import get_daily_history, get_stock_name
 from app.ml.dataset import LABEL_NAME, build_dataset, time_split
+from app.ml.pool_builder import (filter_df_by_active_periods,
+                                 load_training_pool, mainline_codes,
+                                 sample_weights)
 
 _METRIC_KEYS = ("accuracy", "f1_weighted", "precision_weighted",
                 "recall_weighted", "up_rank_metric", "down_rank_metric")
 
 
+def _pool_codes(verbose: bool = True):
+    """训练池代码 + A500 调样期(池缺失时回退静态配置)。"""
+    pool = load_training_pool()
+    codes = pool.get("codes")
+    periods = pool.get("a500_periods") or []
+    if not codes:
+        codes = list(config.TRAIN_STOCK_CODES)
+    return codes, periods
+
+
 def _history_groups(verbose: bool = True):
-    """按代码分组的历史数据,供多股票训练。"""
+    """按代码分组的历史数据,供多股票训练(含 A500 幸存者偏差裁剪)。"""
+    codes, periods = _pool_codes(verbose)
+    # 需多取:滚动窗口(400) + 特征 warmup + 标签 horizon 对齐,统一放宽到 3 倍
+    fetch_days = int(max(config.HIST_DAYS, getattr(config, "WF_FIXED_WINDOW_DAYS", 0) * 3))
     groups = {}
-    for code in config.TRAIN_STOCK_CODES:
+    for code in codes:
         try:
-            df = get_daily_history(code, days=config.HIST_DAYS, adjust="qfq")
-            df = df.tail(int(config.HIST_DAYS))
+            df = get_daily_history(code, days=fetch_days, adjust="qfq")
+            df = df.tail(fetch_days)
+            # A500 历史成分期裁剪:调出股票只用其有效期内样本(消除幸存者偏差)
+            if periods:
+                df = filter_df_by_active_periods(df, code, periods)
             df.name = code
             groups[code] = df
             if verbose:
@@ -53,7 +72,11 @@ def _model_params() -> dict:
 
 
 def _build_training_data(horizon: int, threshold: float, verbose: bool):
-    """数据准备:历史分组 -> 特征+标签 -> 特征筛选 -> 滚动 z-score 标准化。"""
+    """数据准备:历史分组 -> 特征+标签 -> 特征筛选 -> 滚动 z-score 标准化。
+
+    返回 (groups, data, feature_names, mainline_set)。
+    mainline_set:主线标的代码集合(供各折内计算样本权重),可为空集。
+    """
     groups = _history_groups(verbose)
     data, _, feature_names = build_dataset(list(groups.values()), horizon, threshold)
     if getattr(config, "FEATURE_SELECT", True):
@@ -65,12 +88,34 @@ def _build_training_data(horizon: int, threshold: float, verbose: bool):
     from app.features.standardize import standardize_dataset
     data = standardize_dataset(data, feature_names)
     data = data.dropna(subset=feature_names)
+    mainline = set()
+    if getattr(config, "SAMPLE_WEIGHT_ENABLED", True):
+        try:
+            mainline = mainline_codes()
+        except Exception as e:  # noqa: BLE001
+            if verbose:
+                print(f"[训练] 主线标的解析失败,样本加权退化为纯类别平衡: {e}")
     if verbose:
         vc = data["label"].value_counts(normalize=True)
         print(f"[训练] 样本: {len(data)}, 特征: {len(feature_names)}, "
               f"三类占比: 下跌 {vc.get(0, 0):.1%} / 震荡 {vc.get(1, 0):.1%} / "
               f"上涨 {vc.get(2, 0):.1%}")
-    return groups, data, feature_names
+    atr_baseline = None
+    # ATR baseline 必须用标准化前的原始 atr_pct(标准化后中位数≈0 无意义)。
+    # 从 groups 原始日线估算:各股最新 atr14/close 的中位数。
+    try:
+        import vectorbt as vbt
+        vals = []
+        for code, g in groups.items():
+            if len(g) < 30 or {"high", "low", "close"}.issubset(g.columns):
+                atr = vbt.indicators.ATR.run(g["high"], g["low"], g["close"],
+                                             window=14).atr
+                vals.append(float((atr / g["close"]).dropna().median()))
+        if vals:
+            atr_baseline = float(np.median(vals))
+    except Exception:  # noqa: BLE001
+        atr_baseline = None
+    return groups, data, feature_names, mainline, atr_baseline
 
 
 def _class_avg_returns(train_df: pd.DataFrame, groups: dict, horizon: int) -> dict:
@@ -147,7 +192,7 @@ def walk_forward_train(horizon: int = None, threshold: float = None,
               f"window={config.LABEL_QUANTILE_WINDOW}, "
               f"q=({config.LABEL_QUANTILE_LOW}, {config.LABEL_QUANTILE_HIGH}))")
 
-    groups, data, feature_names = _build_training_data(horizon, threshold, verbose)
+    groups, data, feature_names, mainline_set, atr_baseline = _build_training_data(horizon, threshold, verbose)
     k = max(3, int(getattr(config, "WF_K_FOLDS", 4)))
     init = max(1, min(k - 2, int(getattr(config, "WF_INITIAL_FOLDS", 1))))
     window = int(getattr(config, "WF_FIXED_WINDOW_DAYS", 0))
@@ -159,6 +204,8 @@ def walk_forward_train(horizon: int = None, threshold: float = None,
         print(f"[WF] 时间轴切 {k} 段,初始训练 {init} 段,"
               f"测试折 {len(splits)} 折(window={window or 'expand'})")
 
+    # 特征重要性缓存(最后一折模型)
+    last_importance = None
     fold_results = []
     for i, (tr_df, te_df, ts, te) in enumerate(splits, 1):
         if len(tr_df) < config.MIN_TRAIN_SAMPLES:
@@ -166,8 +213,43 @@ def walk_forward_train(horizon: int = None, threshold: float = None,
                 print(f"[WF] 折{i} 训练样本不足 {len(tr_df)} < "
                       f"{config.MIN_TRAIN_SAMPLES},跳过")
             continue
-        model = LGBMClassifier(**_model_params())
-        model.fit(tr_df[feature_names].values, tr_df["label"].values)
+        # 与训练行对齐的样本权重(类别平衡 × 主线 1.2)
+        tr_w = None
+        if getattr(config, "SAMPLE_WEIGHT_ENABLED", True):
+            tr_w = sample_weights(tr_df, mainline_set)
+
+        # 可选:贝叶斯调参(在折内训练集上做时间切分验证,默认关闭)
+        params = _model_params()
+        if getattr(config, "BAYESIAN_TUNE_ENABLED", False) and len(tr_df) > 2000:
+            from app.ml.tune import tune_hyperparams
+            dates = sorted(tr_df.index.unique())
+            vd = int(getattr(config, "BAYESIAN_TUNE_VERIFY_DAYS", 120))
+            va_dates = dates[-vd:]
+            va_idx = tr_df.index.isin(va_dates)
+            va_w = tr_w[va_idx] if tr_w is not None else None
+            params = tune_hyperparams(
+                tr_df.loc[~va_idx, feature_names].values,
+                tr_df.loc[~va_idx, "label"].values,
+                tr_df.loc[va_idx, feature_names].values,
+                tr_df.loc[va_idx, "label"].values,
+                sample_weight_tr=tr_w[~va_idx] if tr_w is not None else None,
+                verbose=verbose)
+
+        model = LGBMClassifier(**params)
+        model.fit(tr_df[feature_names].values, tr_df["label"].values,
+                  sample_weight=tr_w)
+        # 特征重要性在校准前捕获(校准模型不暴露 feature_importances_)
+        importance = {}
+        if hasattr(model, "feature_importances_"):
+            imp = model.feature_importances_
+            importance = {feature_names[j]: float(imp[j])
+                          for j in np.argsort(imp)[::-1][:10]}
+        # 概率校准(默认开启,训练集内部 CV 拟合校准器)
+        if getattr(config, "CALIBRATE_ENABLED", True):
+            from app.ml.validation import calibrate_probabilities
+            model = calibrate_probabilities(
+                model, tr_df[feature_names].values, tr_df["label"].values,
+                method=config.CALIBRATE_METHOD, cv=int(getattr(config, "CALIBRATE_CV", 3)))
         metrics = _eval_metrics(model, te_df[feature_names].values,
                                 te_df["label"].values)
         avg = _class_avg_returns(tr_df, groups, horizon)
@@ -178,6 +260,7 @@ def walk_forward_train(horizon: int = None, threshold: float = None,
             "n_test": int(len(te_df)),
             "model": model,
             "class_avg_returns": avg,
+            "feature_importance_top10": importance,
             **metrics,
         })
         if verbose:
@@ -199,6 +282,23 @@ def walk_forward_train(horizon: int = None, threshold: float = None,
     # ---- 最后一折(最新时段)模型部署
     last = fold_results[-1]
     last_test_start = last["period"].split(" ~ ")[0]
+
+    # 分池验证(默认关闭):用最后一折测试集按训练池分类评估
+    split_valid = {}
+    if getattr(config, "SPLIT_VALIDATION_ENABLED", False):
+        try:
+            from app.ml.pool_builder import load_training_pool
+            from app.ml.validation import split_validation
+            pool = load_training_pool()
+            cats = pool.get("categories") or {}
+            te = splits[-1][1]
+            split_valid = split_validation(
+                last["model"], te[feature_names].values, te["label"].values,
+                te["code"].values, cats)
+        except Exception as e:  # noqa: BLE001
+            if verbose:
+                print(f"[WF] 分池验证失败: {e}")
+
     summary = {
         "model_name": config.MODEL_NAME,
         "framework": "lightgbm",
@@ -206,7 +306,7 @@ def walk_forward_train(horizon: int = None, threshold: float = None,
         "trained_at": dt.datetime.now().isoformat(timespec="seconds"),
         "horizon": horizon,
         "threshold": threshold,
-        "label_method": "rolling_quantile",
+        "label_method": getattr(config, "LABEL_MODE", "quantile"),
         "label_window": config.LABEL_QUANTILE_WINDOW,
         "label_quantiles": [config.LABEL_QUANTILE_LOW, config.LABEL_QUANTILE_HIGH],
         "n_samples": int(len(data)),
@@ -216,22 +316,34 @@ def walk_forward_train(horizon: int = None, threshold: float = None,
         "split_date": last_test_start,
         "classes": {int(k): v for k, v in LABEL_NAME.items()},
         "class_avg_returns": last["class_avg_returns"],
+        "atr_pct_baseline": atr_baseline,
         "metrics": {k: last[k] for k in _METRIC_KEYS}
                   | {"confusion_matrix": last["confusion_matrix"]},
+        "feature_importance_top10": last.get("feature_importance_top10") or {},
         "validation": {
             "method": "walk_forward",
             "k_folds": k,
             "initial_folds": init,
             "fixed_window_days": window,
+            "calibrated": bool(getattr(config, "CALIBRATE_ENABLED", True)),
+            "sample_weighted": bool(getattr(config, "SAMPLE_WEIGHT_ENABLED", True)),
+            "split_validation": split_valid or None,
             "test_ratio_note": "滚动前视交叉验证,非随机拆分,无未来信息泄露",
-            "folds": [{kk: vv for kk, vv in f.items() if kk != "model"}
+            "folds": [{kk: vv for kk, vv in f.items()
+                       if kk not in ("model", "feature_importance_top10")}
                       for f in fold_results],
             "mean": mean,
         },
         "feature_names": feature_names,
         "train_codes": list(groups.keys()),
+        "pool_stats": None,
         "elapsed_sec": round(time.time() - t0, 1),
     }
+    try:
+        from app.ml.pool_builder import pool_report
+        summary["pool_stats"] = pool_report()
+    except Exception:  # noqa: BLE001
+        pass
 
     _save_model(last["model"], summary, horizon)
     if verbose:
@@ -259,8 +371,10 @@ def single_split_train(horizon: int = None, threshold: float = None,
               f"window={config.LABEL_QUANTILE_WINDOW}, "
               f"q=({config.LABEL_QUANTILE_LOW}, {config.LABEL_QUANTILE_HIGH}))")
 
-    groups, data, feature_names = _build_training_data(horizon, threshold, verbose)
+    groups, data, feature_names, mainline_set, atr_baseline = _build_training_data(horizon, threshold, verbose)
     train_df, test_df, split_date = time_split(data)
+    tr_w = sample_weights(train_df, mainline_set) \
+        if getattr(config, "SAMPLE_WEIGHT_ENABLED", True) else None
     if verbose:
         print(f"[训练] 切分日: {split_date.date()} (train {len(train_df)} / "
               f"test {len(test_df)})")
@@ -269,7 +383,18 @@ def single_split_train(horizon: int = None, threshold: float = None,
         raise RuntimeError(f"训练样本不足: {len(train_df)} < {config.MIN_TRAIN_SAMPLES}")
 
     model = LGBMClassifier(**_model_params())
-    model.fit(train_df[feature_names].values, train_df["label"].values)
+    model.fit(train_df[feature_names].values, train_df["label"].values,
+              sample_weight=tr_w)
+    importance = {}
+    if hasattr(model, "feature_importances_"):
+        imp = model.feature_importances_
+        importance = {feature_names[j]: float(imp[j])
+                      for j in np.argsort(imp)[::-1][:10]}
+    if getattr(config, "CALIBRATE_ENABLED", True):
+        from app.ml.validation import calibrate_probabilities
+        model = calibrate_probabilities(
+            model, train_df[feature_names].values, train_df["label"].values,
+            method=config.CALIBRATE_METHOD, cv=int(getattr(config, "CALIBRATE_CV", 3)))
     metrics = _eval_metrics(model, test_df[feature_names].values,
                             test_df["label"].values)
     class_avg_returns = _class_avg_returns(train_df, groups, horizon)
@@ -281,7 +406,7 @@ def single_split_train(horizon: int = None, threshold: float = None,
         "trained_at": dt.datetime.now().isoformat(timespec="seconds"),
         "horizon": horizon,
         "threshold": threshold,
-        "label_method": "rolling_quantile",
+        "label_method": getattr(config, "LABEL_MODE", "quantile"),
         "label_window": config.LABEL_QUANTILE_WINDOW,
         "label_quantiles": [config.LABEL_QUANTILE_LOW, config.LABEL_QUANTILE_HIGH],
         "n_samples": int(len(data)),
@@ -291,13 +416,23 @@ def single_split_train(horizon: int = None, threshold: float = None,
         "split_date": str(pd.Timestamp(split_date).date()),
         "classes": {int(k): v for k, v in LABEL_NAME.items()},
         "class_avg_returns": class_avg_returns,
+        "atr_pct_baseline": atr_baseline,
         "metrics": {k: metrics[k] for k in _METRIC_KEYS}
                   | {"confusion_matrix": metrics["confusion_matrix"]},
-        "validation": {"method": "single_split", "test_ratio": config.TEST_RATIO},
+        "feature_importance_top10": importance,
+        "validation": {"method": "single_split", "test_ratio": config.TEST_RATIO,
+                       "calibrated": bool(getattr(config, "CALIBRATE_ENABLED", True)),
+                       "sample_weighted": bool(getattr(config, "SAMPLE_WEIGHT_ENABLED", True))},
         "feature_names": feature_names,
         "train_codes": list(groups.keys()),
+        "pool_stats": None,
         "elapsed_sec": round(time.time() - t0, 1),
     }
+    try:
+        from app.ml.pool_builder import pool_report
+        summary["pool_stats"] = pool_report()
+    except Exception:  # noqa: BLE001
+        pass
 
     path = _save_model(model, summary, horizon)
     if verbose:

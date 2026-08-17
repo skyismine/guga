@@ -44,7 +44,7 @@ ETF_SAMPLE_CODES = [        # 流动性好的样本 ETF(跨宽基/行业/主题)
 ]
 
 # ---------------------------------------------------------------- 预测
-PREDICT_HORIZON = 3        # 预测未来几个交易日(3 日短中期)
+PREDICT_HORIZON = 5        # 预测未来几个交易日(5 日短中期)
 PREDICT_THRESHOLD = 0.015  # 涨跌幅超过该值判定为 上涨/下跌 (1.5%);启用滚动分位数后仅作早期回退
 
 # 标签阈值:滚动分位数(替代固定百分比,自动适配个股波动率与市场环境)
@@ -54,6 +54,20 @@ LABEL_QUANTILE_WINDOW = 250     # 滚动窗口(交易日)
 LABEL_QUANTILE_LOW = 0.30       # 下跌阈值分位数(<= 该分位 -> 下跌)
 LABEL_QUANTILE_HIGH = 0.70      # 上涨阈值分位数(>= 该分位 -> 上涨)
 LABEL_QUANTILE_MIN_PERIODS = 60 # 窗口最小样本数,不足则剔除
+
+# 标签阈值模式:quantile(滚动分位数,默认) | atr(固定收益阈值 + 个股 ATR 动态调整)
+# atr 模式:对每只个股,阈值 = max(FIXED, k_atr * ATR14%/close),
+#          用个股波动率个性化涨跌判定(高波动股阈值放宽,低波动股收紧)。
+LABEL_MODE = "quantile"
+LABEL_ATR_THRESHOLD = 0.015      # atr 模式固定阈值
+LABEL_ATR_K = 1.0                # ATR 倍率:阈值下限 = k_atr * atr_pct
+
+# 剔除不可交易样本(训练样本必须真实可成交):
+# 当日涨停封板(一字/T 字,买入无法成交)或跌停(卖出无法成交)剔除该样本;
+# 未来 horizon 内存在停牌(交易间隔 > MAX_GAP_DAYS)的样本剔除。
+DROP_LIMIT_DAYS = True           # 剔除标签日处于涨/跌停(封板)的样本
+DROP_HALT_DAYS = True            # 剔除未来 horizon 内含停牌段的样本
+MAX_HALT_GAP_DAYS = 15           # 交易日间隔超过该值(自然日)视为停牌
 
 # ---------------------------------------------------------------- 每日信号排序(Top-N)
 # 信号系统不做自动交易,仅每日收盘后输出"买什么/卖什么":对股票池按预期收益排序,
@@ -112,14 +126,35 @@ TEST_RATIO = 0.2           # 按时间切分的验证集比例(single_split 模�
 TRAIN_MODE = "walk_forward"
 WF_K_FOLDS = 4              # 时间切分数(>=3,测试折数 = K - INITIAL_FOLDS)
 WF_INITIAL_FOLDS = 1        # 初始训练占用的最早段数(保证首折训练样本充足)
-WF_FIXED_WINDOW_DAYS = 0    # >0 训练用固定滚动窗口(交易日),0=expand 使用全部历史
+WF_FIXED_WINDOW_DAYS = 400  # 训练用固定滚动窗口(交易日);0=expand 使用全部历史
 WF_MIN_TEST_DAYS = 20       # 每折测试段最少交易日数,不足则跳过该折
+
+# 模型验证增强(默认值与任务设定一致)
+# 概率校准:对训练集内部 CV 拟合 isotonic/sigmoid 校准器,校正模型输出概率,
+#   使其接近真实频率(预测概率可直接解读为涨幅置信度)。默认开启。
+CALIBRATE_ENABLED = True
+CALIBRATE_METHOD = "isotonic"   # isotonic | sigmoid
+CALIBRATE_CV = 3                # 校准用内部交叉验证折数
+# 贝叶斯调参:optuna 驱动,用时间上更早的验证段评分;未安装 optuna 时自动降级
+#   为轻量随机搜索。默认关闭(为控制训练时长,月度重训保持稳定超参)。
+BAYESIAN_TUNE_ENABLED = False
+BAYESIAN_TUNE_TRIALS = 20       # 调参试验次数
+BAYESIAN_TUNE_VERIFY_DAYS = 120 # 调参验证段长度(交易日,取测试折之前的最近 N 日)
+# 分池验证:按训练池分类(core_a500/emotional/risk/large_cap)分别评估样本外指标,
+#   用于观察模型在不同类型股票上的泛化差异。默认关闭(不影响部署)。
+SPLIT_VALIDATION_ENABLED = False
+
+# 样本加权:类别平衡(缓解震荡类多数类偏向) × 主线标的 1.2(增强主线股权重)。
+SAMPLE_WEIGHT_ENABLED = True
 
 # 特征筛选(相关性去冗余 + 重要性 Top-N)
 FEATURE_SELECT = True               # 训练时是否使用筛选后的特征子集
-FEATURE_SELECT_TOP_N = 30           # 保留的特征数量
+FEATURE_SELECT_TOP_N = 40           # 保留的特征数量
 FEATURE_CORR_THRESHOLD = 0.8        # |相关系数| 超过该值视为冗余(按重要性贪心保留)
 FEATURE_SELECTED_FILE = "selected_features.json"   # 选择结果(存于 MODEL_DIR)
+
+# 新增高级特征(主线板块动量/量价衍生/市场风格),默认开启。
+ADVANCED_FEATURES_ENABLED = True
 
 # 特征标准化(滚动 z-score,仅用历史窗口,避免未来数据)
 STANDARDIZE_ROLLING = True      # 是否启用滚动 z-score 标准化

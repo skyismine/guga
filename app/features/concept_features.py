@@ -382,7 +382,11 @@ def attach_industry_features(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_features(df: pd.DataFrame, code: str = None) -> pd.DataFrame:
-    """统一特征装配(推断/回测路径):个股技术 + 市场级 + 概念特征。"""
+    """统一特征装配(推断/回测路径):个股技术 + 市场级 + 概念特征 + 高级特征。
+
+    高级特征(theme_/pv_/style_)与训练口径一致(全部历史可算、无前视),
+    由 advanced_features.prepare_advanced_features 补齐(缺失列用 0)。
+    """
     code = str(code).zfill(6) if code else (getattr(df, "name", None) or None)
     features = attach_market_features(compute_features(df))
     mc = main_concept_sw(code) if code else None
@@ -402,6 +406,10 @@ def prepare_features(df: pd.DataFrame, code: str = None) -> pd.DataFrame:
     else:
         for col in _NEUTRAL_COLS:
             features[col] = 0.0
+    # 高级特征(主线板块动量/量价衍生/市场风格)
+    if getattr(config, "ADVANCED_FEATURES_ENABLED", True):
+        from app.features.advanced_features import prepare_advanced_features
+        features = prepare_advanced_features(features, code)
     return standardize_stock_frame(features)
 
 
