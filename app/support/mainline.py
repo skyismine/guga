@@ -30,6 +30,21 @@ from app.support.portfolio import _one
 _last_scores = {"date": None, "items": {}}
 _grade_cache = {"date": None, "grade": "B"}
 
+# 涨停池缓存:盘中涨停家数持续变化,文件缓存短 TTL;不足该家数且超龄视为半截抓取
+_ZT_TTL_SECONDS = 5 * 60          # 盘中缓存 5 分钟
+_ZT_MIN_COUNT = 50                # 低于此家数视为半截数据(早盘/被限流)
+_ZT_MIN_COUNT_AGE = 2 * 60        # 半截缓存超 2 分钟即强制重抓
+
+
+def _is_trading_now(now=None) -> bool:
+    """当前是否处于交易时段(工作日 9:30-11:30 / 13:00-15:00)。"""
+    import datetime as _dt
+    now = now or _dt.datetime.now()
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    return (9 * 60 + 30) <= hm <= (11 * 60 + 30) or (13 * 60) <= hm <= (15 * 60)
+
 
 # ---------------------------------------------------------------- 数据源(带缓存)
 def _today() -> str:
@@ -160,13 +175,24 @@ def _zt_pool(date=None, refresh=False) -> list:
 
     boards=连板数(炸板重来按当前连板), float_yi=流通市值(亿)。
     旧缓存文件缺字段时按 boards=1 / float_yi=0 兜底,不阻塞读取。
+    缓存策略:盘中涨停池持续变化,文件缓存 TTL=_ZT_TTL_SECONDS;
+    低于 _ZT_MIN_COUNT 家视为早盘半截抓取,超龄即强制重抓,避免主线被陈旧数据误杀。
     """
     date = date or _try_trade_date()
     path = os.path.join(config.DATA_DIR, f"zt_{date}.json")
+    today = dt.date.today().strftime("%Y-%m-%d")
+    live = (date == today and _is_trading_now())
     if not refresh and os.path.exists(path):
         try:
+            mtime = os.path.getmtime(path)
+            age = time.time() - mtime
             with open(path, encoding="utf-8") as f:
-                return json.load(f)
+                cached = json.load(f)
+            stale = live and age > _ZT_TTL_SECONDS
+            incomplete = (live and len(cached) < _ZT_MIN_COUNT
+                          and age > _ZT_MIN_COUNT_AGE)
+            if not stale and not incomplete:
+                return cached
         except (OSError, ValueError):
             pass
     import akshare as ak
