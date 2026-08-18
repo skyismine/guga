@@ -102,7 +102,7 @@ def _build_training_data(horizon: int, threshold: float, verbose: bool):
               f"上涨 {vc.get(2, 0):.1%}")
     atr_baseline = None
     # ATR baseline 必须用标准化前的原始 atr_pct(标准化后中位数≈0 无意义)。
-    # 从 groups 原始日线估算:各股最新 atr14/close 的中位数。
+    # 从 groups 原始日线估算:各股 atr14/close 中位数的中位数(剔除 NaN/异常)。
     try:
         import vectorbt as vbt
         vals = []
@@ -110,7 +110,9 @@ def _build_training_data(horizon: int, threshold: float, verbose: bool):
             if len(g) < 30 or {"high", "low", "close"}.issubset(g.columns):
                 atr = vbt.indicators.ATR.run(g["high"], g["low"], g["close"],
                                              window=14).atr
-                vals.append(float((atr / g["close"]).dropna().median()))
+                v = (atr / g["close"]).dropna().median()
+                if np.isfinite(v):
+                    vals.append(float(v))
         if vals:
             atr_baseline = float(np.median(vals))
     except Exception:  # noqa: BLE001

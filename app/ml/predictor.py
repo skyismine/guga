@@ -115,7 +115,8 @@ class Predictor:
                    + row["down"] * avg.get(0, 0.0))
         # 个性化缩放:ATR/价 相对训练集基准(meta.atr_pct_baseline,默认 2.5%)
         if atr_pct is not None and atr_pct > 0:
-            baseline = float((self.meta or {}).get("atr_pct_baseline") or 0.025)
+            baseline = (self.meta or {}).get("atr_pct_baseline")
+            baseline = float(baseline) if np.isfinite(baseline) else 0.025
             scale = 1.0 + 2.0 * (atr_pct - baseline) / (baseline + 1e-9)
             scale = max(0.5, min(2.0, scale))
             exp_ret = exp_ret * scale
