@@ -65,10 +65,11 @@ def _metrics(pred: Predictor, results: pd.DataFrame) -> dict:
     rows["pred_label"] = rows["pred_signal"].map({"up": 2, "flat": 1, "down": 0})
     actual = (rows["actual_fwd_ret"] > 0).astype(int).values
     up_signal = (rows["pred_signal"] == "up").astype(int).values
+    # 上涨方向命中率:预测上涨信号的样本实际真上涨比例(召回视角,取正预测准确率)
+    hit = float(rows.loc[up_signal == 1, "actual_fwd_ret"].gt(0).mean()) if up_signal.sum() else 0.0
     acc = accuracy_score(actual, up_signal)
-    f1 = f1_score(rows["pred_label"].values,
-                  (rows["actual_fwd_ret"] >= 0).astype(int) * 2, average="weighted",
-                  zero_division=0)
+    # 二分类 F1:信号=上涨(正) vs 实际>0
+    f1 = f1_score(actual, up_signal, zero_division=0)
     up_auc = roc_auc_score(actual, rows["up"].values)
     down_auc = roc_auc_score(1 - actual, rows["down"].values)
     # 分箱校准:按 p_up 十分位分组,比较平均预测概率 vs 实际上涨率
@@ -77,8 +78,9 @@ def _metrics(pred: Predictor, results: pd.DataFrame) -> dict:
         pred_up=("up", "mean"), actual_up=("actual_fwd_ret", lambda x: float((x > 0).mean())),
         n=("up", "size"))
     calib_mae = float(np.abs(calib["pred_up"] - calib["actual_up"]).mean())
-    return {"n": len(rows), "acc_up_signal": acc, "f1_weighted": f1,
-            "up_auc": up_auc, "down_auc": down_auc, "calibration_mae": calib_mae}
+    return {"n": len(rows), "acc_up_signal": acc, "f1_up_signal": f1,
+            "up_hit_rate": hit, "up_auc": up_auc, "down_auc": down_auc,
+            "calibration_mae": calib_mae}
 
 
 def main():
@@ -117,9 +119,9 @@ def main():
     print("=" * 64)
     print(f"{'指标':<18}{'旧模型(h3)':<16}{'新模型(h5)':<16}")
     print("-" * 64)
-    for k, label in [("acc_up_signal", "上涨信号准确率"), ("f1_weighted", "F1(加权)"),
-                     ("up_auc", "上涨AUC"), ("down_auc", "下跌AUC"),
-                     ("calibration_mae", "校准误差(MAE)")]:
+    for k, label in [("acc_up_signal", "方向准确率"), ("f1_up_signal", "F1(上涨信号)"),
+                     ("up_hit_rate", "上涨信号命中率"), ("up_auc", "上涨AUC"),
+                     ("down_auc", "下跌AUC"), ("calibration_mae", "校准误差(MAE)")]:
         om = _metrics(old_pred, old_df)
         nm = _metrics(new_pred, new_df)
         print(f"{label:<18}{om.get(k, float('nan')):<16.4f}{nm.get(k, float('nan')):<16.4f}")

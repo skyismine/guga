@@ -76,7 +76,7 @@ class Predictor:
 
     def _entropy(self, row: pd.Series) -> float:
         """三分类预测熵(0=完全确定,1=完全不确定)。"""
-        p = row[["up", "flat", "down"]].clip(1e-9, 1)
+        p = row[["up", "flat", "down"]].astype(float).clip(1e-9, 1).values
         return float(-(p * np.log(p)).sum() / np.log(3))
 
     def _confidence(self, row: pd.Series) -> float:
