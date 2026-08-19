@@ -35,6 +35,9 @@ _ZT_TTL_SECONDS = 5 * 60          # 盘中缓存 5 分钟
 _ZT_MIN_COUNT = 50                # 低于此家数视为半截数据(早盘/被限流)
 _ZT_MIN_COUNT_AGE = 2 * 60        # 半截缓存超 2 分钟即强制重抓
 
+# 全A快照缓存:盘中价格/涨幅/成交额持续变化,文件缓存短 TTL;非交易时段按日期复用
+_SPOT_TTL_SECONDS = 5 * 60        # 盘中缓存 5 分钟
+
 
 def _is_trading_now(now=None) -> bool:
     """当前是否处于交易时段(工作日 9:30-11:30 / 13:00-15:00)。"""
@@ -97,12 +100,21 @@ def _try_trade_date() -> str:
 
 
 def _a_spot_map(refresh=False) -> dict:
-    """全 A 快照:{code: {...}}。东财接口限流时自动降级新浪分页拉取;再失败返回空。"""
+    """全 A 快照:{code: {...}}。东财接口限流时自动降级新浪分页拉取;再失败返回空。
+
+    缓存策略:盘中快照价格/涨幅/成交额持续变化,文件缓存 TTL=_SPOT_TTL_SECONDS;
+    非交易时段按日期文件名复用(收盘快照不再变化)。早盘(09:30 前)抓取可能
+    得到 price=0 的无效数据,盘中超龄后强制重抓。
+    """
     path = os.path.join(config.DATA_DIR, f"spot_{_today()}.json")
     if not refresh and os.path.exists(path):
         try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
+            mtime = os.path.getmtime(path)
+            age = time.time() - mtime
+            stale = _is_trading_now() and age > _SPOT_TTL_SECONDS
+            if not stale:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
         except (OSError, ValueError):
             pass
 
@@ -162,11 +174,16 @@ def _a_spot_map(refresh=False) -> dict:
     if not out:
         out = _with_timeout(_fetch_sina, 50, {}, name="a_spot_sina")
     if out:
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(out, f, ensure_ascii=False)
-        except OSError:
-            pass
+        # 有效性校验:价格<=0 占比过高视为无效快照(早盘开盘前抓取),不落盘
+        valid = [v for v in out.values() if (v.get("price") or 0) > 0]
+        if valid and len(valid) >= max(1, int(len(out) * 0.5)):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False)
+            except OSError:
+                pass
+        else:
+            print(f"[mainline] 全A快照无效(有价 {len(valid)}/{len(out)}),不落盘")
     return out
 
 

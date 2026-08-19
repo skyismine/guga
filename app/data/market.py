@@ -153,9 +153,13 @@ def get_basis_series(days: int = None, use_cache: bool = True) -> pd.DataFrame:
 
 
 def get_futures_quotes(use_cache: bool = True) -> Dict:
-    """四大期指实时快照(连续合约 IF0/IH0/IC0/IM0)+ 对现货的实时基差。"""
+    """四大期指实时快照(连续合约 IF0/IH0/IC0/IM0)+ 对现货的实时基差。
+
+    交易时段基差盘中持续变化,短 TTL(60s)刷新;非交易时段用长 TTL(4h)。
+    """
     if use_cache:
-        cached = _load_cache("futures_rt", ttl=config.CACHE_TTL_SECONDS)
+        ttl = _INTRADAY_TTL if _is_trading_time() else config.CACHE_TTL_SECONDS
+        cached = _load_cache("futures_rt", ttl=ttl)
         if cached is not None:
             return cached
     import akshare as ak
@@ -185,7 +189,8 @@ def get_futures_quotes(use_cache: bool = True) -> Dict:
             }
         except Exception as e:  # noqa: BLE001
             print(f"[market] 期指实时获取失败 {key}: {e}")
-    _save_cache("futures_rt", result)
+    if result:  # 接口失败返回空时不污染缓存,避免盘中一直命中空快照
+        _save_cache("futures_rt", result)
     return result
 
 
