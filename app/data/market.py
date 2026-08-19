@@ -164,9 +164,22 @@ def get_futures_quotes(use_cache: bool = True) -> Dict:
             return cached
     import akshare as ak
     result = {}
+    errors = []
     for key, variety in config.FUTURES_VARIETY.items():
+        df = None
+        for attempt in range(2):  # 间歇性 JSON 解析失败,轻量重试一次
+            try:
+                df = ak.futures_zh_realtime(symbol=variety)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 0:
+                    errors.append(f"{key}:{type(e).__name__}")
+                else:
+                    errors.append(f"{key}:{type(e).__name__}")
+                time.sleep(0.4)
+        if df is None or df.empty:
+            continue
         try:
-            df = ak.futures_zh_realtime(symbol=variety)
             row = df[df["symbol"] == f"{key.upper()}0"]
             if row.empty:
                 row = df[df["symbol"].str.upper().str.startswith(key.upper())]
@@ -188,7 +201,9 @@ def get_futures_quotes(use_cache: bool = True) -> Dict:
                 "basis": round(basis, 5) if basis is not None else None,
             }
         except Exception as e:  # noqa: BLE001
-            print(f"[market] 期指实时获取失败 {key}: {e}")
+            errors.append(f"{key}:{type(e).__name__}")
+    if errors and len(errors) < len(config.FUTURES_VARIETY):
+        print(f"[market] 期指部分获取失败: {errors}")
     if result:  # 接口失败返回空时不污染缓存,避免盘中一直命中空快照
         _save_cache("futures_rt", result)
     return result
