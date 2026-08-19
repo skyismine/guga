@@ -19,6 +19,18 @@ from app import config
 _SINA_HQ = "https://hq.sinajs.cn/list={symbols}"
 _SINA_REFERER = "https://finance.sina.com.cn"
 
+# 盘中实时数据短 TTL:乐咕涨跌家数盘中持续变化,60s 内复用避免频繁抓取
+_INTRADAY_TTL = 60
+
+
+def _is_trading_time(now=None) -> bool:
+    """是否处于交易时段(工作日 9:30-11:30 / 13:00-15:00)。"""
+    now = now or dt.datetime.now()
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    return (9 * 60 + 30) <= hm <= (11 * 60 + 30) or (13 * 60) <= hm <= (15 * 60)
+
 
 # ---------------------------------------------------------------- 缓存
 def _path(key: str) -> str:
@@ -179,9 +191,13 @@ def get_futures_quotes(use_cache: bool = True) -> Dict:
 
 # ---------------------------------------------------------------- 涨跌家数(乐咕乐股)
 def get_market_activity(use_cache: bool = True) -> Dict:
-    """全市场当日涨跌家数/涨停跌停/活跃度(乐咕乐股快照)。"""
+    """全市场当日涨跌家数/涨停跌停/活跃度(乐咕乐股快照)。
+
+    交易时段家数盘中持续变化,短 TTL(60s)刷新;非交易时段用长 TTL(4h)。
+    """
     if use_cache:
-        cached = _load_cache("activity", ttl=config.CACHE_TTL_SECONDS)
+        ttl = _INTRADAY_TTL if _is_trading_time() else config.CACHE_TTL_SECONDS
+        cached = _load_cache("activity", ttl=ttl)
         if cached is not None:
             return cached
     import akshare as ak
