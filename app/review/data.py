@@ -241,6 +241,16 @@ def _summarize_zt(df: pd.DataFrame) -> Dict:
 # ---------------------------------------------------------------- 板块资金流(同花顺概念板块)
 _SF_FLOW_TTL = 120   # 秒:单日概念资金流快照缓存有效期(短,保证盘中较新)
 _SF_FLOW5_TTL = 300  # 秒:5日概念资金流缓存有效期(5日数据盘中变化小)
+_SF_FAIL_BACKOFF = 300  # 秒:实时抓取失败回退快照后,该 key 的退避期(期内复用快照不重试)
+
+_sf_fail_ts = {}  # key -> 最近一次抓取失败时间戳(退避)
+
+
+def _sf_in_backoff(key: str) -> bool:
+    """抓取失败后短时间内复用快照,避免对故障源空转重试/刷屏。"""
+    ts = _sf_fail_ts.get(key)
+    return ts is not None and (time.time() - ts) < _SF_FAIL_BACKOFF
+
 
 def _sf_load(key: str, ttl: int) -> Optional[list]:
     """读取板块资金流缓存;命中则直接返回(不触发网络)。"""
@@ -256,6 +266,7 @@ def _sf_save(key: str, rows: list) -> None:
 
 def _sf_fallback(key: str, src: str, err) -> list:
     """实时抓取失败时回退最近一次成功快照(任意年龄,含盘中),并告警。"""
+    _sf_fail_ts[key] = time.time()
     stale = _load_cache(key, ttl=None)
     if stale:
         print(f"[review] {src} 实时抓取失败,回退最近快照({len(stale)} 条): {err}")
@@ -273,6 +284,10 @@ def collect_sector_flow(use_cache: bool = True) -> list:
         hit = _sf_load("sector_flow", _SF_FLOW_TTL)
         if hit is not None:
             return hit
+        if _sf_in_backoff("sector_flow"):  # 刚失败过,退避期内直接复用快照
+            stale = _load_cache("sector_flow", ttl=None)
+            if stale is not None:
+                return stale
     import akshare as ak
     try:
         df = _retry(lambda: ak.stock_fund_flow_concept(symbol="即时"), n=2, slp=0.8)
@@ -306,6 +321,10 @@ def collect_sector_flow_5d(use_cache: bool = True) -> list:
         hit = _sf_load("sector_flow_5d", _SF_FLOW5_TTL)
         if hit is not None:
             return hit
+        if _sf_in_backoff("sector_flow_5d"):  # 刚失败过,退避期内直接复用快照
+            stale = _load_cache("sector_flow_5d", ttl=None)
+            if stale is not None:
+                return stale
     import akshare as ak
     try:
         df = _retry(lambda: ak.stock_fund_flow_concept(symbol="5日排行"), n=2, slp=0.8)
