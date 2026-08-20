@@ -505,24 +505,71 @@ def collect_market_daily(days: int = 10) -> List[Dict]:
 
     dates = sorted((set(sh) & set(sz)) or list(sh))[-days:]
     hist = _load_history()
+    both_ok = bool(sh and sz)  # 沪/深两市场 kline 均成功时才能算出正确成交额
+
+    # kline 整体失败时用本地存档回放近 N 日,保证成交额/资金/家数不缺失
+    if not dates and hist:
+        hdates = sorted(hist.keys())[-days:]
+        rows_from_hist = [{
+            "date": hd, "close": hist[hd].get("close"), "pct_chg": hist[hd].get("pct_chg"),
+            "amount_yi": hist[hd].get("amount_yi"), "main_yi": hist[hd].get("main_yi"),
+            "advance": hist[hd].get("advance"), "decline": hist[hd].get("decline"),
+            "limit_up": hist[hd].get("limit_up"), "limit_down": hist[hd].get("limit_down"),
+        } for hd in hdates]
+        # 当日成交额优先用新浪实时(东财 kline 限流时权威替代,如 9505.6→20794 亿)
+        if rows_from_hist:
+            try:
+                from app.data.market import get_two_market_amount
+                amt = get_two_market_amount()
+                if amt:
+                    for rr in rows_from_hist:
+                        if rr["date"] == dt.date.today().isoformat():
+                            rr["amount_yi"] = round(amt / 1e8, 1)
+            except Exception:  # noqa: BLE001
+                pass
+            _MD_CACHE["data"] = rows_from_hist
+            _MD_CACHE["t"] = time.time()
+            return rows_from_hist
 
     rows = []
     for d in dates:
         s, z = sh.get(d, {}), sz.get(d, {})
+        live_amt = round(((s.get("amount") or 0) + (z.get("amount") or 0)) / 1e8, 1) if both_ok else None
+        live_main = round(((fsh.get(d) or 0) + (fsz.get(d) or 0)) / 1e8, 2) if (fsh and fsz) else None
         row = {
             "date": d,
             "close": s.get("close"),
             "pct_chg": s.get("pct_chg"),
-            "amount_yi": round(((s.get("amount") or 0) + (z.get("amount") or 0)) / 1e8, 1),
-            "main_yi": round(((fsh.get(d) or 0) + (fsz.get(d) or 0)) / 1e8, 2),
+            "amount_yi": live_amt,
+            "main_yi": live_main,
             "advance": None, "decline": None,
             "limit_up": None, "limit_down": None,
         }
         h = hist.get(d)
         if h:
-            for k in ("advance", "decline", "limit_up", "limit_down", "main_yi", "amount_yi"):
+            # 家数类字段历史存档更可靠(乐咕/涨停池);当日(今天)成交额/主力资金
+            # 以实时 kline 为准——存档可能是盘中不完整快照(如 9505.6→应20794亿)。
+            is_today = (d == dt.date.today().isoformat())
+            for k in ("advance", "decline", "limit_up", "limit_down"):
                 if h.get(k) is not None:
                     row[k] = h[k]
+            if not is_today:
+                for k in ("main_yi", "amount_yi"):
+                    if h.get(k) is not None:
+                        row[k] = h[k]
+            elif not both_ok:  # 当日但 kline 单边失败:先试新浪实时,再回退存档
+                sina_amt = None
+                try:
+                    from app.data.market import get_two_market_amount
+                    sina_amt = get_two_market_amount()
+                except Exception:  # noqa: BLE001
+                    sina_amt = None
+                if sina_amt:
+                    row["amount_yi"] = round(sina_amt / 1e8, 1)
+                elif h.get("amount_yi") is not None:
+                    row["amount_yi"] = h["amount_yi"]
+                if h.get("main_yi") is not None:
+                    row["main_yi"] = h["main_yi"]
         else:
             row["limit_up"] = _zt_pool_count(d)
         rows.append(row)

@@ -99,10 +99,28 @@ def get_index_spot(symbol: str = None) -> Dict:
     except (TypeError, ValueError, IndexError):
         open_ = prev_close = price = high = low = 0.0
     pct = (price - prev_close) / prev_close if prev_close else 0.0
+    amount = 0.0
+    try:
+        amount = float(parts[9]) if len(parts) > 9 else 0.0
+    except (TypeError, ValueError, IndexError):
+        pass
     m2 = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})", resp.text)
     return {"symbol": symbol, "name": name, "open": open_, "prev_close": prev_close,
             "price": price, "high": high, "low": low, "pct_chg": pct,
+            "amount": amount,
             "datetime": f"{m2.group(1)} {m2.group(2)}" if m2 else ""}
+
+
+def get_two_market_amount() -> Optional[float]:
+    """两市当日成交额(元):上证指数+深证成指(新浪实时)。失败返回 None。"""
+    try:
+        sh = get_index_spot("sh000001")
+        sz = get_index_spot("sz399001")
+        if sh.get("amount") and sz.get("amount"):
+            return sh["amount"] + sz["amount"]
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 # ---------------------------------------------------------------- 期指资金/基差
