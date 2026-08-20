@@ -402,7 +402,30 @@ _EM_HEADERS = {
     "Referer": "http://quote.eastmoney.com/",
 }
 _HIST_FILE = os.path.join(_REVIEW_DIR, "daily_history.json")
+_EM_KLINE_CACHE_FILE = os.path.join(_REVIEW_DIR, "em_kline_cache.json")
 _MD_CACHE = {"t": 0.0, "data": None}
+
+
+def _em_kline_cache(secid: str) -> Dict:
+    try:
+        with open(_EM_KLINE_CACHE_FILE, "r", encoding="utf-8") as f:
+            all_ = json.load(f)
+        return all_.get(secid, {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _em_kline_save(secid: str, data: Dict) -> None:
+    try:
+        all_ = {}
+        if os.path.exists(_EM_KLINE_CACHE_FILE):
+            with open(_EM_KLINE_CACHE_FILE, "r", encoding="utf-8") as f:
+                all_ = json.load(f)
+        all_[secid] = data
+        with open(_EM_KLINE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_, f, ensure_ascii=False)
+    except OSError:
+        pass
 
 
 def _em_json(url: str, n: int = 3) -> Dict:
@@ -426,7 +449,10 @@ def _em_kline_rows(secid: str, lmt: int = 12) -> Dict[str, Dict]:
     url = ("http://push2his.eastmoney.com/api/qt/stock/kline/get"
            f"?secid={secid}&klt=101&fqt=1&lmt={lmt}&end=20500101"
            "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59")
-    j = _em_json(url)
+    try:
+        j = _em_json(url)
+    except Exception:  # noqa: BLE001
+        return _em_kline_cache(secid)  # 接口限流时回退最近一次成功快照(收盘值,权威)
     out = {}
     for line in (j.get("data") or {}).get("klines") or []:
         p = line.split(",")
@@ -436,6 +462,8 @@ def _em_kline_rows(secid: str, lmt: int = 12) -> Dict[str, Dict]:
             out[p[0]] = {"close": float(p[2]), "pct_chg": float(p[8]), "amount": float(p[6])}
         except (TypeError, ValueError):
             continue
+    if out:
+        _em_kline_save(secid, out)
     return out
 
 
@@ -547,16 +575,18 @@ def collect_market_daily(days: int = 10) -> List[Dict]:
         }
         h = hist.get(d)
         if h:
-            # 家数类字段历史存档更可靠(乐咕/涨停池);当日(今天)成交额/主力资金
-            # 以实时 kline 为准——存档可能是盘中不完整快照(如 9505.6→应20794亿)。
+            # 家数类字段历史存档更可靠(乐咕/涨停池);成交额/主力资金以 kline 收盘值
+            # 为准——存档可能是盘中不完整快照(如 08-19 盘中 14019→实际 25110 亿)。
             is_today = (d == dt.date.today().isoformat())
             for k in ("advance", "decline", "limit_up", "limit_down"):
                 if h.get(k) is not None:
                     row[k] = h[k]
             if not is_today:
-                for k in ("main_yi", "amount_yi"):
-                    if h.get(k) is not None:
-                        row[k] = h[k]
+                # 历史日期:优先 kline 收盘值(权威,收盘后定值);存档仅当 kline 缺失时回退
+                if row["amount_yi"] is None and h.get("amount_yi") is not None:
+                    row["amount_yi"] = h["amount_yi"]
+                if row["main_yi"] is None and h.get("main_yi") is not None:
+                    row["main_yi"] = h["main_yi"]
             elif not both_ok:  # 当日但 kline 单边失败:先试新浪实时,再回退存档
                 sina_amt = None
                 try:
