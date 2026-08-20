@@ -44,10 +44,10 @@ def _sector_stats(name: str) -> dict | None:
 
 def _sector_stats_uncached(name: str) -> dict | None:
     try:
-        from app.features.concept_features import _get_concept_close
-        close = _get_concept_close(name)
+        from app.features.concept_features import _get_concept_daily
+        df = _get_concept_daily(name)
+        close = df["close"]
         if close is not None and len(close) >= 4:
-            out = {"gain3": float(close.iloc[-1] / close.iloc[-4] - 1)}
             out = {"gain3": float(close.iloc[-1] / close.iloc[-4] - 1)}
             if len(close) >= 21:
                 out["ret20"] = float(close.iloc[-1] / close.iloc[-21] - 1)
@@ -58,6 +58,11 @@ def _sector_stats_uncached(name: str) -> dict | None:
                 out["res20"] = float(win.max())
                 out["sup20"] = float(win.min())
                 out["dd20"] = float(close.iloc[-1] / win.max() - 1)  # 相对20日高点回撤(负值)
+                # 板块量能比:当日成交量 / 近5日均量(>1 放量,<1 缩量)
+                if "volume" in df.columns and len(df["volume"]) >= 6:
+                    v = df["volume"].astype(float)
+                    if float(v.tail(5).mean()) > 0:
+                        out["volume_ratio"] = float(v.iloc[-1] / v.tail(5).mean())
             return out
     except Exception:  # noqa: BLE001
         pass
@@ -77,7 +82,8 @@ def _sector_stats_many(names: list, max_workers: int = 8) -> dict:
 
 
 # ---------------------------------------------------------------- 第一层 大盘开仓许可评级
-def _market_score(fg, adv_ratio, zt, amount_yi, w) -> float:
+def _market_score(fg, adv_ratio, zt, amount_yi, w, vol_ratio=None, vol_cfg=None,
+                  vol_incomplete=False) -> float:
     s = 0.0
     if fg is not None:
         s += max(0.0, min(float(fg), 100.0)) / 100.0 * w.get("mood", 40)
@@ -85,11 +91,24 @@ def _market_score(fg, adv_ratio, zt, amount_yi, w) -> float:
         s += min(max(float(adv_ratio), 0.0), 2.0) / 2.0 * w.get("breadth", 25)
     if zt is not None:
         s += min(max(int(zt), 0), 80) / 80.0 * w.get("zt", 20)
+    # 成交额:线性映射;量能比:以1.0为基准(平量),vr<1 缩量显著减分,>1 放量加分
+    amt_w = w.get("amount", 15)
+    vol_used_w = 0.0
+    if vol_ratio is not None and vol_cfg and vol_cfg.get("enabled", True):
+        vol_w = float(vol_cfg.get("weight", 10))
+        if vol_incomplete:  # 盘中折算的量能比可信度低,权重减半
+            vol_w *= 0.5
+        lo, hi = vol_cfg.get("range", (0.5, 2.0))
+        vr_c = min(max(float(vol_ratio), lo), hi)
+        # 缩量(vr<1)线性降至下限分,平量(1.0)得满分,放量封顶满分
+        s += min(vr_c / 1.0, 1.0) * vol_w
+        vol_used_w = vol_w
+        amt_w = max(0.0, amt_w - vol_used_w)  # 量能权重从 amount 项借调,总分保持 100
     if amount_yi is not None:
         base = _cfg().get("min_amount_yi", 10000.0)
-        s += min(max(float(amount_yi), 0.0), base) / base * w.get("amount", 15)
+        s += min(max(float(amount_yi), 0.0), base) / base * amt_w
     else:
-        s += w.get("amount", 15) * 0.6  # 成交额缺失按中性 60% 计
+        s += amt_w * 0.6  # 成交额缺失按中性 60% 计
     return round(min(s, 100.0), 1)
 
 
@@ -118,15 +137,45 @@ def market_permit() -> dict:
     if adv is not None and dec:
         adv_ratio = adv / dec if dec else None
     amount_yi = None
+    vol_ratio = None
+    vol_cfg = dcfg.get("market_volume", {})
+    vol_incomplete = False
     try:
         from app.review.data import collect_market_daily
+        from app.features.market_features import _is_trading_time
         rows = collect_market_daily(10)
         if rows:
             amount_yi = rows[-1].get("amount_yi")
+            # 量能比:当日两市成交额 / 近N日成交额均值(识别缩量/放量)
+            # 盘中当日成交额未完整,按时间进度折算到全天口径
+            window = int(vol_cfg.get("window", 5))
+            if len(rows) >= window + 1:
+                cur = rows[-1].get("amount_yi")
+                prevs = [r.get("amount_yi") for r in rows[-window - 1:-1]]
+                prevs = [v for v in prevs if v]
+                if cur and prevs:
+                    avg = sum(prevs) / len(prevs)
+                    if avg > 0:
+                        vol_ratio = cur / avg
+                        if _is_trading_time():
+                            # 盘中:折算全天=当前累计/交易进度(9:30-11:30+13:00-15:00)
+                            vol_incomplete = True
+                            now = dt.datetime.now()
+                            mins = 0
+                            hm = now.hour * 60 + now.minute
+                            if hm <= 11 * 60 + 30:
+                                mins = hm - (9 * 60 + 30)
+                            else:
+                                mins = 120 + (hm - (13 * 60))
+                            progress = mins / 240.0
+                            if 0 < progress < 1:
+                                vol_ratio = cur / progress / avg
     except Exception:  # noqa: BLE001
         pass
 
-    score = _market_score(fg, adv_ratio, zt, amount_yi, rules.get("weights", {}))
+    score = _market_score(fg, adv_ratio, zt, amount_yi, rules.get("weights", {}),
+                          vol_ratio=vol_ratio, vol_cfg=vol_cfg,
+                          vol_incomplete=vol_incomplete)
     grade = _grade(score, zt, adv_ratio, rules)
     cap = rules["cap"].get(grade, 0.1)
     checks = {
@@ -142,6 +191,10 @@ def market_permit() -> dict:
     reasons.append(f"涨停 {zt} 家 / 上涨 {adv} 家 vs 下跌 {dec} 家,家数比 {adv_ratio:.2f}")
     if amount_yi:
         reasons.append(f"两市成交额 {amount_yi:,.0f} 亿")
+    if vol_ratio is not None:
+        tag = "放量" if vol_ratio >= 1.05 else ("缩量" if vol_ratio <= 0.95 else "平量")
+        suffix = "(盘中按进度折算)" if vol_incomplete else ""
+        reasons.append(f"量能比 {vol_ratio:.2f}{suffix}({tag},当日/近{vol_cfg.get('window', 5)}日均)")
     reasons.append(f"大盘综合评分 {score},达 {grade} 级标准(总仓位上限 {cap:.0%})")
     return {
         "grade": grade,
@@ -150,7 +203,7 @@ def market_permit() -> dict:
         "cap": cap,
         "score": score, "fear_greed": fg, "fear_greed_label": fear_greed_label(fg),
         "limit_up": zt, "advance": adv, "decline": dec, "adv_ratio": adv_ratio,
-        "amount_yi": amount_yi, "checks": checks, "reasons": reasons,
+        "amount_yi": amount_yi, "vol_ratio": vol_ratio, "checks": checks, "reasons": reasons,
         "date": str(snap.get("market_date") or _today()),
     }
 
@@ -172,7 +225,7 @@ def _veto(name, r, dcfg, stats, zt_available=True) -> tuple:
     return bool(reasons), reasons
 
 
-def _pass_reasons(r, stats) -> list:
+def _pass_reasons(r, stats, score=None) -> list:
     out = []
     if r["net_yi"] >= 0:
         out.append(f"主力净流入 {r['net_yi']:.1f} 亿")
@@ -187,7 +240,7 @@ def _pass_reasons(r, stats) -> list:
             out.append(f"近20日涨幅 {stats['ret20'] * 100:+.1f}%")
         if stats.get("vol20"):
             out.append(f"20日波动率 {stats['vol20'] * 100:.1f}%")
-    out.append(f"综合评分 {r['score']} 分,达标")
+    out.append(f"综合评分 {score if score is not None else r['score']} 分,达标")
     return out
 
 
@@ -295,6 +348,10 @@ def _value_notes(it: dict, vcfg: dict) -> str:
     rank = it.get("fund_rank_1d")
     fund_txt = f"净流入率 {rate * 100:.1f}% 全市场第 {rank} 名" if rate is not None and rank else "资金持续净流入"
     zt = f"{it.get('zt_count') or 0} 家涨停形成板块效应" if (it.get("zt_count") or 0) > 0 else "板块个股活跃"
+    vr = it.get("volume_ratio")
+    if vr is not None:
+        vtag = "放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")
+        zt += f",量能{vtag}(比 {vr:.2f})"
     if pos == "低位启动":
         lead = "资金技术双共振,低位启动持续性强"
     elif pos == "短期高位":
@@ -349,6 +406,7 @@ def mainline_select() -> dict:
         item = {"name": r["industry"], "score": r["score"], "pct_chg": r["pct_chg"],
                 "net_yi": r["net_yi"], "zt_count": r["zt_count"], "leader": r.get("leader", ""),
                 "news_hits": r.get("news_hits", 0), "stats": stats or {},
+                "volume_ratio": (stats or {}).get("volume_ratio"),
                 "rate_1d": r.get("rate_1d"), "fund_rank_1d": r.get("fund_rank_1d"),
                 "fund_status": r.get("fund_status"), "rate_5d": r.get("rate_5d"),
                 "fund_rank_5d": r.get("fund_rank_5d"),
@@ -359,13 +417,27 @@ def mainline_select() -> dict:
             item["ladder_tag"] = r.get("ladder_tag")
             item["size_bias"] = r.get("size_bias", 0)
             item["market_style_tag"] = style_tag
-        if r["score"] >= mline.get("pass_score", 60.0):
-            item["reasons"] = _pass_reasons(r, stats)
+        # 板块量能修正:放量涨加分、缩量涨减分(缩量普涨的板块不追高),幅度受配置约束
+        vadj = dcfg.get("volume_adj", {})
+        if vadj.get("enabled", True) and stats and stats.get("volume_ratio") is not None:
+            vr = stats["volume_ratio"]
+            lo, hi = vadj.get("range", (0.5, 2.0))
+            max_d = float(vadj.get("max_delta", 3.0))
+            base = min(max(vr, lo), hi) / hi  # 0.25~1.0
+            delta = (base - 0.75) * 2.0 * max_d  # 量比居中(0.75分)时修正0,放量加分/缩量减分
+            item["score"] = round(r["score"] + delta, 2)
+            item["volume_adj"] = round(delta, 2)
+        if item["score"] >= mline.get("pass_score", 60.0):
+            item["reasons"] = _pass_reasons(r, stats, item["score"])
+            if item.get("volume_adj"):
+                vr = stats.get("volume_ratio") or 0
+                tag = "放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")
+                item["reasons"].insert(0, f"板块量能比 {vr:.2f}({tag}),评分{'上调' if item['volume_adj'] > 0 else '下调'} {abs(item['volume_adj']):.1f} 分")
             item["pool"] = _sector_pool(r["industry"])
             passed.append(item)
         else:
             item["level"] = "watch"
-            item["reasons"] = [f"综合评分 {r['score']} 分,低于准入线 {mline.get('pass_score', 60.0)} 分,仅跟踪"]
+            item["reasons"] = [f"综合评分 {item['score']} 分,低于准入线 {mline.get('pass_score', 60.0)} 分,仅跟踪"]
             low.append(item)
 
     # ---- 属性池内分级(禁止跨池对比);第五轮:风格偏转仅调整同池相邻且分差小的排序

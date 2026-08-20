@@ -252,12 +252,13 @@ def main_concept_sw(code: str):
 
 
 # ---------------------------------------------------------------- 概念指数
-def _fetch_index_close_by_code(code: str, name: str, start_date: str) -> pd.Series:
-    """按板块代码直连抓取同花顺概念指数收盘序列。
+def _fetch_index_close_by_code(code: str, name: str, start_date: str) -> pd.DataFrame:
+    """按板块代码直连抓取同花顺概念指数日线(index=date, 列 close/volume/amount)。
 
     akshare 的 stock_board_concept_index_ths 内部使用概念名录映射,
     名录缺失的板块(如 CRO概念/308734)会 KeyError;这里直接用代码取
     clid 再拉取 bk 日线,兼容名录外板块。
+    数据行格式: 日期,开,高,低,收,成交量,成交额,...
     """
     from py_mini_racer import MiniRacer as _MR
     js_code = _MR()
@@ -292,23 +293,27 @@ def _fetch_index_close_by_code(code: str, name: str, start_date: str) -> pd.Seri
             continue
         for row in rows:
             parts = row.split(",")
-            if len(parts) < 6:
+            if len(parts) < 7:
                 continue
             try:
-                frames.append([parts[0], float(parts[2])])  # 日期,收盘
+                frames.append([parts[0], float(parts[4]), float(parts[5]), float(parts[6])])  # 日期,收盘,成交量,成交额
             except (IndexError, ValueError):
                 continue
     if not frames:
         raise KeyError(f"{name} 无指数数据")
-    df = pd.DataFrame(frames, columns=["date", "close"])
+    df = pd.DataFrame(frames, columns=["date", "close", "volume", "amount"])
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna().drop_duplicates("date").sort_values("date")
     df = df[(df["date"] >= pd.to_datetime(start_date))]
-    return pd.Series(df["close"].values, index=df["date"].values, name="close").astype(float)
+    df = df.set_index("date")
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
+    df["amount"] = df["amount"].astype(float)
+    return df
 
 
-def _get_concept_close(name: str) -> pd.Series:
-    """概念指数日收盘序列(本地缓存 TTL,失败重试)。"""
+def _load_concept_daily(name: str) -> pd.DataFrame:
+    """概念指数日线 DataFrame(index=date, close/volume/amount), 本地缓存 TTL+失败重试。"""
     code = _name_to_code().get(name)
     if code is None:
         raise KeyError(name)
@@ -317,20 +322,35 @@ def _get_concept_close(name: str) -> pd.Series:
     if os.path.exists(path) and time.time() - os.path.getmtime(path) <= config.CACHE_TTL_SECONDS:
         try:
             with open(path, "rb") as f:
-                return pickle.load(f)
+                obj = pickle.load(f)
+            if isinstance(obj, pd.Series):  # 旧版缓存只有 close,重新抓取
+                pass
+            elif isinstance(obj, pd.DataFrame) and {"close", "volume"}.issubset(obj.columns):
+                return obj
         except Exception:
             pass
     last = None
     for i in range(4):
         try:
-            close = _fetch_index_close_by_code(code, name, _INDEX_START)
+            df = _fetch_index_close_by_code(code, name, _INDEX_START)
             with open(path, "wb") as f:
-                pickle.dump(close, f)
-            return close
+                pickle.dump(df, f)
+            return df
         except Exception as e:  # noqa: BLE001
             last = e
             time.sleep(1.5 * (i + 1))
     raise last
+
+
+def _get_concept_daily(name: str) -> pd.DataFrame:
+    """概念指数日线 DataFrame(含 close/volume/amount),用于板块量能等。"""
+    return _load_concept_daily(name)
+
+
+def _get_concept_close(name: str) -> pd.Series:
+    """概念指数日收盘序列(兼容旧调用方,从日线 DataFrame 取 close)。"""
+    df = _load_concept_daily(name)
+    return df["close"]
 
 
 # ---------------------------------------------------------------- 特征装配
