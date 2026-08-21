@@ -417,14 +417,16 @@ def mainline_select() -> dict:
             item["ladder_tag"] = r.get("ladder_tag")
             item["size_bias"] = r.get("size_bias", 0)
             item["market_style_tag"] = style_tag
-        # 板块量能修正:放量涨加分、缩量涨减分(缩量普涨的板块不追高),幅度受配置约束
+        # 板块量能修正:以平量(1.0)为零点——放量加分、缩量减分(缩量普涨的板块不追高)
         vadj = dcfg.get("volume_adj", {})
         if vadj.get("enabled", True) and stats and stats.get("volume_ratio") is not None:
             vr = stats["volume_ratio"]
             lo, hi = vadj.get("range", (0.5, 2.0))
             max_d = float(vadj.get("max_delta", 3.0))
-            base = min(max(vr, lo), hi) / hi  # 0.25~1.0
-            delta = (base - 0.75) * 2.0 * max_d  # 量比居中(0.75分)时修正0,放量加分/缩量减分
+            vr_c = min(max(vr, lo), hi)
+            # 缩量侧在 lo 处扣满 -max_d,放量侧在 hi 处加满 +max_d,平量(1.0)修正 0
+            span = (hi - 1.0) if vr_c >= 1.0 else (1.0 - lo)
+            delta = (vr_c - 1.0) / span * max_d if span > 0 else 0.0
             item["score"] = round(r["score"] + delta, 2)
             item["volume_adj"] = round(delta, 2)
         if item["score"] >= mline.get("pass_score", 60.0):
