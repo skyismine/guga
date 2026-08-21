@@ -25,12 +25,8 @@ import requests
 
 from app import config
 
-# 强制直连(绕开系统代理对 eastmoney 的干扰),放行后 akshare 各源直连
-try:
-    import requests as _req
-    _req.sessions.Session.trust_env = False
-except Exception:
-    pass
+# 强制直连补丁已集中到 app/__init__.py(包装 Session.__init__ 关闭 trust_env);
+# 此处不再重复设置——类属性方式会被 Session.__init__ 的实例属性覆盖而失效。
 
 _REVIEW_DIR = os.path.join(config.DATA_DIR, "review")
 os.makedirs(_REVIEW_DIR, exist_ok=True)
