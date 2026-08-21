@@ -11,6 +11,9 @@
 原则:纯增量、只读复用现有接口;所有阈值可配置;输出中性合规。
 """
 import datetime as dt
+import json
+import os
+import time
 
 from app import config
 from app.support import settings as _st
@@ -28,6 +31,12 @@ def _today() -> str:
 
 
 _sector_stats_cache = {}  # name -> (date, result)
+
+# 盘中量能采样存档:{date: {"HH:MM": 两市累计成交额(亿)}} —— 「相同时段」量能比的数据基础
+_VOL_ARCH_FILE = os.path.join(config.DATA_DIR, "intraday_amount.json")
+_VR_SMOOTH = []      # 大盘量能比5分钟滚动窗口 [(ts, vr)]
+_SEC_VR_SMOOTH = {}  # 板块量能比5分钟滚动窗口 {name: [(ts, vr)]}
+_SEC_ADJ_LAST = {}   # 板块量能修正滞回记忆 {name: (vr_used, delta)}
 
 
 def _sector_stats(name: str) -> dict | None:
@@ -81,34 +90,150 @@ def _sector_stats_many(names: list, max_workers: int = 8) -> dict:
     return result
 
 
+def _sector_volume_adj(name: str, vr_raw: float, pct_chg, gain3, grade: str):
+    """板块量能修正 delta(固化规则),返回 (delta, 平滑后量能比)。
+
+    - 涨跌方向绑定(修复放量下跌加分漏洞):上涨放量正修(0~+2)/缩量小负修(0~-1);
+      下跌放量大幅负修(0~-3,出货信号)/缩量小正修(0~+0.6,抛压衰竭);
+    - 滞回:平滑后量能比波动 <0.05 沿用上次 delta,过滤盘中微小毛刺;
+    - 过热保护:近3日累计涨幅 >=15% 仅保留负向修正,防高位出货板块被推升排名;
+    - 大盘环境联动:A/B/C-D 级修正幅度分别 100%/80%/50%(弱市降低量能噪声干扰);
+    - 输入量能比先做5分钟滚动窗口均值平滑,原始瞬时值不参与打分。
+    """
+    _VR_LO, _VR_HI, _MAX = 0.5, 2.0, 2.0   # 量能比截断区间与最大修正幅度(分)
+    _UP_WEAK, _DN_HEAVY, _DN_MILD = 0.5, 1.5, 0.3  # 方向系数:涨缩量/跌放量/跌缩量
+    _HYST, _HOT, _SMOOTH_SEC = 0.05, 0.15, 300     # 滞回阈值/过热涨幅线/平滑窗口
+    _SCALE = {"A": 1.0, "B": 0.8, "C": 0.5, "D": 0.5}
+    now = time.time()
+    buf = [x for x in _SEC_VR_SMOOTH.get(name, []) if now - x[0] <= _SMOOTH_SEC]
+    buf.append((now, float(vr_raw)))
+    _SEC_VR_SMOOTH[name] = buf[-64:]
+    vr = sum(v for _, v in buf) / len(buf)
+    vr_c = max(_VR_LO, min(vr, _VR_HI))
+    up = (pct_chg or 0.0) > 0
+    if up:
+        # 上涨:放量正向修正,缩量小幅负向修正(无量上涨不可持续)
+        base = (_MAX * (vr_c - 1.0) / (_VR_HI - 1.0) if vr_c >= 1.0
+                else -_UP_WEAK * _MAX * (1.0 - vr_c) / (1.0 - _VR_LO))
+    else:
+        # 下跌:放量大幅负向修正(放量出货),缩量小幅正向修正(抛压衰竭)
+        base = (-_DN_HEAVY * _MAX * (vr_c - 1.0) / (_VR_HI - 1.0) if vr_c >= 1.0
+                else _DN_MILD * _MAX * (1.0 - vr_c) / (1.0 - _VR_LO))
+    if (gain3 or 0.0) >= _HOT:
+        base = min(base, 0.0)  # 过热保护:只许扣分不许加分
+    delta = base * _SCALE.get(grade or "B", 0.8)
+    last = _SEC_ADJ_LAST.get(name)
+    if last and abs(vr - last[0]) < _HYST:
+        delta = last[1]        # 滞回:波动太小沿用上次修正
+    else:
+        _SEC_ADJ_LAST[name] = (vr, delta)
+    return round(delta, 2), round(vr, 3)
+
+
 # ---------------------------------------------------------------- 第一层 大盘开仓许可评级
-def _market_score(fg, adv_ratio, zt, amount_yi, w, vol_ratio=None, vol_cfg=None,
-                  vol_incomplete=False) -> float:
+def _market_vol_ratio(rows: list, amount_yi):
+    """大盘量能比 = 截至当前时段累计成交额 / 近5日相同时段平均成交额。
+
+    盘中每次计算把「时刻->累计成交额」写入本地存档,滚动积累相同时段历史,
+    取消按交易进度折算全天成交额的预测逻辑;收盘后/非交易时段直接对比
+    近5日全天均额。输出前做5分钟滚动窗口均值平滑——原始瞬时值仅用于
+    前端展示,不参与打分(抑制盘中评分高频抖动)。
+    """
+    _ARCH_KEEP_DAYS = 7   # 存档保留天数(只需覆盖近5个交易日)
+    _SMOOTH_SEC = 300     # 滚动平滑窗口=5分钟
+    if not amount_yi:
+        return None, None
+    now = dt.datetime.now()
+    hm = now.strftime("%H:%M")
+    # 交易时段含午休(9:30-15:00):午休期间累计成交额静止,仍属「盘中口径」
+    in_session = now.weekday() < 5 and 9 * 60 + 30 <= now.hour * 60 + now.minute <= 15 * 60
+    try:
+        with open(_VOL_ARCH_FILE, encoding="utf-8") as f:
+            arch = json.load(f)
+    except Exception:  # noqa: BLE001
+        arch = {}
+    arch = {d: v for d, v in arch.items() if d >= (dt.date.today() - dt.timedelta(days=_ARCH_KEEP_DAYS)).isoformat()}
+    if in_session:
+        arch.setdefault(_today(), {})[hm] = round(float(amount_yi), 1)
+        try:
+            with open(_VOL_ARCH_FILE, "w", encoding="utf-8") as f:
+                json.dump(arch, f, ensure_ascii=False)
+        except OSError:
+            pass
+    # 分母:过去5个交易日相同时段的累计成交额(取当日存档中<=当前时刻的最近一条);
+    # 冷启动/收盘后无同时段存档时,统一回退近5日全天均额(随存档积累自动收敛)
+    samples = []
+    if in_session:
+        for d in sorted(k for k in arch if k < _today())[-5:]:
+            earlier = [float(v) for k, v in sorted(arch[d].items()) if k <= hm]
+            if earlier:
+                samples.append(earlier[-1])
+    if not samples:
+        samples = [float(r["amount_yi"]) for r in rows[:-1] if r.get("amount_yi")][-5:]
+    if not samples or sum(samples) <= 0:
+        return None, None
+    vr_raw = float(amount_yi) / (sum(samples) / len(samples))
+    t = time.time()
+    _VR_SMOOTH[:] = [(x, v) for x, v in _VR_SMOOTH if t - x <= _SMOOTH_SEC]
+    _VR_SMOOTH.append((t, vr_raw))
+    return sum(v for _, v in _VR_SMOOTH) / len(_VR_SMOOTH), vr_raw
+
+
+def _volume_price_score(vr, pct_chg):
+    """量价配合分(0~5分):涨放量满分/涨缩量线性扣/跌放量重罚40%/跌缩量70%。
+
+    修复原「只看量不看价」漏洞——放量下跌是出货信号不能加分,缩量上涨
+    缺乏增量资金需按比例扣分;量在价先,量价同向才给高分。
+    """
+    _FULL, _VR_FLOOR = 5.0, 0.5   # 满分与缩量线性扣分的下限(量能比0.5得半分)
+    _DN_HEAVY, _DN_MILD = 0.4, 0.7  # 下跌时量能项得分系数:放量出货40%/缩量惜售70%
+    if vr is None:
+        return None
+    if (pct_chg or 0.0) > 0:
+        # 上涨:放量(vr>=1)拿满分,缩量按比例线性扣分
+        return round(_FULL * max(_VR_FLOOR, min(float(vr), 1.0)), 2)
+    return round(_FULL * (_DN_HEAVY if vr >= 1.0 else _DN_MILD), 2)
+
+
+def _trend_score(closes):
+    """趋势强度分(0~20分)=中性基准10 + 20日涨跌幅(±6) + 均线多空排列(±4)。
+
+    用20日慢趋势对冲恐贪情绪的高频波动:趋势向上高分、震荡中性、破位低分,
+    稳定大盘评级,避免单日情绪脉冲导致 A/D 级反复切换。返回 (得分, 说明)。
+    """
+    _BASE, _RET_PTS, _ALIGN_PTS = 10.0, 6.0, 4.0
+    _RET_SPAN = 0.08  # 20日涨跌幅 ±8% 打满 ±6 分
+    vals = [float(x) for x in (closes or []) if x]
+    if len(vals) < 21:
+        return _BASE, "数据不足,按中性计"
+    ret20 = vals[-1] / vals[-21] - 1
+    ma5, ma20 = sum(vals[-5:]) / 5.0, sum(vals[-20:]) / 20.0
+    if vals[-1] > ma5 > ma20:
+        align, tag = _ALIGN_PTS, "多头排列"
+    elif vals[-1] < ma5 < ma20:
+        align, tag = -_ALIGN_PTS, "空头排列"
+    else:
+        align, tag = 0.0, "均线纠缠"
+    pts = _BASE + _RET_PTS * max(-1.0, min(1.0, ret20 / _RET_SPAN)) + align
+    return round(max(0.0, min(20.0, pts)), 1), f"20日{ret20:+.1%},{tag}"
+
+
+def _market_score(fg, adv_ratio, zt, vp, trend) -> float:
+    """大盘评分(总分固定100)=恐贪30+宽度25+涨停20+量价配合5+趋势强度20。
+
+    权重直接固化,不读外部配置;恐贪从40降至30并新增趋势20分,
+    以慢变量稳定评级。vp/trend 缺失时按中性值计入,不中断打分。
+    """
+    _W_MOOD, _W_BREADTH, _W_ZT, _W_VP, _W_TREND = 30.0, 25.0, 20.0, 5.0, 20.0
     s = 0.0
     if fg is not None:
-        s += max(0.0, min(float(fg), 100.0)) / 100.0 * w.get("mood", 40)
+        s += max(0.0, min(float(fg), 100.0)) / 100.0 * _W_MOOD
     if adv_ratio is not None:
-        s += min(max(float(adv_ratio), 0.0), 2.0) / 2.0 * w.get("breadth", 25)
+        s += min(max(float(adv_ratio), 0.0), 2.0) / 2.0 * _W_BREADTH
     if zt is not None:
-        s += min(max(int(zt), 0), 80) / 80.0 * w.get("zt", 20)
-    # 成交额:线性映射;量能比:以1.0为基准(平量),vr<1 缩量显著减分,>1 放量加分
-    amt_w = w.get("amount", 15)
-    vol_used_w = 0.0
-    if vol_ratio is not None and vol_cfg and vol_cfg.get("enabled", True):
-        vol_w = float(vol_cfg.get("weight", 10))
-        if vol_incomplete:  # 盘中折算的量能比可信度低,权重减半
-            vol_w *= 0.5
-        lo, hi = vol_cfg.get("range", (0.5, 2.0))
-        vr_c = min(max(float(vol_ratio), lo), hi)
-        # 缩量(vr<1)线性降至下限分,平量(1.0)得满分,放量封顶满分
-        s += min(vr_c / 1.0, 1.0) * vol_w
-        vol_used_w = vol_w
-        amt_w = max(0.0, amt_w - vol_used_w)  # 量能权重从 amount 项借调,总分保持 100
-    if amount_yi is not None:
-        base = _cfg().get("min_amount_yi", 10000.0)
-        s += min(max(float(amount_yi), 0.0), base) / base * amt_w
-    else:
-        s += amt_w * 0.6  # 成交额缺失按中性 60% 计
+        s += min(max(int(zt), 0), 80) / 80.0 * _W_ZT
+    s += vp if vp is not None else _W_VP * 0.6          # 量价分缺失按中性60%计
+    s += trend if trend is not None else _W_TREND / 2.0  # 趋势分缺失按中性50%计
     return round(min(s, 100.0), 1)
 
 
@@ -137,45 +262,20 @@ def market_permit() -> dict:
     if adv is not None and dec:
         adv_ratio = adv / dec if dec else None
     amount_yi = None
-    vol_ratio = None
-    vol_cfg = dcfg.get("market_volume", {})
-    vol_incomplete = False
+    vol_ratio = vol_raw = vp = trend = trend_note = None
     try:
         from app.review.data import collect_market_daily
-        from app.features.market_features import _is_trading_time
-        rows = collect_market_daily(10)
+        rows = collect_market_daily(30)  # 30行:趋势分需21日收盘序列
         if rows:
             amount_yi = rows[-1].get("amount_yi")
-            # 量能比:当日两市成交额 / 近N日成交额均值(识别缩量/放量)
-            # 盘中当日成交额未完整,按时间进度折算到全天口径
-            window = int(vol_cfg.get("window", 5))
-            if len(rows) >= window + 1:
-                cur = rows[-1].get("amount_yi")
-                prevs = [r.get("amount_yi") for r in rows[-window - 1:-1]]
-                prevs = [v for v in prevs if v]
-                if cur and prevs:
-                    avg = sum(prevs) / len(prevs)
-                    if avg > 0:
-                        vol_ratio = cur / avg
-                        if _is_trading_time():
-                            # 盘中:折算全天=当前累计/交易进度(9:30-11:30+13:00-15:00)
-                            vol_incomplete = True
-                            now = dt.datetime.now()
-                            mins = 0
-                            hm = now.hour * 60 + now.minute
-                            if hm <= 11 * 60 + 30:
-                                mins = hm - (9 * 60 + 30)
-                            else:
-                                mins = 120 + (hm - (13 * 60))
-                            progress = mins / 240.0
-                            if 0 < progress < 1:
-                                vol_ratio = cur / progress / avg
+            # 量能比:相同时段对比 + 5分钟滚动平滑;量价配合分绑定大盘涨跌方向
+            vol_ratio, vol_raw = _market_vol_ratio(rows, amount_yi)
+            vp = _volume_price_score(vol_ratio, rows[-1].get("pct_chg"))
+            trend, trend_note = _trend_score([r.get("close") for r in rows])
     except Exception:  # noqa: BLE001
         pass
 
-    score = _market_score(fg, adv_ratio, zt, amount_yi, rules.get("weights", {}),
-                          vol_ratio=vol_ratio, vol_cfg=vol_cfg,
-                          vol_incomplete=vol_incomplete)
+    score = _market_score(fg, adv_ratio, zt, vp, trend)
     grade = _grade(score, zt, adv_ratio, rules)
     cap = rules["cap"].get(grade, 0.1)
     checks = {
@@ -187,14 +287,16 @@ def market_permit() -> dict:
                        "ok_min": adv_ratio is not None and adv_ratio >= rules["adv_ratio_ok"]},
     }
     reasons = []
-    reasons.append(f"恐贪指数 {fg:.0f} 分({fear_greed_label(fg)}),贡献评分 {fg / 100 * rules['weights']['mood']:.0f}/{rules['weights']['mood']}")
+    reasons.append(f"恐贪指数 {fg:.0f} 分({fear_greed_label(fg)}),贡献评分 {fg / 100 * 30:.0f}/30")
     reasons.append(f"涨停 {zt} 家 / 上涨 {adv} 家 vs 下跌 {dec} 家,家数比 {adv_ratio:.2f}")
     if amount_yi:
         reasons.append(f"两市成交额 {amount_yi:,.0f} 亿")
     if vol_ratio is not None:
         tag = "放量" if vol_ratio >= 1.05 else ("缩量" if vol_ratio <= 0.95 else "平量")
-        suffix = "(盘中按进度折算)" if vol_incomplete else ""
-        reasons.append(f"量能比 {vol_ratio:.2f}{suffix}({tag},当日/近{vol_cfg.get('window', 5)}日均)")
+        reasons.append(f"量能比 {vol_ratio:.2f}({tag},对比近5日)"
+                       + (f",量价配合分 {vp}/5" if vp is not None else ""))
+    if trend is not None:
+        reasons.append(f"趋势强度 {trend}/20({trend_note})")
     reasons.append(f"大盘综合评分 {score},达 {grade} 级标准(总仓位上限 {cap:.0%})")
     return {
         "grade": grade,
@@ -203,7 +305,8 @@ def market_permit() -> dict:
         "cap": cap,
         "score": score, "fear_greed": fg, "fear_greed_label": fear_greed_label(fg),
         "limit_up": zt, "advance": adv, "decline": dec, "adv_ratio": adv_ratio,
-        "amount_yi": amount_yi, "vol_ratio": vol_ratio, "checks": checks, "reasons": reasons,
+        "amount_yi": amount_yi, "vol_ratio": vol_ratio, "vol_ratio_raw": vol_raw,
+        "vp_score": vp, "trend_score": trend, "checks": checks, "reasons": reasons,
         "date": str(snap.get("market_date") or _today()),
     }
 
@@ -350,7 +453,8 @@ def _value_notes(it: dict, vcfg: dict) -> str:
     zt = f"{it.get('zt_count') or 0} 家涨停形成板块效应" if (it.get("zt_count") or 0) > 0 else "板块个股活跃"
     vr = it.get("volume_ratio")
     if vr is not None:
-        vtag = "放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")
+        vtag = ("放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")) \
+            + ("上涨" if (it.get("pct_chg") or 0) > 0 else "下跌")
         zt += f",量能{vtag}(比 {vr:.2f})"
     if pos == "低位启动":
         lead = "资金技术双共振,低位启动持续性强"
@@ -377,6 +481,11 @@ def mainline_select() -> dict:
     rows = _ml.sector_scores(use_cache=True)
     zt_pool = _ml._zt_pool()
     zt_available = len(zt_pool) > 0  # 涨停池为空视为数据缺失,跳过涨停家数否决项
+    # 大盘环境联动:量能修正幅度随大盘评级缩放(A/B/C-D -> 100%/80%/50%)
+    try:
+        mkt_grade = market_permit().get("grade")
+    except Exception:  # noqa: BLE001
+        mkt_grade = None
     # ---- 第五轮:扩展因子(风格偏转排序 + 标签字段) ----
     ext_cfg = _ml._extend_cfg()
     style = _ml.market_style_bias() if ext_cfg else None
@@ -417,32 +526,31 @@ def mainline_select() -> dict:
             item["ladder_tag"] = r.get("ladder_tag")
             item["size_bias"] = r.get("size_bias", 0)
             item["market_style_tag"] = style_tag
-        # 板块量能修正:以平量(1.0)为零点——放量加分、缩量减分(缩量普涨的板块不追高)
-        vadj = dcfg.get("volume_adj", {})
-        if vadj.get("enabled", True) and stats and stats.get("volume_ratio") is not None:
-            vr = stats["volume_ratio"]
-            lo, hi = vadj.get("range", (0.5, 2.0))
-            max_d = float(vadj.get("max_delta", 3.0))
-            vr_c = min(max(vr, lo), hi)
-            # 缩量侧在 lo 处扣满 -max_d,放量侧在 hi 处加满 +max_d,平量(1.0)修正 0
-            span = (hi - 1.0) if vr_c >= 1.0 else (1.0 - lo)
-            delta = (vr_c - 1.0) / span * max_d if span > 0 else 0.0
+        # 板块量能修正(固化规则):方向绑定+滞回+过热保护+大盘联动,见 _sector_volume_adj
+        if stats and stats.get("volume_ratio") is not None:
+            delta, vr_smooth = _sector_volume_adj(
+                r["industry"], stats["volume_ratio"], r.get("pct_chg"),
+                (stats or {}).get("gain3"), mkt_grade)
+            item["volume_ratio"] = vr_smooth
             item["score"] = round(r["score"] + delta, 2)
-            item["volume_adj"] = round(delta, 2)
+            item["volume_adj"] = delta
         if item["score"] >= mline.get("pass_score", 60.0):
             item["reasons"] = _pass_reasons(r, stats, item["score"])
             if item.get("volume_adj"):
-                vr = stats.get("volume_ratio") or 0
-                tag = "放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")
-                item["reasons"].insert(0, f"板块量能比 {vr:.2f}({tag}),评分{'上调' if item['volume_adj'] > 0 else '下调'} {abs(item['volume_adj']):.1f} 分")
+                vr = item["volume_ratio"] or 0
+                vtag = ("放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")) \
+                    + ("上涨" if (r.get("pct_chg") or 0) > 0 else "下跌")
+                item["reasons"].insert(0, f"板块量能比 {vr:.2f}({vtag}),评分{'上调' if item['volume_adj'] > 0 else '下调'} {abs(item['volume_adj']):.1f} 分")
             item["pool"] = _sector_pool(r["industry"])
             passed.append(item)
         else:
             item["level"] = "watch"
             vtxt = ""
-            if stats.get("volume_ratio") is not None:
-                vtag = "放量" if stats["volume_ratio"] >= 1.05 else ("缩量" if stats["volume_ratio"] <= 0.95 else "平量")
-                vtxt = f"(量能比 {stats['volume_ratio']:.2f} {vtag},量能修正 {item.get('volume_adj') or 0:+.1f} 分)"
+            if item.get("volume_ratio") is not None:
+                vr = item["volume_ratio"]
+                vtag = ("放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")) \
+                    + ("上涨" if (r.get("pct_chg") or 0) > 0 else "下跌")
+                vtxt = f"(量能比 {vr:.2f} {vtag},量能修正 {item.get('volume_adj') or 0:+.1f} 分)"
             item["reasons"] = [f"综合评分 {item['score']} 分,低于准入线 {mline.get('pass_score', 60.0)} 分,仅跟踪{vtxt}"]
             low.append(item)
 
