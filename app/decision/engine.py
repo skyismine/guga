@@ -439,7 +439,11 @@ def mainline_select() -> dict:
             passed.append(item)
         else:
             item["level"] = "watch"
-            item["reasons"] = [f"综合评分 {item['score']} 分,低于准入线 {mline.get('pass_score', 60.0)} 分,仅跟踪"]
+            vtxt = ""
+            if stats.get("volume_ratio") is not None:
+                vtag = "放量" if stats["volume_ratio"] >= 1.05 else ("缩量" if stats["volume_ratio"] <= 0.95 else "平量")
+                vtxt = f"(量能比 {stats['volume_ratio']:.2f} {vtag},量能修正 {item.get('volume_adj') or 0:+.1f} 分)"
+            item["reasons"] = [f"综合评分 {item['score']} 分,低于准入线 {mline.get('pass_score', 60.0)} 分,仅跟踪{vtxt}"]
             low.append(item)
 
     # ---- 属性池内分级(禁止跨池对比);第五轮:风格偏转仅调整同池相邻且分差小的排序
