@@ -527,74 +527,217 @@ def _sector_size_bias(name: str, zt: list, cons: list, lcfg: dict) -> int:
 
 
 _style_cache = {"date": None, "data": None}
+# 风格滞回状态持久化:记录上一交易日终态,支撑跨日状态记忆(进程重启不丢)
+_STYLE_STATE_FILE = os.path.join(config.DATA_DIR, "style_state.json")
+
+
+def _style_hysteresis(prev: int, diff: float, enter: float, exit_: float) -> int:
+    """风格滞回状态机:进入用全阈值,退出用更窄的退出线。
+
+    设计目的:消除临界点抖动——均衡态需 |diff|>=enter 才切入风格态;
+    已处风格态时需回落到 |diff|<exit_ 才切回均衡(enter=2%时 exit_=1.5%,
+    中间形成0.5pct滞回带)。大盘↔小盘不直接互切,须经均衡态过渡。
+    """
+    if prev == 1:
+        return 1 if diff >= exit_ else 0
+    if prev == -1:
+        return -1 if diff <= -exit_ else 0
+    if diff >= enter:
+        return 1
+    if diff <= -enter:
+        return -1
+    return 0
+
+
+def _style_dyn_threshold(big_c, small_c, lookback: int, base: float,
+                         anchor: float, floor: float, cap: float) -> float:
+    """动态阈值:过去 lookback 日「小盘-大盘」日收益差标准差定标。
+
+    设计目的:高波动市放宽阈值防噪声误切,低波动市收紧阈值保灵敏度;
+    std=anchor 时阈值恰为 base,结果钳制在 [floor,cap];历史不足或
+    std 异常时回退基准阈值。
+    """
+    n = min(len(big_c), len(small_c))
+    if n < lookback + 1:
+        return base
+    d = (small_c.iloc[-n:].pct_change() - big_c.iloc[-n:].pct_change()).dropna()
+    std = float(d.tail(lookback).std()) if len(d) else 0.0
+    if not std or std <= 0:
+        return base
+    return min(max(base * std / anchor, floor), cap)
+
+
+def _style_turnover_ok(small_amt: dict, total_amt: dict, win: int) -> bool:
+    """资金面交叉验证:小盘成交额占全市场比近 win 日均值是否高于前 win 日。
+
+    设计目的:过滤纯价格脉冲假信号——小盘走强须有成交额占比同步抬升佐证;
+    两序列按日期对齐取交集,重叠样本不足或分母异常时返回 False(不放行)。
+    注:分子分母单位口径不影响结论,占比趋势具有尺度不变性。
+    """
+    common = sorted(set(small_amt) & set(total_amt))[-(win * 2):]
+    shares = [small_amt[d] / total_amt[d] for d in common if total_amt[d] > 0]
+    if len(shares) < win + 2:
+        return False
+    return sum(shares[-win:]) > sum(shares[:-win])
 
 
 def market_style_bias(refresh: bool = False) -> dict:
-    """全局大小盘风格偏转(沪深300 vs 中证2000 相对动量)。
+    """全局大小盘风格偏转(P0+P1 固化逻辑,沪深300 vs 中证1000 相对动量差)。
 
-    返回 {bias, tag, mom, rel_score, date}:bias∈{-1,0,1} = 大盘/均衡/小盘。
-    数据源:小盘指数优先中证2000(东财 932000);东财被限流/新浪无该指数时,
-    依次退化为中证1000(sh000852)/中证500(sh000905)作小盘代理(输出 small_symbol 标注),
-    大盘指数为沪深300(sh000300)。全部不可用时降级为 0(均衡),不影响打分。
+    判定链路(唯一执行路径,无配置开关):
+    - 合成差值 D = 30%×10日相对动量 + 70%×20日相对动量(强化中期趋势,抑制短期脉冲);
+    - 动态阈值 T:60日相对日收益差标准差定标(基准2%/锚1%),钳制[1%,3%];
+    - 滞回状态机:见 _style_hysteresis;上一交易日状态持久化到 style_state.json;
+    - 资金面交叉验证:切入风格态须近5日小盘成交额占全市场比抬升(纯价格脉冲
+      不放行);维持原状态免验;
+    - 降级约束:小盘基准固化中证1000;中证2000仅作参考不参与计算;退化到
+      中证500 时可信度=low 并强制均衡(bias=0 即关闭排序微调);数据全失回退均衡。
+    返回兼容原有 {bias,tag,mom,rel_score,date,big_symbol,small_symbol},
+    新增 {style,style_diff_pct,style_confidence,turnover_support}(上层可忽略)。
     """
+    # ---- 固化参数 ----
+    _MOM_DAYS = (10, 20)
+    _MOM_WEIGHTS = (0.3, 0.7)      # 周期权重:短周期30% + 中期70%
+    _BASE_THRESH = 0.02            # 基准进入阈值2%
+    _VOL_LOOKBACK = 60             # 波动率回看窗口(日)
+    _VOL_ANCHOR = 0.01             # 波动率锚:日收益差std=1%时阈值=基准
+    _THRESH_FLOOR, _THRESH_CAP = 0.01, 0.03   # 阈值上下限1%~3%
+    _EXIT_RATIO = 0.75             # 退出线=进入阈值×75%(基准2%→退出1.5%)
+    _TURN_WIN = 5                  # 成交额占比抬升验证窗口:近5日 vs 前5日
+    _MIN_HIST = 21                 # 动量计算最少样本数
+
     global _style_cache
     today = _today()
     if not refresh and _style_cache["date"] == today and _style_cache["data"]:
         return _style_cache["data"]
-    out = {"bias": 0, "tag": "均衡", "mom": {}, "rel_score": 0.0, "date": today,
-           "big_symbol": "", "small_symbol": ""}
+
+    def _blank() -> dict:
+        return {"bias": 0, "tag": "均衡", "mom": {}, "rel_score": 0.0, "date": today,
+                "big_symbol": "", "small_symbol": "", "style": "balance",
+                "style_diff_pct": 0.0, "style_confidence": "low",
+                "turnover_support": False}
+
+    out = _blank()
     try:
         import akshare as ak
-        scfg = _extend_cfg().get("style") or {}
-        if not scfg.get("enabled", True):
-            _style_cache.update(date=today, data=out)
-            return out
-        days = scfg.get("mom_days") or [10, 20]
-        weights = scfg.get("mom_weight") or [0.5] * len(days)
 
-        def _em_close(symbol: str):
-            df = ak.index_zh_a_hist(symbol=symbol, period="daily")
-            return pd.to_numeric(df["收盘"], errors="coerce").dropna()
+        def _em_hist(symbol: str):
+            df = ak.index_zh_a_hist(symbol=symbol, period="daily").tail(90)
+            return df.rename(columns={"日期": "date", "收盘": "close",
+                                      "成交额": "amount", "成交量": "volume"})
 
-        def _sina_close(symbol: str):
+        def _sina_hist(symbol: str):
             from app.data.market import get_index_history
-            return get_index_history(symbol)["close"]
+            return get_index_history(symbol, days=90)
 
-        def _close_chain(em: tuple, sinas: tuple):
-            for s in em:
+        def _hist_chain(em_syms: tuple, sina_syms: tuple):
+            """依次尝试东财/新浪取指数日线,返回 (df, symbol, source)。"""
+            for s in em_syms:
                 try:
-                    return _em_close(s), s
+                    df = _em_hist(s)
+                    if len(df) >= _MIN_HIST:
+                        return df, s, "em"
                 except Exception:  # noqa: BLE001
                     continue
-            for s in sinas:
+            for s in sina_syms:
                 try:
-                    return _sina_close(s), s
+                    df = _sina_hist(s)
+                    if len(df) >= _MIN_HIST:
+                        return df, s, "sina"
                 except Exception:  # noqa: BLE001
                     continue
-            return None, None
+            return None, None, None
 
-        big, bsym = _close_chain(("000300",), ("sh000300",))
-        small, ssym = _close_chain(("932000",),
-                                   ("sh932000", "sz932000", "sh000852", "sh000905"))
-        need = max(days) + 1
-        if big is None or small is None or len(big) < need or len(small) < need:
+        def _amt_map(df, col: str) -> dict:
+            """取成交额/成交量序列为 {YYYY-MM-DD: value};无该列返回空。"""
+            if col not in getattr(df, "columns", ()):
+                return {}
+            if "date" in df.columns:
+                pairs = zip(df["date"].astype(str), pd.to_numeric(df[col], errors="coerce"))
+            else:
+                pairs = zip(df.index.astype(str), pd.to_numeric(df[col], errors="coerce"))
+            return {str(k)[:10]: float(v) for k, v in pairs if v == v}
+
+        big_df, bsym, _src = _hist_chain(("000300",), ("sh000300",))
+        # 小盘基准固化中证1000(保证口径稳定);仅当中证1000完全不可得才退化中证500
+        small_df, ssym, ssrc = _hist_chain(("000852",), ("sh000852",))
+        degraded_500 = False
+        if small_df is None:
+            small_df, ssym, ssrc = _hist_chain((), ("sh000905",))
+            degraded_500 = small_df is not None
+        if big_df is None or small_df is None:
             _style_cache.update(date=today, data=out)
             return out
-        out["big_symbol"], out["small_symbol"] = bsym, ssym
+
+        big_c = pd.to_numeric(big_df["close"], errors="coerce").dropna().reset_index(drop=True)
+        small_c = pd.to_numeric(small_df["close"], errors="coerce").dropna().reset_index(drop=True)
+        need = max(_MOM_DAYS) + 1
+        if len(big_c) < need or len(small_c) < need:
+            _style_cache.update(date=today, data=out)
+            return out
+
+        # ---- 合成相对动量差 D(正=小盘强):短周期30% + 中期70% ----
         rel = {}
-        for nd, wt in zip(days, weights):
-            r_big = big.iloc[-1] / big.iloc[-1 - nd] - 1
-            r_small = small.iloc[-1] / small.iloc[-1 - nd] - 1
-            rel[f"{nd}d"] = round(float(r_small - r_big), 4)   # 正=小盘强
-        score = sum(float(wt) * rel[f"{nd}d"] for nd, wt in zip(days, weights))
-        thresh = float(scfg.get("bias_thresh", 0.02))
-        if score >= thresh:
-            out["bias"], out["tag"] = 1, "小盘风格"
-        elif score <= -thresh:
-            out["bias"], out["tag"] = -1, "大盘风格"
+        for nd, wt in zip(_MOM_DAYS, _MOM_WEIGHTS):
+            r_big = float(big_c.iloc[-1] / big_c.iloc[-1 - nd] - 1)
+            r_small = float(small_c.iloc[-1] / small_c.iloc[-1 - nd] - 1)
+            rel[f"{nd}d"] = round(r_small - r_big, 4)
+        diff = sum(wt * rel[f"{nd}d"] for nd, wt in zip(_MOM_DAYS, _MOM_WEIGHTS))
+
+        # 中证2000仅作补充参考(数据完整时记录20日相对动量),不参与核心差值
+        ref2000 = None
+        try:
+            c2k = pd.to_numeric(_em_hist("932000")["close"], errors="coerce").dropna()
+            if len(c2k) > 20:
+                ref2000 = round(float(c2k.iloc[-1] / c2k.iloc[-21] - 1)
+                                - float(big_c.iloc[-1] / big_c.iloc[-21] - 1), 4)
+        except Exception:  # noqa: BLE001
+            ref2000 = None
+
+        # ---- 资金面交叉验证输入:小盘成交额(东财源)/成交量代理(新浪源) vs 全市场 ----
+        col = "amount" if (ssrc == "em" and "amount" in small_df.columns) else "volume"
+        total_amt = {}
+        try:
+            from app.review.data import collect_market_daily
+            total_amt = {str(r["date"])[:10]: float(r["amount_yi"])
+                         for r in collect_market_daily(15) if r.get("amount_yi")}
+        except Exception:  # noqa: BLE001
+            total_amt = {}
+        tsup = _style_turnover_ok(_amt_map(small_df, col), total_amt, _TURN_WIN)
+
+        # ---- 滞回状态机 + 切换门控 ----
+        thresh = _style_dyn_threshold(big_c, small_c, _VOL_LOOKBACK, _BASE_THRESH,
+                                      _VOL_ANCHOR, _THRESH_FLOOR, _THRESH_CAP)
+        rec = {}
+        try:
+            with open(_STYLE_STATE_FILE, encoding="utf-8") as f:
+                rec = json.load(f)
+        except Exception:  # noqa: BLE001
+            rec = {}
+        if rec.get("date") == today:
+            prev = int(rec.get("prev") or 0)   # 当日重算(进程重启):沿用当日入口状态,保证幂等
         else:
-            out["bias"], out["tag"] = 0, "均衡"
-        out["mom"], out["rel_score"] = rel, round(score, 4)
+            prev = int(rec.get("cur") or 0)    # 新交易日:以上一交易日终态为入口
+        cur = _style_hysteresis(prev, diff, thresh, thresh * _EXIT_RATIO)
+        if cur != prev and cur != 0 and not tsup:
+            cur = prev                          # 成交额未同步:纯价格脉冲不触发切换,维持原状态
+        if degraded_500:
+            cur, tsup = 0, False                # 口径失真保护:强制均衡并关闭排序微调
+
+        tagmap = {1: "小盘风格", -1: "大盘风格", 0: "均衡"}
+        out.update(bias=cur, tag=tagmap[cur], mom=rel, rel_score=round(diff, 4),
+                   big_symbol=bsym, small_symbol=ssym,
+                   style={1: "small_cap", -1: "large_cap", 0: "balance"}[cur],
+                   style_diff_pct=round(diff * 100, 2),
+                   style_confidence="low" if degraded_500 else "high",
+                   turnover_support=bool(tsup))
+        if ref2000 is not None:
+            out["ref2000_rel20"] = ref2000
+        try:
+            with open(_STYLE_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"date": today, "prev": prev, "cur": cur}, f, ensure_ascii=False)
+        except OSError:
+            pass
     except Exception as e:  # noqa: BLE001
         print(f"[mainline] market_style_bias 降级为均衡: {e}")
     _style_cache.update(date=today, data=out)

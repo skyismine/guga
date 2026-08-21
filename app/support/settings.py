@@ -101,11 +101,7 @@ DEFAULTS = {
                     "drop_confirm": 3,       # 梯队变差需连续N个快照周期确认(稳定器内生效)
                     "drop_delta": 0.25,      # ladder_score 降幅>=此值判定为梯队变差
                 },
-                "style": {                   # 全局大小盘风格偏转(仅池内排序,不改板块原始score)
-                    "enabled": True,
-                    "mom_days": [10, 20],    # 相对动量窗口(日)
-                    "mom_weight": [0.5, 0.5],# 窗口权重(与 mom_days 对齐)
-                    "bias_thresh": 0.02,     # 小盘-大盘相对动量差(小数,2%)判定风格
+                "style": {                   # 全局大小盘风格偏转(判定逻辑已固化在 mainline.market_style_bias)
                     "sort_bias_thresh": 3.0, # 同池板块分数差<=此值才启用风格偏转排序
                 },
             },

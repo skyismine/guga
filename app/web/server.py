@@ -2219,9 +2219,7 @@ _SETTING_FIELDS = [
         ("decision.mainline.extend_factor.ladder.gap_from_board", "断层判定起板位", "number", 2, 6, "最高连板>=此值才检查梯队断层"),
         ("decision.mainline.extend_factor.ladder.drop_confirm", "梯队变差确认周期N", "number", 1, 20, "盘中炸板导致梯队变差需连续N个快照周期确认(稳定器内生效)"),
         ("decision.mainline.extend_factor.ladder.drop_delta", "梯队变差判定阈值", "number", 0, 1, "ladder_score 降幅>=此值判定为梯队变差"),
-        ("decision.mainline.extend_factor.style.enabled", "风格偏转启用", "checkbox", None, None, "仅同池板块分数差<=阈值时按大小盘风格调整排序,不改板块原始score"),
-        ("decision.mainline.extend_factor.style.bias_thresh", "风格判定阈值", "number", 0, 0.1, "中证2000-沪深300相对动量差(小数,如0.02=2%)判定大盘/均衡/小盘"),
-        ("decision.mainline.extend_factor.style.sort_bias_thresh", "偏转排序分差阈值", "number", 0, 20, "同池板块分数差<=此值(分)才启用风格偏转排序"),
+        ("decision.mainline.extend_factor.style.sort_bias_thresh", "偏转排序分差阈值", "number", 0, 20, "同池板块分数差<=此值(分)才启用风格偏转排序(风格判定逻辑已固化)"),
     ]),
     ("标的匹配优化(第六轮)", [
         ("target_match.enable_target_stabilizer", "标的驻留防抖", "checkbox", None, None, "P0.1 连续N周期保持前2才晋升正式推荐,避免盘中标的频繁切换"),
