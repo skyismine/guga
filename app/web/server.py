@@ -38,7 +38,7 @@ from markupsafe import Markup as _Markup
 
 _SIDE_MENU = [("/decision", "decision", "🎯 今日决策"),
               ("/analyze", "home", "📈 走势预测"),
-              ("/report", "report", "📄 复盘报告"), ("/mainline", "mainline", "🔥 主线板块"),
+              ("/report", "report", "📄 复盘报告"),
               ("/portfolio", "portfolio", "💼 持仓诊断"),
               ("/alerts", "alerts", "🚨 盘中预警"), ("/settings", "settings", "⚙️ 系统设置")]
 
@@ -221,21 +221,6 @@ def _shell(active: str, title: str, content: str) -> str:
 <body>""" + _SIDE(active) +
             '<div class="wrap">' + content + '</div></body></html>')
 
-
-def _mainline_chart(items: list) -> str:
-    import plotly.graph_objects as go
-    import plotly.io as pio
-    top = items[:12]
-    fig = go.Figure(go.Bar(
-        x=[it["score"] for it in top][::-1],
-        y=[it["name"] for it in top][::-1], orientation="h",
-        marker_color=["#ef5350" if it["level"] == "core" else "#ffca28" if it["level"] == "branch" else "#5c6b80"
-                      for it in top][::-1]))
-    fig.update_layout(title="主线板块综合评分(Top12)", template="plotly_dark",
-                      height=520, margin=dict(l=10, r=10, t=40, b=10),
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    return pio.to_html(fig, full_html=False, include_plotlyjs="inline",
-                       default_width="100%", default_height="100%")
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1512,123 +1497,6 @@ def api_review():
     if c["err"]:
         return jsonify({"error": c["err"]}), 500
     return jsonify(_jsonable_review(c["data"]))
-
-
-# ============================================================ 模块1 主线板块
-_ML_CACHE = {"t": 0.0, "data": None, "err": None}
-_ML_TTL = 600
-
-
-def _get_mainline(refresh=False):
-    if refresh or _ML_CACHE["data"] is None or _ML_CACHE["err"] or \
-            _time.time() - _ML_CACHE["t"] > _ML_TTL:
-        from app.support import mainline as ml
-        try:
-            _ML_CACHE["data"] = ml.mainline_summary()
-            _ML_CACHE["err"] = None
-        except Exception as e:  # noqa: BLE001
-            _ML_CACHE["data"] = None
-            _ML_CACHE["err"] = str(e)
-        _ML_CACHE["t"] = _time.time()
-    return _ML_CACHE
-
-
-def _targets_html(t) -> str:
-    if not t:
-        return ""
-    if t.get("error"):
-        return f'<div class="mut">{_h(t["error"])}</div>'
-    parts = []
-    for s in t.get("stocks", []):
-        role = _h(s.get("role", ""))
-        name = _h(s.get("name", ""))
-        code = _h(s.get("code", ""))
-        extra = ""
-        if s.get("pct_chg") is not None:
-            extra += f' <span class="{"up" if s["pct_chg"] >= 0 else "down"}">{s["pct_chg"]:+.2f}%</span>'
-        if s.get("amount_yi"):
-            extra += f' <span class="mut">成交 {s["amount_yi"]} 亿</span>'
-        if s.get("amount_wan"):
-            extra += f' <span class="mut">成交 {s["amount_wan"]:.0f} 万</span>'
-        sig = ""
-        if s.get("p_up") is not None:
-            cls = {"buy": "b-buy", "sell": "b-sell", "hold": "b-hold"}.get(s.get("action") == "" and "hold" or "buy")
-            sig = (f' 上涨概率 {s["p_up"]:.0%} · 方向 {_h(s.get("direction", ""))} · '
-                   f'建议 <b>{_h(s.get("action", ""))}</b>')
-        lv = s.get("levels") or {}
-        levels = f' 支撑 {_h(lv.get("support"))} / 压力 {_h(lv.get("resistance"))}' if lv else ""
-        parts.append(f'<div class="line">• <span class="tag">{role}</span>{name} ({code}){extra}'
-                     f'<div class="mut" style="margin-left:0">{sig}{levels}</div></div>')
-    return "\n".join(parts)
-
-
-@app.route("/mainline")
-def page_mainline():
-    refresh = request.args.get("refresh") == "1"
-    c = _get_mainline(refresh=refresh)
-    if c["err"]:
-        return _shell("mainline", "主线板块",
-                      f'<header><h1>🔥 主线板块识别</h1><span class="mut">{c["err"]}</span></header>'
-                      f'<div class="card err">主线分析失败: {_h(c["err"])}'
-                      f' <a class="btn" href="/mainline?refresh=1">重试</a></div>')
-    d = c["data"]
-    fg = d.get("fear_greed")
-    mood = (f'<div class="pill">恐贪指数<b>{fg}</b><br><span class="mut">{_h(d.get("fear_greed_label"))}</span></div>'
-            if fg is not None else "")
-    cards = []
-    for it in d.get("items", []):
-        lv = {"core": "b-core", "branch": "b-branch", "watch": "b-watch"}.get(it["level"], "b-watch")
-        lab = {"core": "核心主线", "branch": "补涨支线", "watch": "观察"}.get(it["level"], "观察")
-        zt = f"涨停 {it.get('zt_count', 0)} 家" if it.get("zt_count") else ""
-        news = f'<span class="tag">📰 电报 {it["news_hits"]} 次</span>' if it.get("news_hits") else ""
-        fund = ""
-        if it.get("fund_score") is not None:
-            st = {"持续流入": "up", "流入转弱": "down", "流出": "down"}.get(it.get("fund_status"), "mut")
-            fund = (f"<div class='line'>资金面 <b>{it['fund_score']}分</b> · "
-                    f"5日/单日排名 {it.get('fund_rank_1d')} · "
-                    f"<span class='{st}'>{_h(it.get('fund_status') or '')}</span></div>")
-        cards.append(
-            f"<div class='card'><h3>#{it['rank']} {_h(it['name'])} "
-            f"<span class='badge {lv}'>{lab}</span> <span class='mut'>score {it['score']}</span></h3>"
-            f"<div class='line'>板块涨跌 <b class='{'up' if it['pct_chg'] >= 0 else 'down'}'>{it['pct_chg']:+.2f}%</b> · "
-            f"主力净流入 {it['net_yi']:+.1f} 亿 · {zt}</div>"
-            f"{fund}"
-            f"<div class='line'>领涨股:{_h(it.get('leader') or '-')} {news}</div>"
-            f"{_targets_html(it.get('targets'))}</div>")
-    rejected_html = ""
-    if d.get("rejected"):
-        rows = "".join(
-            f"<tr><td>{_h(r['name'])}</td>"
-            f"<td class='{'up' if r['pct_chg'] >= 0 else 'down'}'>{r['pct_chg']:+.2f}%</td>"
-            f"<td>{r['net_yi']:+.1f} 亿</td>"
-            f"<td><span class='tag'>{_h(r.get('fund_status') or '-')}</span></td>"
-            f"<td class='mut'>{_h(r['reason'])}</td></tr>"
-            for r in d["rejected"][:15])
-        rejected_html = ("<div class='card'><h3>🚫 准入淘汰板块(5日资金规则)</h3>"
-                         "<div class='tbl'><table><tr><th>板块</th><th>5日累计涨幅</th>"
-                         "<th>当日净流入</th><th>5日资金状态</th><th>淘汰理由</th></tr>" + rows + "</table></div></div>")
-    content = [
-        f"<header><h1>🔥 主线板块识别与龙头匹配</h1>"
-        f'<span class="mut">{_h(d.get("date"))} · Top{d.get("top_n")} 为核心主线 · '
-        f'市场评级 {_h(d.get("market_grade"))}</span>'
-        f'<a class="btn" href="/mainline?refresh=1">🔄 刷新</a></header>',
-        f'<div class="grid">{mood}<div class="card"><h3>说明</h3><div class="line">打分 = 资金面40(5日+单日,权重随市场评级切换) + 趋势30(涨幅+涨停家数) + 情绪共振20 + 消息催化10,权重可在系统设置调整。</div></div></div>',
-        f'<div class="card">{_mainline_chart(d.get("items", []))}</div>',
-        "\n".join(cards),
-        rejected_html,
-        '<div class="footer">主线识别基于当日资金/涨停/情绪/新闻规则打分,仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
-    ]
-    return _shell("mainline", "主线板块", "\n".join(content))
-
-
-@app.route("/api/mainline")
-def api_mainline():
-    c = _get_mainline(refresh=request.args.get("refresh") == "1")
-    if c["err"]:
-        return jsonify({"error": c["err"]}), 500
-    return jsonify(c["data"])
-
-
 # ============================================================ 模块2 持仓诊断
 _PF_CACHE = {"t": 0.0, "data": None, "err": None}
 _PF_TTL = 300
@@ -2206,7 +2074,7 @@ def api_settings_reset():
 
 
 def _warm_startup_cache():
-    """服务启动后后台预热今日决策与主线,避免用户首次访问触发慢速冷计算。"""
+    """服务启动后后台预热今日决策,避免用户首次访问触发慢速冷计算。"""
     import threading as _th
     import time as _t
     _t.sleep(2)
@@ -2215,11 +2083,6 @@ def _warm_startup_cache():
         print("[预热] 今日决策缓存已就绪")
     except Exception as e:  # noqa: BLE001
         print(f"[预热] 今日决策预热失败: {e}")
-    try:
-        _get_mainline(refresh=True)
-        print("[预热] 主线回顾缓存已就绪")
-    except Exception as e:  # noqa: BLE001
-        print(f"[预热] 主线回顾预热失败: {e}")
 
 
 def main():

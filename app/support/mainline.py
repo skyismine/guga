@@ -10,8 +10,7 @@
 准入规则:剔除 5日主力资金累计净流出的板块,以及 5日资金净流入但股价累计涨幅≤0 的量价背离板块,
 淘汰板块附带 reject_reason。
 
-输出:核心主线(Top N)/ 补涨支线(Top M)/ 观察,并匹配三类标的:
-情绪龙头 / 中军(成交额最大) / 对应 ETF,附带预测概率、操作信号、支撑压力位。
+输出:核心主线(Top N)/ 补涨支线(Top M)/ 观察(板块维度)。标的匹配由 decision 引擎的 match_targets_v2 承担。
 """
 import os
 import json
@@ -22,10 +21,8 @@ import pandas as pd
 from app import config
 from app.data.fetcher import get_spot_quotes
 from app.features.concept_features import _load_map
-from app.features.market_features import market_snapshot, fear_greed_label
-from app.ml.predictor import Predictor
+from app.features.market_features import market_snapshot
 from app.support import settings as _st
-from app.support.portfolio import _one
 
 _last_scores = {"date": None, "items": {}}
 _grade_cache = {"date": None, "grade": "B"}
@@ -426,27 +423,6 @@ _ETF_ALIAS = {
     "游戏": ["游戏", "传媒"], "传媒": ["传媒"], "数字经济": ["计算机", "数字"],
     "5G": ["5G", "通信"], "通信": ["通信"], "电力": ["电力", "公用"],
 }
-
-
-def _match_etf(name: str) -> dict | None:
-    cfg = _st.load()
-    min_wan = cfg.get("etf_min_amount", 5000.0)
-    kws = _ETF_ALIAS.get(_concept_kw(name)) or [_concept_kw(name)]
-    etfs = _etf_map()
-    best = None
-    for kw in kws:
-        for en, e in etfs.items():
-            if kw and kw.lower() not in en.lower():
-                continue
-            if e["amount_wan"] < min_wan:
-                continue
-            if best is None or e["amount_wan"] > best["amount_wan"]:
-                best = {**e, "name": en}
-    if best:
-        best["matched_kw"] = kws
-    return best
-
-
 # ---------------------------------------------------------------- 打分
 def _minmax(vals: list) -> dict:
     lo, hi = min(vals), max(vals)
@@ -993,39 +969,6 @@ def sector_level(name: str) -> str:
     return _last_scores["items"].get(name, "watch")
 
 
-def mainline_summary() -> dict:
-    """Web 展示:主线列表 + 三类标的 + 准入淘汰板块。"""
-    scores = sector_scores(use_cache=True)
-    items = []
-    for r in scores[: max(_st.load().get("mainline_branch_top_n", 5), 5)]:
-        items.append({
-            "rank": r["rank"], "name": r["industry"], "level": r["level"],
-            "score": r["score"], "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
-            "zt_count": r["zt_count"], "leader": r.get("leader", ""),
-            "news_hits": r["news_hits"], "fund_score": r.get("fund_score"),
-            "fund_rank_1d": r.get("fund_rank_1d"), "fund_status": r.get("fund_status"),
-            "rate_1d": r.get("rate_1d"), "rate_5d": r.get("rate_5d"),
-            "fund_rank_5d": r.get("fund_rank_5d"),
-            "targets": match_targets(r["industry"]),
-        })
-    rejected = [{"name": r["industry"], "pct_chg": r["pct_chg"], "net_yi": r["net_yi"],
-                  "fund_status": r.get("fund_status"), "reason": r["reject_reason"]}
-                 for r in scores if r.get("level") == "rejected"]
-    try:
-        fg = float((market_snapshot() or {}).get("market", {}).get("market_fear_greed") or 50)
-    except Exception:  # noqa: BLE001
-        fg = None
-    return {
-        "date": _today(),
-        "fear_greed": fg,
-        "fear_greed_label": fear_greed_label(fg) if fg is not None else None,
-        "top_n": _st.load().get("mainline_top_n", 2),
-        "market_grade": _grade_cache.get("grade", "B"),
-        "items": items,
-        "rejected": rejected,
-    }
-
-
 # ---------------------------------------------------------------- 三类标的
 def _filter_spot(spot: dict, stocks: list) -> list:
     cfg = _st.load()
@@ -1056,44 +999,3 @@ def _match_stocks(name: str, spot: dict) -> list:
         stocks = [{"code": c, **v} for c, v in _batch_spot(codes).items() if v.get("price")]
         stocks = [s for s in stocks if not any(b in s["name"].upper() for b in bad)]
     return stocks
-
-
-def match_targets(name: str, top_n: int = 3) -> dict:
-    """匹配某板块:情绪龙头 / 中军 / ETF,附预测与支撑压力。"""
-    spot = _a_spot_map()
-    stocks = _match_stocks(name, spot)
-    if not stocks:
-        return {"name": name, "error": "无成分股数据(成分源暂不可用)"}
-
-    emo = max(stocks, key=lambda s: s["pct_chg"])   # 情绪龙头:涨幅最大
-    mid = max(stocks, key=lambda s: s["amount"])    # 中军:成交额最大
-    etf = _match_etf(name)
-
-    predictor = Predictor()
-    quotes = get_spot_quotes([emo["code"], mid["code"]]) if len(stocks) >= 2 else {}
-    out = []
-    for tag, t in (("龙头", emo), ("中军", mid)):
-        item = {"role": tag, "code": t["code"], "name": t["name"],
-                "price": round(t["price"], 2), "pct_chg": t["pct_chg"],
-                "amount_yi": round(t["amount"] / 1e8, 2),
-                "float_mv": t["float_mv"]}
-        try:
-            _, pred, adv = _one(t["code"], predictor, quotes, None, _st.load())
-            item.update({
-                "p_up": round(pred["p_up"], 4), "direction": pred["direction_cn"],
-                "action": adv["action_cn"], "levels": adv["levels"],
-                "reasons": adv["reasons"][:3],
-            })
-        except Exception as e:  # noqa: BLE001
-            item["error"] = str(e)
-        out.append(item)
-    if etf:
-        out.append({"role": "ETF", "name": etf["name"], "code": etf["code"],
-                    "price": round(etf["price"], 3), "amount_wan": round(etf["amount_wan"], 0),
-                    "matched_kw": ",".join(etf["matched_kw"])})
-    return {"name": name, "stocks": out, "count": len(stocks)}
-
-
-if __name__ == "__main__":
-    import json
-    print(json.dumps(mainline_summary(), ensure_ascii=False, indent=2)[:3000])
