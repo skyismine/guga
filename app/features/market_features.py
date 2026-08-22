@@ -14,6 +14,7 @@
 - 期指资金: market_basis_if / market_basis_ih / market_basis_ic / market_basis_im / market_basis_avg
 - 恐贪合成: market_fear_greed(0~100, 低=恐慌 高=贪婪)
 """
+import json
 import os
 import pickle
 import time
@@ -47,18 +48,38 @@ def _fear_greed(frame: pd.DataFrame) -> pd.Series:
 
 
 def _breadth_frame(days: int) -> pd.DataFrame:
-    """从样本篮子(与训练股票一致)逐日统计涨跌家数/宽度特征。"""
+    """市场宽度特征:计算池与 GBM 训练池完全对齐(pool_builder 统一供数)。
+
+    设计目的:解决「训练样本 680 只、环境特征仅用 129 只自选股计算」的口径错配,
+    使环境特征刻画的就是模型样本所在市场的真实状态。
+    口径一致性约束(与 app/ml/trainer._history_groups 完全同款):
+    - 标的清单直接读取 load_training_pool(),不单独维护股票列表;
+    - 复用 filter_df_by_active_periods 把 A500 成分裁剪到其历史成员区间,
+      调出标的不再以新成分身份回溯历史,杜绝幸存者偏差;
+    - 补充标的(emotional/risk/large_cap)与训练侧一样不限区间;
+    - 当日停牌/无行情的标的不产生当日横截面样本(groupby 天然仅含有效交易日)。
+    特征公式、列名、输出格式完全不变,上层训练/推理代码零改动。
+    """
+    from app.ml.pool_builder import load_training_pool, filter_df_by_active_periods
+    pool = load_training_pool()
+    codes = pool.get("codes") or []
+    periods = pool.get("a500_periods") or []
     rows = []
-    for code in config.MARKET_BASKET:
+    for code in codes:
         try:
             df = get_daily_history(code, days=days, adjust="qfq")
+            # A500 幸存者偏差裁剪(与训练侧同款):仅保留当日有效成分的样本
+            if periods:
+                df = filter_df_by_active_periods(df, code, periods)
+            if df is None or df.empty:
+                continue
             f = compute_features(df)
             rows.append(pd.DataFrame({
                 "ret_1": f["ret_1"], "close_ma20": f["close_ma20"],
                 "volume_ratio": f["volume_ratio"],
             }))
         except Exception as e:  # noqa: BLE001
-            print(f"[market_features] 篮子 {code} 失败: {e}")
+            print(f"[market_features] 训练池 {code} 失败: {e}")
     if not rows:
         raise RuntimeError("市场宽度篮子无数据")
     basket = pd.concat(rows)
@@ -71,6 +92,94 @@ def _breadth_frame(days: int) -> pd.DataFrame:
         "market_hot_ratio": g["ret_1"].apply(lambda x: float((x > 0.05).mean())),
         "market_median_vol_ratio": g["volume_ratio"].median(),
     })
+
+
+# ---------------------------------------------------------------- P1 全市场宽度(mkt_all_*)
+_MKT_ALL_PATH = os.path.join(config.DATA_DIR, "mkt_all_breadth.json")
+
+
+def _mkt_all_universe(spot: dict) -> dict:
+    """全市场合规池:全部A股 - ST/退市整理 - 上市初期(N/C 标识近似次新) - 无效报价。
+
+    说明:A股快照不含精确上市日期,60 交易日次新过滤以简称 N/C 冠标近似
+    (N=上市首日,C=上市第2~5日),恰好剔除波动最极端的新股阶段;
+    精确上市天数需逐股接口,与轻量化约束冲突,故采用该近似并在横截面占比上影响有限。
+    """
+    out = {}
+    for code, v in (spot or {}).items():
+        code = str(code).zfill(6)
+        if not code.startswith(("60", "00", "30", "68")):
+            continue
+        nm = str(v.get("name") or "").replace("*", "").upper()
+        if nm.startswith("ST") or "退" in nm:
+            continue
+        if nm.startswith(("N", "C")) and len(nm) >= 2 and nm[1].isascii() and nm[1:].isalnum():
+            continue  # N首日/C第2-5日次新标识(如 NXXZZ / CXXZZ)
+        px = v.get("price") or 0
+        pc = v.get("pct_chg")
+        if not px or px <= 0 or pc is None:
+            continue  # 停牌/无交易数据
+        out[code] = float(pc) / 100.0
+    return out
+
+
+def _append_mkt_all_row() -> None:
+    """向增量积累文件追加当日全市场宽度行(已有则跳过)。
+
+    数据源复用系统每日必然生成的全A快照缓存(_a_spot_map),零额外请求;
+    仅在非交易时段落盘(或收盘后),保证历史回测读到的都是收盘口径,无未来信息。
+    上线日起逐日积累,早期缺失为 NaN:dataset 强校验仅覆盖 market_/ind_/alpha_
+    前缀,mkt_all_ 缺失不删训练行,由 LightGBM 原生处理、特征筛选自动取舍。
+    """
+    store = {}
+    try:
+        with open(_MKT_ALL_PATH, encoding="utf-8") as f:
+            store = json.load(f)
+    except (OSError, ValueError):
+        store = {}
+    key = _today_str()
+    if key in store:
+        return
+    if _is_trading_time():
+        return  # 盘中不落盘,避免半日快照污染收盘口径
+    try:
+        from app.support.mainline import _a_spot_map
+        universe = _mkt_all_universe(_a_spot_map())
+    except Exception as e:  # noqa: BLE001
+        print(f"[market_features] 全市场宽度获取失败: {e}")
+        return
+    if len(universe) < 500:
+        return  # 快照残缺时放弃本日,防脏数据
+        rets = pd.Series(universe)
+    store[key] = {
+        "n": int(len(rets)),
+        "mkt_all_adv_ratio": float((rets > 0).mean()),
+        "mkt_all_avg_ret_1": float(rets.mean()),
+        "mkt_all_dispersion": float(rets.std()),
+        "mkt_all_hot_ratio": float((rets > 0.05).mean()),
+    }
+    try:
+        with open(_MKT_ALL_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def _mkt_all_frame(index: pd.DatetimeIndex) -> pd.DataFrame:
+    """把积累的全市场宽度行对齐到市场帧日期索引(ffill 补齐非积累日)。"""
+    _append_mkt_all_row()
+    store = {}
+    try:
+        with open(_MKT_ALL_PATH, encoding="utf-8") as f:
+            store = json.load(f)
+    except (OSError, ValueError):
+        store = {}
+    if not store:
+        return pd.DataFrame(index=index)
+    s = pd.DataFrame.from_dict(store, orient="index")
+    s.index = pd.to_datetime(s.index)
+    s = s.sort_index().drop(columns=["n"], errors="ignore")
+    return s.reindex(index).ffill()
 
 
 def _index_frame(days: int) -> pd.DataFrame:
@@ -103,8 +212,13 @@ def build_market_frame(days: int = None, use_cache: bool = True) -> pd.DataFrame
 
     frame = _breadth_frame(days).join(_index_frame(days), how="outer") \
         .join(_basis_frame(days), how="outer").sort_index()
+    # P1:并入全市场宽度(mkt_all_*,增量积累,早期日期为 NaN 由模型原生处理)
+    frame = frame.join(_mkt_all_frame(frame.index), how="left")
     frame = frame.ffill()
-    frame = frame.dropna(subset=[c for c in frame.columns if not c.endswith(("dispersion",))])
+    # 强校验仅针对训练池宽度列;mkt_all_ 早期无积累属预期,不得删行
+    frame = frame.dropna(subset=[c for c in frame.columns
+                                 if not c.endswith(("dispersion",))
+                                 and not c.startswith("mkt_all_")])
     frame["market_fear_greed"] = _fear_greed(frame)
     frame = frame.dropna(subset=["market_fear_greed"])
 
@@ -114,7 +228,8 @@ def build_market_frame(days: int = None, use_cache: bool = True) -> pd.DataFrame
 
 
 def market_feature_names() -> list:
-    return [c for c in build_market_frame().columns if c.startswith("market_")]
+    return [c for c in build_market_frame().columns
+            if c.startswith(("market_", "mkt_all_"))]
 
 
 def attach_market_features(features: pd.DataFrame, frame: pd.DataFrame = None) -> pd.DataFrame:
@@ -122,10 +237,11 @@ def attach_market_features(features: pd.DataFrame, frame: pd.DataFrame = None) -
 
     注意:个股帧的日期会跨多只股票重复出现,join 右侧必须先收敛到
     唯一日期(右侧唯一 -> 左侧重复, 多对一, 不会因重复索引发生笛卡尔爆炸)。
-    market_* 特征在源端做滚动 z-score(按市场帧序列,同一天所有股票取值一致,横截面可比)。
+    market_*/mkt_all_* 特征在源端做滚动 z-score(按市场帧序列,
+    同一天所有股票取值一致,横截面可比);个股维度标准化时按前缀跳过。
     """
     frame = frame if frame is not None else build_market_frame()
-    cols = [c for c in frame.columns if c.startswith("market_")]
+    cols = [c for c in frame.columns if c.startswith("market_") or c.startswith("mkt_all_")]
     if config.STANDARDIZE_ROLLING:
         frame = zscore_frame(frame[cols])
         cols = list(frame.columns)
