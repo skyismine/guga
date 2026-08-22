@@ -683,9 +683,10 @@ def collect_review(date: dt.date = None, use_cache: bool = True) -> Dict:
         "activity": collect_activity(),
         "limit_up": collect_limit_up(date),
         "sector_flow": collect_sector_flow(),
+        "sector_flow_5d": collect_sector_flow_5d(),   # 主线资金验证/5日趋势(P0/P1)
         "north": collect_north(date),
         "market_fund": collect_market_fund(),
-        "market_daily": collect_market_daily(10),
+        "market_daily": collect_market_daily(20),     # 20日: 量能/情绪近20日分位(P1)
         "events": collect_events(date),
     }
     _save_cache(f"review_{date}", data)

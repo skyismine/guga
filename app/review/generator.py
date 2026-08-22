@@ -1,12 +1,16 @@
-"""A股每日复盘 · 文本生成:数据驱动的六大部分深度复盘(参照人工复盘模板)。
+"""A股每日复盘 · 文本生成:数据驱动的十大模块深度复盘(参照人工复盘模板)。
 
 每个部分输出结构化 items(文本行 / 小节标题 / 数据表格),页面按序交错渲染,提升可读性。
-  一、大盘核心综述(主题 / 指数表格 / 成交额 / 涨跌结构)
-  二、板块轮动深度拆解(领涨主线表 / 分歧表 / 领跌表 / 轮动规律)
-  三、核心事件深度解读(要闻表 + 央视联播 + 解读)
-  四、资金面与情绪面分析(资金流向表 / 市场情绪)
-  五、盘面核心结论(结论总纲 / 趋势 / 主线 / 风险 / 操作)
-  六、操作策略参考(短线 / 中线 / 核心风险)
+   📋 30秒速览(大盘定性/核心主线/操作要点/核心风险)
+   一、大盘综述(周期定位:量能/情绪/风格)
+   二、板块轮动拆解(结构分析:核心主线/异动脉冲/退潮回落 + 驱动属性标签)
+   三、主线三层分级研判(核心/发酵/观察 + 梯队/资金验证/生命周期/演进追踪/格局强度)
+   四、明日重点观察标的池(主线龙头观察池 + 有承接超跌标的池)
+   五、核心事件深度解读(要闻表 + 央视联播 + 解读)
+   六、资金面与情绪面交叉验证(资金流向/市场情绪/背离检测/5日趋势)
+   七、当日决策效果验证(主线/标的/模型三档验证)
+   八、盘面核心结论(结论总纲 / 趋势 / 主线 / 风险 / 操作)
+   九、明日交易策略(主线分层策略 / 超跌策略 / 仓位与风控红线)
 
 行文本中 `**加粗**` 用于标记强调,页面渲染为加粗;文本统一使用中文冒号。
 """
@@ -52,6 +56,16 @@ _INDEX_FEATURE = {
     "中证1000": "中小盘题材活跃",
     "科创50": "科技成长领跑",
 }
+
+
+def _drv_tag(f) -> str:
+    """板块驱动属性标签: 领涨股接近涨停(情绪驱动) vs 中军趋势驱动。
+
+    设计取舍: 以领涨股涨幅近似判别情绪/趋势属性(免去逐股市值/筹码采集);
+    涨停级领涨 → 小票情绪驱动,否则 → 中军趋势驱动。
+    """
+    lp = f.get("leader_pct") or 0
+    return "小票情绪驱动" if lp >= 9.5 else "中军趋势驱动"
 
 
 # ================================================================ 一、大盘核心综述
@@ -140,6 +154,53 @@ def _index_overview(d: Dict) -> List[Dict]:
                         f"并非全面普涨;涨停 **{lu_n:.0f} 家** / 跌停 **{ld_n:.0f} 家**,{effect}。"
                         "上涨集中于权重龙头与细分赛道,多数个股跟涨力度有限,"
                         + ("市场分化程度较高。" if ratio < 0.55 else "市场广度良好。")))
+
+    # ---- P1 周期定位(量能 / 情绪 / 风格) ----
+    items.append(_head("周期定位(量能 / 情绪 / 风格)"))
+    if len(valid_amt) >= 5:
+        cur_amt = valid_amt[-1]
+        hi, lo = max(valid_amt), min(valid_amt)
+        pctile = sum(1 for v in valid_amt if v <= cur_amt) / len(valid_amt)
+        vol_tag = ("放量(高位)" if cur_amt >= hi * 0.95
+                   else ("放量" if pctile >= 0.8 and cur_amt > lo * 1.15
+                         else ("缩量" if pctile <= 0.25 and cur_amt < hi * 0.85 else "平量")))
+        items.append(_t(f"**量能周期**:近{len(valid_amt)}日成交分位 **{pctile:.0%}**"
+                        f"(区间 {lo:.0f}~{hi:.0f} 亿),当前 **{vol_tag}**。"))
+    fg = None
+    try:
+        from app.features.market_features import market_snapshot, fear_greed_label
+        fg = (market_snapshot().get("market") or {}).get("market_fear_greed")
+    except Exception:  # noqa: BLE001
+        fg = None
+    if fg is not None:
+        emo = ("过热" if fg >= 75 else ("高温" if fg >= 60 else ("中性" if fg >= 40
+                                                                 else ("低温" if fg >= 25 else "寒冷"))))
+        items.append(_t(f"**情绪周期**:恐贪指数 **{fg:.0f}**(0-100 分位),处于 **{emo}** 区,{fear_greed_label(fg)}。"))
+    elif lu_n is not None:
+        emo = "高温" if lu_n >= 60 else ("中性" if lu_n >= 30 else "低温")
+        items.append(_t(f"**情绪周期**:涨停 **{lu_n:.0f}** 家,处于 **{emo}** 区。"))
+    style_tag = None
+    try:
+        from app.support.mainline import market_style_bias
+        style_tag = (market_style_bias() or {}).get("tag")
+    except Exception:  # noqa: BLE001
+        style_tag = None
+    if style_tag:
+        items.append(_t(f"**风格定位**:决策系统风格标签 **{style_tag}**。"))
+    elif big and small:
+        items.append(_t(f"**风格定位**:今日大小盘价差 {(s - b) * 100:+.2f}pp,"
+                        + ("资金偏好小盘弹性。" if s > b else "资金偏向大盘防守。")))
+    try:
+        from app.review import archive
+        prev_tags = [(r.get("metrics") or {}).get("style_tag")
+                     for r in archive.load_days(4)[:-1]]
+        prev_tags = [t for t in prev_tags if t]
+        if prev_tags and style_tag:
+            same = sum(1 for t in prev_tags if t == style_tag)
+            items.append(_t(f"**风格延续性**:前 {len(prev_tags)} 个交易日标签"
+                            f"({'、'.join(prev_tags[-3:])}),今日{'延续' if same == len(prev_tags) else '切换'}。"))
+    except Exception:  # noqa: BLE001
+        pass
     return items
 
 
@@ -168,6 +229,25 @@ def _sector_rotation(d: Dict) -> List[Dict]:
     if spread:
         items.append(_t("扩散分支:" + "、".join(f["industry"] for f in spread[:4])
                         + " 同步跟涨,形成板块级资金合力,主线由单一板块向同链条扩散。"))
+
+    # ---- P1 板块结构分类(核心主线 / 异动脉冲 / 退潮回落)+ 驱动属性标签 ----
+    items.append(_head("板块结构分类(核心主线 / 异动脉冲 / 退潮回落)"))
+    core_s = sorted([f for f in up if f["net_yi"] > 0],
+                    key=lambda x: x["net_yi"], reverse=True)[:3]
+    pulse = [f for f in up if f["net_yi"] < -0.5][:3]
+    decay = sorted([f for f in flows if f["pct_chg"] < 0 and f["net_yi"] < 0],
+                   key=lambda x: x["net_yi"])[:3]
+    struct_rows = []
+    for f in core_s:
+        struct_rows.append([f["industry"], "核心主线(资金共振)", _cell(f"{f['pct_chg']:+.2f}%", "up"),
+                            _cell(f"{f['net_yi']:+.2f}亿", "up"), _drv_tag(f)])
+    for f in pulse:
+        struct_rows.append([f["industry"], "异动脉冲(涨但资金流出)", _cell(f"{f['pct_chg']:+.2f}%", "up"),
+                            _cell(f"{f['net_yi']:+.2f}亿", "down"), "持续性待验证"])
+    for f in decay:
+        struct_rows.append([f["industry"], "退潮回落(跌+资金流出)", _cell(f"{f['pct_chg']:+.2f}%", "down"),
+                            _cell(f"{f['net_yi']:+.2f}亿", "down"), "回避/观察"])
+    items.append(_table("", ["板块", "结构分类", "涨跌幅", "主力净流入", "驱动属性"], struct_rows))
 
     # 2) 分歧 / 兑现主线(涨幅高但资金净流出)
     diverge = [f for f in up[:10] if f["net_yi"] < -0.5]
@@ -350,6 +430,34 @@ def _capital_sentiment(d: Dict) -> List[Dict]:
                         + " 存在兑现压力,谨防高开回落与局部踩踏。"))
     else:
         items.append(_t("高位风险信号较少,板块涨跌与资金方向总体一致,承接力尚可。"))
+
+    # ---- P1 多维度交叉验证(背离检测 + 5日趋势) ----
+    items.append(_head("3. 多维度交叉验证(背离 / 趋势)"))
+    adv, dec = act.get("advance", 0), act.get("decline", 0)
+    idx_avg = _avg(d.get("indices", []), "pct_chg")
+    if idx_avg and (adv + dec) > 0:
+        ratio = adv / (adv + dec)
+        if idx_avg > 0.003 and ratio < 0.45:
+            items.append(_t("**背离信号**:指数上涨但下跌家数占优,指数与个股宽度背离,"
+                            "权重护盘而赚钱效应弱,追涨胜率低。"))
+        elif idx_avg < -0.003 and ratio > 0.55:
+            items.append(_t("**背离信号**:指数下跌但多数个股上涨,存在结构修复迹象,需放量确认。"))
+        else:
+            items.append(_t("指数与涨跌家数方向一致,无显著背离。"))
+    mf = d.get("market_fund", {})
+    cur_main = (mf["rows"][0].get("net_yi") if mf.get("ok") and mf.get("rows") else None)
+    if idx_avg and cur_main is not None and idx_avg > 0.003 and cur_main < -30:
+        items.append(_t("**背离信号**:指数上涨但大盘主力资金净流出,量价背离,反弹持续性存疑。"))
+    if len(md) >= 5:
+        last5_main = [r.get("main_yi") for r in md[-5:] if r.get("main_yi") is not None]
+        if len(last5_main) >= 3:
+            up_days = sum(1 for v in last5_main if v > 0)
+            if up_days >= 4:
+                items.append(_t("近 5 日大盘主力资金**持续净流入**,资金趋势持续性强,回踩即机会。"))
+            elif up_days <= 1 and last5_main[-1] < 0:
+                items.append(_t("近 5 日大盘主力资金多日净流出,当日资金行为或为**单日脉冲**,持续性待验证。"))
+            else:
+                items.append(_t("近 5 日大盘主力资金流入流出互现,趋势不明确,以结构性机会为主。"))
     return items
 
 
@@ -422,57 +530,6 @@ def _conclusion(d: Dict) -> List[Dict]:
     return items
 
 
-# ================================================================ 六、操作策略参考
-def _strategy(d: Dict, conclusion_text: str) -> List[Dict]:
-    flows = d.get("sector_flow", [])
-    lu = d.get("limit_up", {})
-    lu_n = d.get("activity", {}).get("real_limit_up", d.get("activity", {}).get("limit_up", 0))
-
-    reso = sorted([f for f in flows if f["pct_chg"] > 0 and f["net_yi"] > 0],
-                  key=lambda x: x["net_yi"], reverse=True)
-    focus = "、".join(f"**{f['industry']}**" for f in reso[:3]) if reso else "暂无明确主线"
-    diverge = [f for f in flows if f["pct_chg"] > 0 and f["net_yi"] < -0.5] if flows else []
-    avoid = "、".join(f"**{f['industry']}**" for f in diverge[:3]) if diverge else "**短期涨幅过大的高位情绪标的**"
-    weak = sorted(flows, key=lambda x: x["pct_chg"])[:2] if flows else []
-
-    if "偏强" in conclusion_text or "进攻" in conclusion_text:
-        pos = "6-7 成"
-    elif "偏弱" in conclusion_text or "防守" in conclusion_text:
-        pos = "3-4 成"
-    else:
-        pos = "4-5 成"
-
-    items = [_head("1. 短线交易思路")]
-    items.append(_t(f"· 不追高连续大涨的题材小票,情绪退潮时回撤速度极快;仓位控制:总仓位 **{pos}**,"
-                    "聚焦核心赛道,避免频繁追涨杀跌。"))
-    items.append(_t(f"· 重点跟踪 {focus} 主线的企稳/回踩机会:若龙头缩量回踩关键支撑后获资金承接,"
-                    "可低吸同链条低位分支,否则以观望为主。"))
-    items.append(_t(f"· 回避方向:{avoid};高位股谨防核按钮与量化踩踏。"))
-
-    items.append(_head("2. 中线持仓思路"))
-    if reso:
-        items.append(_t(f"· 持仓结构优化:核心仓位配置资金共振主线 {focus},作为进攻主力;"
-                        + (f"可少量配置领跌后超跌的防御方向(**{'、'.join(f['industry'] for f in weak)}**)作为对冲。"
-                           if weak else "可少量配置低估值防御品种作为对冲。")))
-    items.append(_t("· 操作节奏:利用盘中分歧调仓,不盲目杀跌;高位涨幅大的标的可分批兑现部分仓位,"
-                    "切换至仍有修复空间的低位分支与超跌方向。"))
-    if lu.get("max_lian", 0) >= 5:
-        items.append(_t("· 情绪跟踪:连板高度较高,短线情绪可能见顶退潮,追高风险加大,注意高位股退潮节奏。"))
-
-    items.append(_head("3. 核心风险提示"))
-    risks = []
-    if lu.get("max_lian", 0) >= 5:
-        risks.append("连板高度较高,情绪退潮引发高位股补跌")
-    if diverge:
-        risks.append("高位获利盘集中兑现,带动成长股整体调整")
-    risks.append("8 月进入中报业绩披露期,部分标的业绩不及预期引发个股风险")
-    risks.append("海外市场波动加剧、外资流向反复影响市场情绪")
-    rrows = [[f"风险{i}", rk] for i, rk in enumerate(risks[:4], 1)]
-    items.append(_table("", ["序号", "风险点"], rrows))
-    items.append(_t("风控纪律:以上均为模型与数据复盘参考,**不构成投资建议**;严格执行止损,控制单票仓位。"))
-    return items
-
-
 # ================================================================ 核心数据表(全局速览)
 def _tables(d: Dict) -> Dict:
     idx = d.get("indices", [])
@@ -507,23 +564,96 @@ def _items_to_lines(items: List[Dict]) -> List[str]:
     return [i["t"] if "t" in i else i["head"] for i in items if ("t" in i or "head" in i)]
 
 
+def _market_ctx(d: Dict) -> Dict:
+    """大盘维度 ctx(评级/量能/情绪/风格),供 30秒速览。复用决策引擎 market_permit,口径一致。"""
+    ctx = {}
+    try:
+        from app.decision.engine import market_permit
+        p = market_permit()
+        ctx["grade"] = p.get("grade")
+        vr = p.get("vol_ratio")
+        ctx["vol_tag"] = ("放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")) if vr else None
+        fg = p.get("fear_greed")
+        ctx["fear_greed"] = fg
+        ctx["qualify"] = (f"大盘评级 {p.get('grade')}"
+                          + (f"、恐贪 {fg:.0f} 分({p.get('fear_greed_label')})" if fg is not None else ""))
+    except Exception:  # noqa: BLE001
+        ctx["qualify"] = "大盘数据暂缺"
+    try:
+        from app.support.mainline import market_style_bias
+        ctx["style_tag"] = (market_style_bias() or {}).get("tag") or "均衡"
+    except Exception:  # noqa: BLE001
+        ctx["style_tag"] = "均衡"
+    lu_n = (d.get("activity") or {}).get("real_limit_up",
+                                         (d.get("activity") or {}).get("limit_up", 0)) or 0
+    fg = ctx.get("fear_greed")
+    if lu_n >= 60 or (fg is not None and fg >= 70):
+        ctx["emotion_tag"] = "高温"
+    elif lu_n >= 30 or (fg is not None and fg >= 45):
+        ctx["emotion_tag"] = "中性"
+    else:
+        ctx["emotion_tag"] = "低温"
+    return ctx
+
+
 def generate_review(d: Dict) -> Dict:
-    """由采集数据生成完整复盘(六大部分结构化 items + 全局速览表)。"""
+    """由采集数据生成完整复盘(十大模块结构化 items + 全局速览表 + 30秒速览 ctx)。
+
+    模块顺序(与页面渲染一致,Markdown 兼容):
+      30秒速览 → 大盘综述(周期定位) → 板块轮动拆解(结构分析) → 主线三层分级研判
+      → 明日重点观察标的池 → 核心事件解读 → 资金面与情绪面交叉验证
+      → 当日决策效果验证 → 盘面核心结论 → 明日交易策略
+    """
     overview = _index_overview(d)
     sector = _sector_rotation(d)
+    from app.review.layers import layer_review, layer_summary
+    from app.review.watch_pool import watch_pool_review
+    from app.review.verify import verify_review
+    from app.review.strategy_today import strategy_review
+    from app.review.snapshot import build_snapshot
+    layers_items = layer_review(d)
+    watch_items = watch_pool_review(d)
     events = _events(d)
     capital = _capital_sentiment(d)
+    verify_items = verify_review(d)
     conclusion = _conclusion(d)
-    conclusion_text = conclusion[-1].get("t", "") if conclusion else ""
-    strategy = _strategy(d, conclusion_text)
+    strategy_items = strategy_review(d)
+
+    # 30秒速览 ctx(汇总各模块结论,置于报告最前)
+    mctx = _market_ctx(d)
+    lsum = layer_summary(d)
+    core_names = "、".join(f"**{c}**" for c in lsum["core"]) or "暂无明确主线"
+    pattern_txt = {"单主线抱团": "单主线高度聚焦", "多主线轮动": "多主线轮动并进",
+                   "无明确主线": "无明确主线"}.get(lsum["pattern"], "")
+    pos_txt, risk_txt = "见「明日交易策略」分区操作", "退潮主线不接力、无承接超跌不抄底"
+    for it in strategy_items:
+        if it.get("t") and "建议次日总仓位区间" in it["t"]:
+            pos_txt = it["t"].split("建议次日总仓位区间 ")[-1].split("。")[0]
+    for it in layers_items:
+        if it.get("t") and "核心风险点" in it["t"]:
+            risk_txt = it["t"].split(":", 1)[-1].strip()[:60]
+    ctx = {
+        "market": mctx,
+        "core_names": core_names,
+        "strength": lsum["strength"],
+        "pattern": pattern_txt,
+        "action": pos_txt,
+        "risk": risk_txt,
+        "headline": {},
+    }
+    snapshot_items = build_snapshot(ctx)
 
     sections = {
-        "index_overview": {"title": "一、大盘核心综述", "items": overview},
-        "sector_rotation": {"title": "二、板块轮动深度拆解", "items": sector},
-        "events": {"title": "三、核心事件深度解读", "items": events},
-        "capital_sentiment": {"title": "四、资金面与情绪面分析", "items": capital},
-        "conclusion": {"title": "五、盘面核心结论", "items": conclusion},
-        "strategy": {"title": "六、操作策略参考", "items": strategy},
+        "snapshot": {"title": "📋 30秒速览", "items": snapshot_items},
+        "index_overview": {"title": "一、大盘综述(周期定位)", "items": overview},
+        "sector_rotation": {"title": "二、板块轮动拆解(结构分析)", "items": sector},
+        "layers": {"title": "三、主线三层分级研判", "items": layers_items},
+        "watch_pool": {"title": "四、明日重点观察标的池", "items": watch_items},
+        "events": {"title": "五、核心事件深度解读", "items": events},
+        "capital_sentiment": {"title": "六、资金面与情绪面交叉验证", "items": capital},
+        "verify": {"title": "七、当日决策效果验证", "items": verify_items},
+        "conclusion": {"title": "八、盘面核心结论", "items": conclusion},
+        "strategy": {"title": "九、明日交易策略", "items": strategy_items},
     }
     for sec in sections.values():
         sec["lines"] = _items_to_lines(sec["items"])
@@ -532,5 +662,6 @@ def generate_review(d: Dict) -> Dict:
         "date": d.get("date"),
         "sections": sections,
         "tables": _tables(d),
+        "snapshot_ctx": ctx,
         "generated_at": None,
     }

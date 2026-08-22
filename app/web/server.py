@@ -117,11 +117,17 @@ def _md_to_html(md: str) -> str:
         i += 1
     if in_tbl:
         out.append(_tbl_block(in_tbl))
-    return "\n".join(out)
+    return _linkify("\n".join(out))
 
 
 def _bold(s):
     return _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", _html.escape(s))
+
+
+def _linkify(s):
+    """6 位股票代码 → 走势预测详情页跳转链接(P2 报告体验)。"""
+    return _re.sub(r"(?<!code=)\b((?:60|00|30|68)\d{4})\b",
+                   r'<a href="/analyze?code=\1">\1</a>', s)
 
 
 def _tbl_block(rows) -> str:
@@ -1654,18 +1660,44 @@ def api_portfolio_clear():
     return jsonify({"ok": True})
 
 
-# ============================================================ 模块3 复盘报告(内存展示,不落盘)
-_REPORT_HTML = {"date": None, "markdown": None, "html": ""}
+# ============================================================ 模块3 复盘报告(内存展示 + 历史检索)
+_REPORT_HTML = {"date": None, "markdown": None, "html": "", "summary": ""}
+_REPORT_STAGE = {"state": "idle", "stage": "", "err": None}
 
 
 def _set_report(res: dict) -> None:
     _REPORT_HTML["date"] = res["date"]
     _REPORT_HTML["markdown"] = res["markdown"]
     _REPORT_HTML["html"] = _md_to_html(res["markdown"])
+    _REPORT_HTML["summary"] = res.get("summary", "")
+
+
+def _report_history() -> list:
+    """历史复盘日期列表(落盘 reports/*.md)。"""
+    import os as _os
+    d = _os.path.join(config.DATA_DIR, "reports")
+    if not _os.path.isdir(d):
+        return []
+    files = sorted(f for f in _os.listdir(d) if f.startswith("review_"))
+    return [f[7:15] for f in files]
+
+
+def _load_report_file(date_str: str) -> str:
+    """读取某日复盘 markdown 文件(date_str=YYYYMMDD)。"""
+    import os as _os
+    path = _os.path.join(config.DATA_DIR, "reports", f"review_{date_str}.md")
+    if not _os.path.exists(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, ValueError):
+        return ""
 
 
 def _start_auto_report(interval_sec: int = 60) -> None:
-    """后台线程:交易日到点自动生成复盘,直接写入内存供页面展示。"""
+    """唯一调度入口:交易日到点(auto_report_time,默认 16:00)自动生成复盘(内存展示,统一入口)。
+    落盘由 settings 控制(need_save_report)。"""
     import datetime as _dt
     import threading as _th
     from app.support import settings as _st
@@ -1675,15 +1707,17 @@ def _start_auto_report(interval_sec: int = 60) -> None:
         while True:
             try:
                 now = _dt.datetime.now()
-                target = _st.load().get("auto_report_time", "15:30")
+                target = _st.load().get("auto_report_time", "16:00")
                 try:
                     hh, mm = map(int, target.split(":"))
                 except ValueError:
-                    hh, mm = 15, 30
+                    hh, mm = 16, 0
                 today = now.strftime("%Y-%m-%d")
                 if (now.weekday() < 5 and now.hour == hh and now.minute == mm
                         and _REPORT_HTML["date"] != today):
-                    _set_report(_rep.generate(use_cache=True, save=False))
+                    cfg = _st.load()
+                    _set_report(_rep.generate(use_cache=True,
+                                              save=bool(cfg.get("need_save_report", False))))
                     print(f"[report] 已生成复盘 {today} (页面内展示)")
             except Exception as e:  # noqa: BLE001
                 print(f"[report] 调度失败: {e}")
@@ -1692,60 +1726,128 @@ def _start_auto_report(interval_sec: int = 60) -> None:
     _th.Thread(target=_run, daemon=True, name="daily-report").start()
 
 
+def _report_page_content(err: str = None) -> str:
+    """组装报告页内容(含历史检索下拉 / 复制摘要 / 刷新进度 JS)。"""
+    if err:
+        date = _REPORT_HTML["date"] or "暂无"
+        return (f'<header><h1>📄 每日深度复盘报告</h1>'
+                f'<span class="mut">AI 深度复盘文案 · 生成时间 {_h(date)}</span></header>'
+                f'<div class="card"><h3 style="color:#e74c3c">❌ 生成失败</h3>'
+                f'<div class="line">{_h(err)}</div></div>'
+                '<div class="footer">报告内容仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>')
+    html = _REPORT_HTML["html"]
+    date = _REPORT_HTML["date"] or "暂无"
+    err_card = ""
+    if err and not html:
+        err_card = (f'<div class="card"><h3 style="color:#e74c3c">❌ 自动生成失败</h3>'
+                    f'<div class="line">{_h(err)}</div></div>')
+    hist_ops = "".join(f'<option value="{h}">{h[:4]}-{h[4:6]}-{h[6:]}</option>'
+                       for h in _report_history())
+    toolbar = (
+        f'<select id="rh" style="padding:8px 12px;border-radius:8px;border:1px solid #2a3350;'
+        f'background:#0b1018;color:var(--txt);font-size:14px" onchange="rhGo()">'
+        f'<option value="">历史复盘(按日期查看)</option>{hist_ops}</select>'
+        f'<button class="btn" onclick="genReport()">🔄 生成/刷新</button>'
+        f'<button class="btn gray" onclick="copySummary()">📋 复制摘要</button>'
+        f'<span id="rst" class="mut"></span>')
+    placeholder = ('<div class="card"><h3>尚未生成报告</h3><div class="line">点击「生成/刷新」'
+                   '将把当日盘面核心数据交给大模型 API(未启用则展示结构化规则复盘),'
+                   '生成深度复盘文案并直接显示在本页。</div></div>')
+    script = (
+        '<script>'
+        'function rhGo(){var d=document.getElementById("rh").value;if(d)'
+        'fetch("/api/report?date="+d).then(r=>r.json()).then(j=>{'
+        'if(j.error){alert(j.error);return;}'
+        'document.getElementById("rbody").innerHTML=j.html;'
+        'document.getElementById("rdt").innerText="历史复盘 · "+j.date;})}'
+        'function genReport(){var s=document.getElementById("rst");s.innerText="⏳ 开始生成…";'
+        'fetch("/api/report/generate",{method:"POST"}).then(r=>r.json());'
+        'var t=setInterval(function(){fetch("/api/report/status").then(r=>r.json()).then(j=>{'
+        'if(j.state==="running"){s.innerText="⏳ "+j.stage+" …";}else{clearInterval(t);'
+        's.innerText=j.err?("❌ "+j.err):"✅ 完成";if(!j.err)location.reload();}})},1200)}'
+        'function copySummary(){fetch("/api/report/summary").then(r=>r.json()).then(j=>{'
+        'if(j.summary){navigator.clipboard.writeText(j.summary).then(()=>alert("摘要已复制"));'
+        'else alert("尚无摘要");}})}'
+        '</script>')
+    return (
+        f'<header><h1>📄 每日深度复盘报告</h1>'
+        f'<span class="mut" id="rdt">AI 深度复盘文案 · 生成时间 {_h(date)}</span>{toolbar}</header>'
+        + err_card
+        + f'<div id="rbody">{html or placeholder}</div>'
+        + script
+        + '<div class="footer">报告内容仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>')
+
+
 @app.route("/report")
 def page_report():
     err = request.args.get("err")
-    if err:
-        date = _REPORT_HTML["date"] or "暂无"
-        content = [
-            f'<header><h1>📄 每日深度复盘报告</h1>'
-            f'<span class="mut">AI 深度复盘文案 · 生成时间 {_h(date)}</span></header>',
-            f'<div class="card"><h3 style="color:#e74c3c">❌ 生成失败</h3>'
-            f'<div class="line">{_h(err)}</div></div>',
-            '<div class="footer">报告内容仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
-        ]
-        return _shell("report", "复盘报告", "\n".join(content))
-    # 无缓存时自动生成一次(避免首次进入只见占位提示)
-    if not _REPORT_HTML["html"]:
+    if not _REPORT_HTML["html"] and not err:
         try:
             from app.support import daily_report as _rep
             _set_report(_rep.generate(use_cache=True, save=False))
         except Exception as e:  # noqa: BLE001
             err = str(e)
-    html = _REPORT_HTML["html"]
-    date = _REPORT_HTML["date"] or "暂无"
-    err_card = ""
-    if err and not html:
-        err_card = f'<div class="card"><h3 style="color:#e74c3c">❌ 自动生成失败</h3><div class="line">{_h(err)}</div></div>'
-    content = [
-        f'<header><h1>📄 每日深度复盘报告</h1>'
-        f'<span class="mut">AI 深度复盘文案 · 生成时间 {_h(date)}</span>'
-        f'<form method="post" action="/api/report/generate" style="display:inline"><button class="btn">🔄 生成/刷新</button></form></header>',
-        err_card,
-        html or '<div class="card"><h3>尚未生成报告</h3><div class="line">点击「生成/刷新」将把当日盘面核心数据交给大模型 API,生成专业深度复盘文案并直接显示在本页(不保存文件)。</div></div>',
-        '<div class="footer">报告内容仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
-    ]
-    return _shell("report", "复盘报告", "\n".join(content))
+    return _shell("report", "复盘报告", _report_page_content(err=err))
 
 
 @app.route("/api/report/generate", methods=["POST"])
 def api_report_generate():
-    """生成复盘并重定向回报告页直接展示(失败带错误提示)。"""
-    from urllib.parse import quote as _q
+    """异步生成复盘:后台线程执行,页面轮询 /api/report/status 获取进度。"""
+    import threading as _th
     from app.support import daily_report as rep
-    try:
-        res = rep.generate(use_cache=True, save=False)
-        _set_report(res)
-        return redirect("/report", code=303)
-    except Exception as e:  # noqa: BLE001
-        return redirect(f"/report?err={_q(str(e)[:100])}", code=303)
+    if _REPORT_STAGE["state"] == "running":
+        return jsonify({"state": "running"})
+
+    def _stage(msg):
+        _REPORT_STAGE["stage"] = msg
+
+    def _run():
+        _REPORT_STAGE["state"] = "running"
+        _REPORT_STAGE["err"] = None
+        try:
+            _set_report(rep.generate(use_cache=True, save=False, on_stage=_stage))
+        except Exception as e:  # noqa: BLE001
+            _REPORT_STAGE["err"] = str(e)
+        finally:
+            _REPORT_STAGE["state"] = "done"
+
+    _th.Thread(target=_run, daemon=True).start()
+    return jsonify({"state": "running"})
+
+
+@app.route("/api/report/status")
+def api_report_status():
+    return jsonify({"state": _REPORT_STAGE["state"], "stage": _REPORT_STAGE["stage"],
+                    "err": _REPORT_STAGE["err"]})
 
 
 @app.route("/api/report")
 def api_report():
+    dstr = request.args.get("date")
+    if dstr:
+        md = _load_report_file(dstr.replace("-", ""))
+        if not md:
+            return jsonify({"error": f"{dstr} 历史复盘不存在"}), 404
+        return jsonify({"date": dstr, "markdown": md, "html": _md_to_html(md)})
     if not _REPORT_HTML["markdown"]:
         return jsonify({"error": "尚未生成报告"}), 404
     return jsonify({"date": _REPORT_HTML["date"], "markdown": _REPORT_HTML["markdown"]})
+
+
+@app.route("/api/report/history")
+def api_report_history():
+    return jsonify({"dates": _report_history()})
+
+
+@app.route("/api/report/summary")
+def api_report_summary():
+    if not _REPORT_HTML["summary"]:
+        try:
+            from app.support import daily_report as _rep
+            _set_report(_rep.generate(use_cache=True, save=False))
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": str(e)}), 500
+    return jsonify({"date": _REPORT_HTML["date"], "summary": _REPORT_HTML["summary"]})
 
 
 # ============================================================ 模块4 盘中预警

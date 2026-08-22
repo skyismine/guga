@@ -22,6 +22,7 @@ from app import config
 from app.data.fetcher import get_spot_quotes
 from app.features.concept_features import _load_map
 from app.features.market_features import market_snapshot
+from app.ml.predictor import Predictor  # 决策引擎 match_level_targets 依赖(_ml.Predictor)
 from app.support import settings as _st
 
 _last_scores = {"date": None, "items": {}}
