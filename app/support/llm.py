@@ -119,30 +119,43 @@ def _compact_data(d: dict) -> dict:
     return out
 
 
+_MIN_CONTENT_LEN = 300   # 复盘文案最小有效长度:低于此值视为推理预算耗尽/截断,触发重试
+
+
 def generate_strategy(review_data: dict = None, extra: dict = None) -> dict:
     """由复盘采集数据 + 可选附加结论生成深度复盘文案。
 
     返回 {"ok": bool, "text": str, "reason": str|None}:
       ok=True  已生成文案(text)
       ok=False 未启用/失败,reason 为原因(调用方应降级为规则话术)。
+
+    重试策略: 推理类模型(deepseek 系)偶发把全部补全预算耗在 reasoning_content 上,
+    导致 content 为空/过短(实测 85~1786 字随机)。对「内容过短」做最多 2 次重试,
+    请求级异常仍一次即弃(避免放大网络故障成本)。
     """
     if not enabled():
         return {"ok": False, "text": "", "reason": "大模型未启用"}
     if not review_data:
         return {"ok": False, "text": "", "reason": "缺少复盘数据"}
-    try:
-        prompt_lines = ["以下为今日量化系统采集的市场结构化数据(JSON):", ""]
-        prompt_lines.append(json.dumps(_compact_data(review_data), ensure_ascii=False, indent=1))
-        if extra:
-            prompt_lines.append("")
-            prompt_lines.append("附加决策与持仓摘要:")
-            prompt_lines.append(json.dumps(extra, ensure_ascii=False, indent=1))
+    prompt_lines = ["以下为今日量化系统采集的市场结构化数据(JSON):", ""]
+    prompt_lines.append(json.dumps(_compact_data(review_data), ensure_ascii=False, indent=1))
+    if extra:
         prompt_lines.append("")
-        prompt_lines.append("请基于以上数据撰写今日深度复盘文案。")
-        text = _req("\n".join(prompt_lines))
-        return {"ok": True, "text": text, "reason": None}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "text": "", "reason": f"生成失败: {e}"}
+        prompt_lines.append("附加决策与持仓摘要:")
+        prompt_lines.append(json.dumps(extra, ensure_ascii=False, indent=1))
+    prompt_lines.append("")
+    prompt_lines.append("请基于以上数据撰写今日深度复盘文案。")
+    prompt = "\n".join(prompt_lines)
+
+    last_reason = "模型返回内容过短(推理预算耗尽或输出被截断),建议调大 max_tokens"
+    for attempt in range(3):
+        try:
+            text = _req(prompt)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "text": "", "reason": f"生成失败: {e}"}
+        if len((text or "").strip()) >= _MIN_CONTENT_LEN:
+            return {"ok": True, "text": text, "reason": None}
+    return {"ok": False, "text": "", "reason": last_reason}
 
 
 def generate_strategy_cached(review_data: dict = None, extra: dict = None, ttl: int = 1800) -> dict:

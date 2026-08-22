@@ -105,16 +105,19 @@ def _verify_short(r: dict) -> str:
 def _llm_check(text: str, ctx: dict) -> bool:
     """LLM 输出关键数值一致性校验: 恐贪指数与大盘评级须命中,否则视为异常(降级规则)。
 
-    设计取舍: 只校验「易产生幻觉的高价值标量」(恐贪分、评级字母),板块名/文案措辞不做硬校验,
-    避免过度约束大模型表达自由度。
+    恐贪口径兼容两种写法: 模型可能引用整数部分(42)或四舍五入(43),任一命中即通过;
+    评级字母(如 C)必须出现。设计取舍: 只校验「易产生幻觉的高价值标量」,
+    板块名/文案措辞不做硬校验,避免过度约束大模型表达自由度。
     """
     if not text or len(text) < 60:
         return False
     mkt = ctx.get("market") or {}
     fg = mkt.get("fear_greed")
     grade = mkt.get("grade")
-    if fg is not None and str(int(fg)) not in text:
-        return False
+    if fg is not None:
+        cands = {str(int(fg)), str(round(fg))}
+        if not any(c in text for c in cands):
+            return False
     if grade and grade not in text:
         return False
     return True
