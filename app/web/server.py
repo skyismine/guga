@@ -1562,23 +1562,6 @@ def _targets_html(t) -> str:
     return "\n".join(parts)
 
 
-def _oversold_html(pool) -> str:
-    if not pool:
-        return '<div class="mut">暂无符合条件的超跌反弹候选</div>'
-    rows = []
-    for p in pool:
-        cls = {"buy": "b-buy", "sell": "b-sell", "hold": "b-hold"}.get(p.get("action") or "", "b-wait")
-        rows.append(
-            f"<tr><td>{_h(p.get('name'))}</td><td>{_h(p.get('code'))}</td>"
-            f"<td class='down'>{_h(p.get('ret30')) and f'{p['ret30']*100:+.1f}%' or '-'}</td>"
-            f"<td class='{'up' if (p.get('pct_chg') or 0) >= 0 else 'down'}'>{(p.get('pct_chg') or 0):+.2f}%</td>"
-            f"<td>{_h(p.get('vol_ratio'))}</td><td>{_h(p.get('atr_pct')) and f'{p['atr_pct']*100:.1f}%' or '-'}</td>"
-            f"<td>{(p.get('p_up') * 100 if p.get('p_up') is not None else None) and f'{p['p_up']*100:.0f}%' or '-'}</td>"
-            f"<td><span class='badge {cls}'>{_h(p.get('action') or '')}</span></td></tr>")
-    return ("<div class='tbl'><table><tr><th>名称</th><th>代码</th><th>30日跌幅</th><th>当日涨幅</th>"
-            "<th>量比</th><th>ATR%</th><th>上涨概率</th><th>建议</th></tr>" + "\n".join(rows) + "</table></div>")
-
-
 @app.route("/mainline")
 def page_mainline():
     refresh = request.args.get("refresh") == "1"
@@ -1633,7 +1616,6 @@ def page_mainline():
         f'<div class="card">{_mainline_chart(d.get("items", []))}</div>',
         "\n".join(cards),
         rejected_html,
-        '<div class="card"><h3>📉 超跌强承接池(近30日超跌 + 放量企稳)</h3>' + _oversold_html(d.get("oversold") or []) + "</div>",
         '<div class="footer">主线识别基于当日资金/涨停/情绪/新闻规则打分,仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
     return _shell("mainline", "主线板块", "\n".join(content))
@@ -1980,12 +1962,6 @@ _SETTING_FIELDS = [
         ("mainline_dynamic_weight", "资金面动态权重", "checkbox", None, None, "开启:A级 5日20%+单日80%, C/D级 5日70%+单日30%;关闭固定 5日40%+单日60%"),
         ("leader_min_market_cap", "龙头最小流通市值(亿)", "number", 0, 1000, "低于该值剔除"),
         ("etf_min_amount", "ETF 最低成交额(万)", "number", 0, 100000, "低于该值不推荐"),
-        ("oversold_pool_size", "超跌池数量", "number", 5, 50, "输出 Top N"),
-    ]),
-    ("超跌筛选", [
-        ("oversold.drop_30d", "30日累计跌幅阈值", "number", 0, 1, "如 0.30 = 累计跌 30%"),
-        ("oversold.vol_ratio", "放量倍数", "number", 0.5, 10, "当日量/5日均量"),
-        ("oversold.max_atr_pct", "最大波动率 ATR%", "number", 0.01, 0.3, "过滤妖股"),
     ]),
     ("持仓诊断", [
         ("band_diff_pct", "做差价区间幅度", "number", 0.01, 0.2, "深套高抛/回补区间"),

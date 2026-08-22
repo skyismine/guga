@@ -1,4 +1,4 @@
-"""模块1 主线板块识别与龙头/中军/ETF 匹配 + 超跌强承接池。
+"""模块1 主线板块识别与龙头/中军/ETF 匹配。
 
 打分维度(权重可配置,默认合计 100):
 - 资金面 40:拆为 5日资金强度 + 单日资金强度,按准入板块净流入率排名线性递减打分;
@@ -994,7 +994,7 @@ def sector_level(name: str) -> str:
 
 
 def mainline_summary() -> dict:
-    """Web 展示:主线列表 + 三类标的 + 超跌池 + 准入淘汰板块。"""
+    """Web 展示:主线列表 + 三类标的 + 准入淘汰板块。"""
     scores = sector_scores(use_cache=True)
     items = []
     for r in scores[: max(_st.load().get("mainline_branch_top_n", 5), 5)]:
@@ -1023,7 +1023,6 @@ def mainline_summary() -> dict:
         "market_grade": _grade_cache.get("grade", "B"),
         "items": items,
         "rejected": rejected,
-        "oversold": oversold_pool(),
     }
 
 
@@ -1093,95 +1092,6 @@ def match_targets(name: str, top_n: int = 3) -> dict:
                     "price": round(etf["price"], 3), "amount_wan": round(etf["amount_wan"], 0),
                     "matched_kw": ",".join(etf["matched_kw"])})
     return {"name": name, "stocks": out, "count": len(stocks)}
-
-
-# ---------------------------------------------------------------- 超跌强承接池
-def _atr14(high, low, close):
-    h, l, c = high.to_numpy(), low.to_numpy(), close.to_numpy()
-    tr = []
-    for i in range(1, len(c)):
-        tr.append(max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])))
-    if len(tr) < 14:
-        return float("nan")
-    return float(pd.Series(tr).tail(14).mean())
-
-
-def oversold_pool(top_n: int = None, use_cache: bool = True) -> list:
-    """超跌强承接池:近30日累计跌超阈值 + 当日放量站上5日线 + ATR 排除妖股波动。"""
-    cfg = _st.load()
-    top_n = top_n or cfg.get("oversold_pool_size", 15)
-    ov = cfg.get("oversold", {})
-    concept_codes = []
-    try:
-        top = sector_scores(use_cache=use_cache)[: max(_st.load().get("mainline_branch_top_n", 5), 5)]
-        for r in top:
-            concept_codes += _concept_cons(r["industry"])
-    except Exception:  # noqa: BLE001
-        pass
-    zt_codes = [z["code"] for z in _zt_pool()]
-    candidates, seen = [], set()
-    for c in list(concept_codes) + zt_codes + list(config.TRAIN_STOCK_CODES):
-        if c not in seen:
-            seen.add(c)
-            candidates.append(c)
-    candidates = candidates[:1200]
-    spot = _a_spot_map()
-
-    hit = []
-    for code in candidates:
-        try:
-            from app.data.fetcher import get_daily_history
-            df = get_daily_history(code, days=70, adjust="qfq")
-            if len(df) < 31:
-                continue
-            close = df["close"]
-            ret30 = close.iloc[-1] / close.iloc[-31] - 1
-            if ret30 > -ov.get("drop_30d", 0.30):
-                continue
-            vol = df["volume"]
-            vol_ratio = vol.iloc[-1] / float(vol.iloc[-6:-1].mean()) if vol.iloc[-6:-1].mean() else 0
-            if vol_ratio < ov.get("vol_ratio", 1.5):
-                continue
-            if close.iloc[-1] <= float(close.iloc[-5:].mean()):
-                continue
-            if close.iloc[-1] <= close.iloc[-2]:
-                continue
-            atr_pct = _atr14(df["high"], df["low"], close) / close.iloc[-1]
-            if atr_pct > ov.get("max_atr_pct", 0.07):
-                continue
-            s = spot.get(code)
-            name = (s or {}).get("name", code)
-            if any(b in name.upper() for b in cfg.get("leader_exclude", ["ST", "退"])):
-                continue
-            pct_chg = (s or {}).get("pct_chg") if s else float(close.iloc[-1] / close.iloc[-2] - 1)
-            hit.append({
-                "code": code, "name": name,
-                "price": round(float(close.iloc[-1]), 2),
-                "pct_chg": round(float(pct_chg or 0), 4),
-                "ret30": round(ret30, 4),
-                "vol_ratio": round(vol_ratio, 2), "atr_pct": round(atr_pct, 4),
-                "amount_yi": round((s or {}).get("amount", 0) / 1e8, 2) if s else None,
-                "float_mv": (s or {}).get("float_mv") if s else None,
-                "score": round(-ret30 * 100 + vol_ratio * 5 + max(pct_chg or 0, 0), 1),
-            })
-        except Exception:  # noqa: BLE001
-            continue
-    hit.sort(key=lambda x: (x["pct_chg"], x["score"]), reverse=True)
-    hit = hit[: top_n * 2]
-
-    predictor = Predictor()
-    quotes = get_spot_quotes([h["code"] for h in hit]) if hit else {}
-    out = []
-    for h in hit[:top_n]:
-        r = dict(h)
-        try:
-            _, pred, adv = _one(h["code"], predictor, quotes, None, cfg)
-            r.update({"p_up": round(pred["p_up"], 4), "direction": pred["direction_cn"],
-                      "action": adv["action_cn"], "levels": adv["levels"]})
-        except Exception as e:  # noqa: BLE001
-            r["error"] = str(e)
-        out.append(r)
-    return out
 
 
 if __name__ == "__main__":

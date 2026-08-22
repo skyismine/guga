@@ -20,9 +20,6 @@ DEFAULTS = {
     "leader_min_market_cap": 20.0,   # 情绪龙头剔除 <20 亿小票(亿)
     "leader_exclude": ["ST", "退"],  # 龙头剔除名称关键词
     "etf_min_amount": 5000.0,        # ETF 日均成交额下限(万元)
-    "oversold_pool_size": 15,        # 超跌强承接池数量
-    # ---- 模块1 超跌强承接筛选
-    "oversold": {"drop_30d": 0.30, "vol_ratio": 1.5, "max_atr_pct": 0.07},
     # ---- 模块2 持仓诊断
     "portfolio_path": os.path.join(config.DATA_DIR, "portfolio.csv"),
     "band_diff_pct": 0.06,       # 深度套牢做差价:高抛/回补区间幅度
