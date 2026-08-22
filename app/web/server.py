@@ -1,4 +1,4 @@
-"""Web 仪表盘:走势预测 + 实时操作建议 + 今日信号单。
+"""Web 仪表盘:走势预测 + 实时操作建议。
 
 启动: python run_web.py  (默认 http://127.0.0.1:8000)
 """
@@ -37,7 +37,7 @@ import html as _html
 from markupsafe import Markup as _Markup
 
 _SIDE_MENU = [("/decision", "decision", "🎯 今日决策"),
-              ("/analyze", "home", "📈 走势预测"), ("/signals", "signals", "📋 今日信号单"),
+              ("/analyze", "home", "📈 走势预测"),
               ("/report", "report", "📄 复盘报告"), ("/mainline", "mainline", "🔥 主线板块"),
               ("/portfolio", "portfolio", "💼 持仓诊断"),
               ("/alerts", "alerts", "🚨 盘中预警"), ("/settings", "settings", "⚙️ 系统设置")]
@@ -390,76 +390,6 @@ PAGE = r"""<!DOCTYPE html>
 </html>
 """
 
-PAGE_SIGNALS = r"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>今日信号单 - 量化预测分析</title>
-<style>
-  :root { --bg:#0f1420; --card:#1a2130; --line:#2a3350; --txt:#e6e9f0; --mut:#8a94a8; }
-  * { box-sizing:border-box; }
-  body { margin:0; font-family:"Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--txt); }
-  .wrap { max-width:1180px; margin:0 auto; padding:18px; }
-  header { display:flex; align-items:center; gap:12px; padding:14px 0; flex-wrap:wrap; }
-  header h1 { font-size:20px; margin:0; }
-  .mut { color:var(--mut); font-size:13px; }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:14px 0; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin:14px 0; }
-  .card h3 { margin:0 0 10px; font-size:15px; }
-  .up{color:#ef5350;} .down{color:#26a69a;} .flat{color:#ffca28;} .mut{color:var(--mut);}
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  td,th { padding:6px 8px; border-bottom:1px solid var(--line); text-align:left; }
-  th { color:var(--mut); font-weight:400; }
-  .rank td:nth-child(1){color:var(--mut);} .rank tr:first-child td:nth-child(1){color:#ffca28;font-weight:600;}
-  .badge { display:inline-block; padding:3px 10px; border-radius:20px; font-size:13px; font-weight:600; }
-  .b-buy{background:#e5393522;color:#ef5350;border:1px solid #ef535055;}
-  .b-sell{background:#00897b22;color:#26a69a;border:1px solid #26a69a55;}
-  .err { color:#ff6e6e; padding:12px; }
-  nav a { display:inline-block; margin-left:8px; padding:7px 14px; border-radius:8px;
-          border:1px solid var(--line); color:var(--txt); text-decoration:none; font-size:14px; }
-  nav a:hover { border-color:#2f6fed; color:#7aa2ff; }
-  .footer { color:var(--mut); font-size:12px; margin-top:16px; line-height:1.8; }
-  @media(max-width:820px){ .grid{grid-template-columns:1fr;} }
-</style>
-</head>
-<body>
-{{ SIDE | safe }}
-<div class="wrap">
-  <header>
-    <h1>📋 今日信号单</h1>
-    <span class="mut">股票池按预期收益排序 · Top-{{ top_n }} 买入候选 · 末位风险提示 · {{ date }}</span>
-  </header>
-
-  {% if error %}<div class="card err">{{ error }}</div>{% endif %}
-
-  <div class="card">
-    <h3>🎯 买入候选 Top-{{ top_n }}
-      <span class="mut">(p_up ≥ {{ p_up_min }}%, 预期收益 ≥ 0)</span></h3>
-    {{ top_html | safe }}
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <h3>⚠️ 风险提示(预期收益末位)</h3>
-      {{ risk_html | safe }}
-    </div>
-    <div class="card">
-      <h3>📊 全池排序</h3>
-      {{ all_html | safe }}
-    </div>
-  </div>
-
-  <div class="footer">
-    信号仅基于量化模型排序,不构成投资建议。股市有风险,入市需谨慎。<br>
-    排名依据:预期涨跌幅 = Σ P(类) × 该类平均未来收益;盈亏比 = 期望盈利/期望亏损。
-  </div>
-</div>
-</body>
-</html>
-"""
-
-
 PAGE_REVIEW = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -679,95 +609,6 @@ def api_backtest():
     res = backtest_universe(codes)
     cols = ["code", "name", "total_return", "sharpe", "max_drawdown", "win_rate", "trades", "profit_factor"]
     return jsonify(res[cols].where(res[cols].notna(), None).to_dict(orient="records"))
-
-
-# ---- 今日信号单 ----
-_SIGNALS_CACHE = {"t": 0.0, "data": None, "err": None}
-_SIGNALS_TTL = 300  # 秒,避免每次刷新都重算
-
-
-def _signals_records(df) -> list:
-    return df.where(pd.notna(df), None).to_dict(orient="records")
-
-
-def _signals_table(records) -> str:
-    if not records:
-        return '<p class="mut">暂无数据</p>'
-    rows = ["<table class='rank'><tr><th>#</th><th>代码</th><th>名称</th><th>现价</th>"
-            "<th>上涨概率</th><th>下跌概率</th><th>方向</th><th>预期涨跌</th><th>盈亏比</th></tr>"]
-    for i, r in enumerate(records, 1):
-        rr = f"{r['reward_risk']:.2f}" if r.get("reward_risk") is not None else "-"
-        d = r.get("direction")
-        dir_cls = "up" if d == "上涨" else ("down" if d == "下跌" else "flat")
-        exp = r.get("expected_return")
-        exp_cls = "up" if (exp or 0) >= 0 else "down"
-        rows.append(
-            f"<tr><td>{i}</td><td>{r['code']}</td><td>{r['name']}</td><td>{r['close']}</td>"
-            f"<td class='up'>{r['p_up'] * 100:.1f}%</td>"
-            f"<td class='down'>{r['p_down'] * 100:.1f}%</td>"
-            f"<td class='{dir_cls}'>{d}</td>"
-            f"<td class='{exp_cls}'>{exp * 100:+.2f}%</td><td>{rr}</td></tr>")
-    rows.append("</table>")
-    return "\n".join(rows)
-
-
-def _get_signals():
-    if (_SIGNALS_CACHE["data"] is None
-            or _SIGNALS_CACHE["err"] is not None
-            or _time.time() - _SIGNALS_CACHE["t"] > _SIGNALS_TTL):
-        from app.strategy.ranker import daily_signals
-        try:
-            _SIGNALS_CACHE["data"] = daily_signals()
-            _SIGNALS_CACHE["err"] = None
-        except Exception as e:  # noqa: BLE001
-            _SIGNALS_CACHE["data"] = None
-            _SIGNALS_CACHE["err"] = str(e)
-        _SIGNALS_CACHE["t"] = _time.time()
-    return _SIGNALS_CACHE
-
-
-@app.route("/signals")
-def signals():
-    c = _get_signals()
-    if c["err"]:
-        return render_template_string(PAGE_SIGNALS, top_html="", risk_html="", all_html="",
-                                      top_n=config.RANK_TOP_N, p_up_min=config.RANK_MIN_P_UP * 100,
-                                      date="-", error=f"信号生成失败: {c['err']}", SIDE=_SIDE("signals"))
-    res = c["data"]
-    date = res["all"]["date"].iloc[0] if len(res["all"]) else "-"
-    return render_template_string(PAGE_SIGNALS,
-                                  top_html=_signals_table(_signals_records(res["top"])),
-                                  risk_html=_signals_table(_signals_records(res["risk"])),
-                                  all_html=_signals_table(_signals_records(res["all"])),
-                                  top_n=config.RANK_TOP_N, p_up_min=config.RANK_MIN_P_UP * 100,
-                                  date=date, error=None, SIDE=_SIDE("signals"))
-
-
-@app.route("/api/signals")
-def api_signals():
-    c = _get_signals()
-    if c["err"]:
-        return jsonify({"error": c["err"]}), 500
-    res = c["data"]
-    return jsonify({
-        "date": res["all"]["date"].iloc[0] if len(res["all"]) else None,
-        "top_n": config.RANK_TOP_N,
-        "buy": _signals_records(res["top"]),
-        "risk": _signals_records(res["risk"]),
-        "all": _signals_records(res["all"]),
-    })
-
-
-@app.route("/api/retrain", methods=["POST"])
-def api_retrain():
-    """手动触发月度重训(force=1 强制)。POST /api/retrain?force=1"""
-    from app.scheduler import retrain_if_due
-    try:
-        res = retrain_if_due(force=request.args.get("force") == "1", verbose=False)
-        return jsonify({"retrained": res["retrained"], "reason": res.get("reason"),
-                        "summary": res.get("summary") or None})
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)}), 500
 
 
 # ============================================================ 决策执行引擎(今日决策)
