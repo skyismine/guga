@@ -30,12 +30,14 @@ _METRIC_KEYS = ("accuracy", "f1_weighted", "precision_weighted",
 
 
 def _pool_codes(verbose: bool = True):
-    """训练池代码 + A500 调样期(池缺失时回退静态配置)。"""
+    """训练池代码 + A500 调样期(池缺失属致命配置,直接报错而非静默降级)。"""
     pool = load_training_pool()
     codes = pool.get("codes")
     periods = pool.get("a500_periods") or []
     if not codes:
-        codes = list(config.TRAIN_STOCK_CODES)
+        raise RuntimeError(
+            "训练池为空: 请先运行 python -m app.ml.pool_builder 构建训练池"
+            "(gbm_train_pool.json)")
     return codes, periods
 
 

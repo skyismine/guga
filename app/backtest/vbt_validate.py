@@ -95,10 +95,16 @@ def backtest_stock(code: str, predictor: Optional[Predictor] = None,
     return metrics
 
 
+def _default_codes() -> list:
+    """回测默认宇宙 = GBM 训练池(与训练/推理口径一致)。"""
+    from app.ml.pool_builder import load_training_pool
+    return list((load_training_pool() or {}).get("codes") or [])
+
+
 def backtest_universe(codes: Optional[List[str]] = None,
                       predictor: Optional[Predictor] = None) -> pd.DataFrame:
     """多股票回测汇总。"""
-    codes = codes or config.TRAIN_STOCK_CODES
+    codes = codes or _default_codes()
     predictor = predictor or Predictor()
     rows = []
     for code in codes:
@@ -121,7 +127,7 @@ def backtest_oos(codes: Optional[List[str]] = None, train_ratio: float = 0.7,
     from app.ml.dataset import build_dataset, build_labels
     from app.features.select_features import load_selected_features
 
-    codes = codes or config.TRAIN_STOCK_CODES
+    codes = codes or _default_codes()
     horizon = horizon or config.PREDICT_HORIZON
     threshold = threshold or config.PREDICT_THRESHOLD
     buy_threshold = buy_threshold or config.BUY_P_UP

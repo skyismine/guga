@@ -90,8 +90,9 @@ def main():
     args = ap.parse_args()
 
     from app.ml.pool_builder import load_training_pool
-    pool = load_training_pool()
-    all_codes = pool.get("codes") or list(config.TRAIN_STOCK_CODES)
+    all_codes = list((load_training_pool() or {}).get("codes") or [])
+    if not all_codes:
+        raise RuntimeError("训练池为空: 请先运行 python -m app.ml.pool_builder")
     random.seed(42)
     codes = random.sample(all_codes, min(args.sample, len(all_codes)))
 

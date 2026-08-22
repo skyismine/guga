@@ -69,33 +69,6 @@ DROP_LIMIT_DAYS = True           # 剔除标签日处于涨/跌停(封板)的样
 DROP_HALT_DAYS = True            # 剔除未来 horizon 内含停牌段的样本
 MAX_HALT_GAP_DAYS = 15           # 交易日间隔超过该值(自然日)视为停牌
 
-# 用于训练的全市场样本股票(代码前缀), 建议覆盖主板/创业板/科创板
-TRAIN_PREFIXES = ("60", "00", "30", "68")
-_STATIC_TRAIN_CODES = [        # 静态基础池(扩充池缺失时的回退)
-    "600519", "601318", "600036", "601899", "600030",
-    "600900", "601012", "600887", "600309", "603259",
-    "000001", "000858", "000333", "000651", "002594",
-    "002415", "300750", "300059", "300124", "002230",
-]
-
-
-def _load_expanded_codes():
-    """优先加载扩充训练池(data_cache/train_pool.json,>=100 只),否则回退静态池。"""
-    import json
-    import os
-    path = os.path.join(DATA_DIR, "train_pool.json")
-    try:
-        if os.path.exists(path):
-            d = json.load(open(path, encoding="utf-8"))
-            codes = d.get("codes") or []
-            if len(codes) >= 100:
-                return codes
-    except (OSError, ValueError):
-        pass
-    return None
-
-
-TRAIN_STOCK_CODES = _load_expanded_codes() or _STATIC_TRAIN_CODES
 TRAIN_YEARS_BACK = 3       # 取最近 N 年历史作为训练数据
 
 # 月度重训调度:固定月度频率,持续适配市场风格变化
