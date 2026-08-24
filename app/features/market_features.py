@@ -30,6 +30,7 @@ from app.features.indicators import compute_features
 from app.features.standardize import zscore_frame
 
 _MARKET_FRAME_PATH = os.path.join(config.DATA_DIR, "market_frame.pkl")
+_MARKET_FRAME_TTL = 24 * 3600   # 市场帧缓存 TTL(秒):收盘后宽度数据不再变动,每日重建一次即可
 
 
 def _clip01(s: pd.Series) -> pd.Series:
@@ -200,10 +201,14 @@ def _basis_frame(days: int) -> pd.DataFrame:
 
 
 def build_market_frame(days: int = None, use_cache: bool = True) -> pd.DataFrame:
-    """构建按日期索引的市场特征帧,本地缓存。"""
+    """构建按日期索引的市场特征帧,本地缓存。
+
+    市场帧缓存 TTL 独立于全局 CACHE_TTL(4h):宽度特征基于收盘历史,重建需遍历 680 池
+    计算特征,成本高;收盘后数据不再变动,延长到 24h 使重建频率降为每日一次。
+    """
     days = days or config.HIST_DAYS
     if use_cache and os.path.exists(_MARKET_FRAME_PATH):
-        if time.time() - os.path.getmtime(_MARKET_FRAME_PATH) <= config.CACHE_TTL_SECONDS:
+        if time.time() - os.path.getmtime(_MARKET_FRAME_PATH) <= _MARKET_FRAME_TTL:
             try:
                 with open(_MARKET_FRAME_PATH, "rb") as f:
                     return pickle.load(f)

@@ -20,8 +20,12 @@ from app.data import patch_requests  # noqa: F401  先注入 UA 补丁
 patch_requests.install()
 
 _SINA_HQ = "https://hq.sinajs.cn/list={symbols}"
-_SINA_REFERER = "https://finance.sina.com.cn"
+_HA_SINA_REFERER = "https://finance.sina.com.cn"
 _SINA_SPOT = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
+
+# 历史日线缓存 TTL(秒):收盘后的历史日线不再变动,延长到 24h 避免每 4h 全量重抓 680 池;
+# 盘中最新价由 get_spot_quotes 短缓存提供,日线特征可容忍当日行稍滞后。
+_HIST_TTL_SECONDS = 24 * 3600
 
 
 # ---------------------------------------------------------------- 工具
@@ -80,12 +84,12 @@ def _cache_path(code: str) -> str:
     return os.path.join(config.HIST_DIR, f"{str(code).zfill(6)}.pkl")
 
 
-def _load_cache(code: str) -> Optional[pd.DataFrame]:
+def _load_cache(code: str, ttl: float = None) -> Optional[pd.DataFrame]:
     path = _cache_path(code)
     if not os.path.exists(path):
         return None
     mtime = os.path.getmtime(path)
-    if time.time() - mtime > config.CACHE_TTL_SECONDS:
+    if time.time() - mtime > (ttl if ttl is not None else config.CACHE_TTL_SECONDS):
         return None
     try:
         with open(path, "rb") as f:
@@ -169,7 +173,7 @@ def get_daily_history(code: str, days: int = None, adjust: str = "qfq", use_cach
     days = days or config.HIST_DAYS
     code = str(code).zfill(6)
     if use_cache:
-        cached = _load_cache(code)
+        cached = _load_cache(code, ttl=_HIST_TTL_SECONDS)
         if (cached is not None and len(cached) >= days and
                 {"open", "high", "low", "close", "volume"}.issubset(cached.columns)):
             return cached
