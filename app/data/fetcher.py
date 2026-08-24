@@ -20,7 +20,7 @@ from app.data import patch_requests  # noqa: F401  先注入 UA 补丁
 patch_requests.install()
 
 _SINA_HQ = "https://hq.sinajs.cn/list={symbols}"
-_HA_SINA_REFERER = "https://finance.sina.com.cn"
+_SINA_REFERER = "https://finance.sina.com.cn"
 _SINA_SPOT = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
 
 # 历史日线缓存 TTL(秒):收盘后的历史日线不再变动,延长到 24h 避免每 4h 全量重抓 680 池;

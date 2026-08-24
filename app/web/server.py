@@ -1781,10 +1781,21 @@ def _report_page_content(err: str = None) -> str:
 @app.route("/report")
 def page_report():
     err = request.args.get("err")
+    # 首访:优先渲染当日已落盘的 md 文件;不存在则生成并落盘(save 按 need_save_report)后渲染。
     if not _REPORT_HTML["html"] and not err:
         try:
-            from app.support import daily_report as _rep
-            _set_report(_rep.generate(use_cache=True, save=False))
+            from app.review.data import review_date
+            from app.support import settings as _st
+            rdate = review_date()
+            fname = rdate.strftime("%Y%m%d") if hasattr(rdate, "strftime") \
+                else str(rdate).replace("-", "")
+            md_text = _load_report_file(fname)
+            if md_text:
+                _set_report({"date": str(rdate), "markdown": md_text, "summary": ""})
+            else:
+                from app.support import daily_report as _rep
+                _set_report(_rep.generate(use_cache=True,
+                                          save=bool(_st.load().get("need_save_report", False))))
         except Exception as e:  # noqa: BLE001
             err = str(e)
     return _shell("report", "复盘报告", _report_page_content(err=err))
@@ -1792,9 +1803,10 @@ def page_report():
 
 @app.route("/api/report/generate", methods=["POST"])
 def api_report_generate():
-    """异步生成复盘:后台线程执行,页面轮询 /api/report/status 获取进度。"""
+    """异步生成复盘:后台线程执行,页面轮询 /api/report/status 获取进度。落盘按 need_save_report。"""
     import threading as _th
     from app.support import daily_report as rep
+    from app.support import settings as _st
     if _REPORT_STAGE["state"] == "running":
         return jsonify({"state": "running"})
 
@@ -1805,7 +1817,9 @@ def api_report_generate():
         _REPORT_STAGE["state"] = "running"
         _REPORT_STAGE["err"] = None
         try:
-            _set_report(rep.generate(use_cache=True, save=False, on_stage=_stage))
+            _set_report(rep.generate(use_cache=True,
+                                     save=bool(_st.load().get("need_save_report", False)),
+                                     on_stage=_stage))
         except Exception as e:  # noqa: BLE001
             _REPORT_STAGE["err"] = str(e)
         finally:
@@ -1844,7 +1858,9 @@ def api_report_summary():
     if not _REPORT_HTML["summary"]:
         try:
             from app.support import daily_report as _rep
-            _set_report(_rep.generate(use_cache=True, save=False))
+            from app.support import settings as _st
+            _set_report(_rep.generate(use_cache=True,
+                                      save=bool(_st.load().get("need_save_report", False))))
         except Exception as e:  # noqa: BLE001
             return jsonify({"error": str(e)}), 500
     return jsonify({"date": _REPORT_HTML["date"], "summary": _REPORT_HTML["summary"]})
