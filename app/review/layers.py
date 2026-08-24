@@ -59,9 +59,9 @@ def _lifecycle(row: dict, zt: dict, prev_names: set, prev_map: dict) -> str:
     net5 = row.get("net_5d_yi", 0) or 0
     pct = row.get("pct_chg", 0) or 0
     is_new = name not in prev_names          # 前3日榜单未出现 → 新晋候选
-    rank_now = row.get("rank", 99)
-    rank_prev = prev_map.get(name, 99)
-    decl = rank_prev < rank_now              # 排名下滑
+    rank_now = row.get("rank") or 99
+    rank_prev = prev_map.get(name)
+    decl = rank_prev is not None and rank_prev < rank_now   # 历史rank缺失时不参与排名下滑判定
     if (net5 < 0 and net < 0) or (decl and net < 0) or (name in prev_names and row.get("level") == "rejected"):
         return "退潮"
     if is_new:
@@ -145,7 +145,9 @@ def layer_review(d: dict) -> list:
     for rec in prev_days:
         for t in rec.get("top", []):
             prev_names.add(t["name"])
-            prev_map.setdefault(t["name"], t.get("rank", 99))
+            rk = t.get("rank")
+            if rk is not None:   # 旧存档 rank 可能缺失,跳过以免 None 参与比较
+                prev_map.setdefault(t["name"], rk)
     events = (d.get("events") or {}).get("hot") or []
 
     items = []
