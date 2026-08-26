@@ -121,6 +121,63 @@ def layer_summary(d: dict = None) -> dict:
     return {"core": core[:4], "branch": branch[:4], "strength": strength, "pattern": pattern}
 
 
+def _emotion_anchor_text(d: dict) -> str:
+    """情绪锚点(最高板连板龙头)当日深度解读: 开盘/最高/最低/收盘/振幅/换手/情绪定级。"""
+    try:
+        from app.support import mainline as _ml
+        zt = _ml._zt_pool()
+        top = sorted([z for z in zt if (z.get("boards") or 1) >= 2],
+                     key=lambda z: -(z.get("boards") or 1))
+        if not top:
+            return ""
+        anchor = top[0]
+        spot = _ml._a_spot_map()
+        fy = {}
+        try:
+            from app.review.operations import _fuyao_snapshot
+            fy = _fuyao_snapshot([anchor["code"]])
+        except Exception:  # noqa: BLE001
+            fy = {}
+        s = spot.get(anchor["code"]) or {}
+        fi = fy.get(anchor["code"]) or {}
+        close = fi.get("last_price") or s.get("price")
+        open_p = fi.get("open_price")
+        high = fi.get("high_price")
+        low = fi.get("low_price")
+        prev = fi.get("prev_price")
+        pct = fi.get("pct")
+        if pct is None:
+            pct = s.get("pct_chg")
+        amp = None
+        if high and low and prev and prev > 0:
+            amp = (high - low) / prev * 100
+        to = s.get("turnover") or 0
+        parts = [f"**{anchor.get('name')}**({anchor.get('boards')}板)"]
+        if open_p and close:
+            parts.append(f"开盘 {open_p:.2f}")
+        if close:
+            parts.append(f"收盘 {close:.2f}")
+        if pct is not None:
+            parts.append(f"涨跌 {pct:+.2f}%")
+        if amp is not None:
+            parts.append(f"振幅 {amp:.1f}%")
+        if to:
+            parts.append(f"换手 {to:.1f}%")
+        # 情绪定级
+        if pct is not None and pct <= -9.0:
+            grade = "跌停走弱,情绪崩塌风险"
+        elif pct is not None and pct >= 0 and amp is not None and amp >= 8:
+            grade = "高位宽幅震荡收红,情绪底部确认,但带动性有限"
+        elif pct is not None and pct >= 0:
+            grade = "红盘企稳,情绪偏暖"
+        else:
+            grade = "绿盘震荡,情绪偏弱,待观察"
+        return "情绪锚点" + "、".join(parts) + f" → **{grade}**。"
+    except Exception as e:  # noqa: BLE001
+        print(f"[layers] 情绪锚点分析失败: {e}")
+        return ""
+
+
 def layer_review(d: dict) -> list:
     """生成「主线三层分级研判」结构化 items。"""
     from app.support import mainline as _ml
@@ -151,6 +208,10 @@ def layer_review(d: dict) -> list:
     events = (d.get("events") or {}).get("hot") or []
 
     items = []
+    anchor_txt = _emotion_anchor_text(d)
+    if anchor_txt:
+        items.append({"head": "情绪锚点解读"})
+        items.append({"t": anchor_txt})
     items.append({"head": "主线分层总览(与决策引擎同源评分)"})
     if dec_core or dec_def:
         tag = f"今日决策引擎采纳:核心 **{_cell(dec_core)}**" + (f" / 防御备选 **{_cell(dec_def)}**" if dec_def else "")

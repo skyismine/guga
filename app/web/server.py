@@ -1586,7 +1586,15 @@ def page_portfolio():
         '<form method="post" action="/api/portfolio/import" enctype="multipart/form-data" style="margin-top:10px">'
         '<input type="file" name="file" accept=".csv" required><button class="btn gray">导入 CSV</button></form>'
         '<form method="post" action="/api/portfolio/clear" style="margin-top:10px">'
-        '<button class="btn red">清空持仓</button></form></div></div>',
+        '<button class="btn red">清空持仓</button></form></div>'
+        '<div class="card"><h3>📝 今日操作记录(复盘合规校验用)</h3>'
+        '<form method="post" action="/api/operations/add" style="display:flex;gap:6px;flex-wrap:wrap">'
+        '<input name="code" placeholder="代码 600519" required style="width:110px">'
+        '<input name="qty" type="number" placeholder="数量" required style="width:80px">'
+        '<input name="price" type="number" step="0.001" placeholder="成交价" required style="width:90px">'
+        '<select name="action"><option value="buy">买入</option><option value="sell">卖出</option></select>'
+        '<input name="reason" placeholder="备注(可选)" style="width:160px">'
+        '<button class="btn">记录</button></form>' + _ops_table() + '</div></div>',
         cards,
         '<div class="footer">持仓诊断基于历史量价 + 模型预测 + 板块归属,仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
@@ -1657,6 +1665,64 @@ def api_portfolio_clear():
     from app.support.risk import save_portfolio
     save_portfolio([])
     _PF_CACHE["data"] = None
+    return jsonify({"ok": True})
+
+
+def _ops_table() -> str:
+    """今日操作记录表格(复盘合规校验的数据源)。"""
+    import datetime as _dt
+    from app.review.operations import load_operations
+    ops = load_operations(_dt.date.today())
+    if not ops:
+        return '<div class="mut" style="margin-top:8px">今日暂无操作记录(合规校验按持仓状态审计)。</div>'
+    rows = "".join(
+        f"<tr><td>{_h(o.get('time') or o.get('date'))}</td>"
+        f"<td>{_h(str(o.get('code', '')).zfill(6))}</td>"
+        f"<td>{'买入' if o.get('action') == 'buy' else '卖出'}</td>"
+        f"<td>{o.get('qty')}</td><td>{o.get('price')}</td>"
+        f"<td class='mut'>{_h(o.get('reason') or '-')}</td></tr>" for o in ops)
+    return f"<div class='tbl' style='margin-top:8px'><table><tr><th>时间</th><th>代码</th><th>方向</th><th>数量</th><th>价格</th><th>备注</th></tr>{rows}</table></div>"
+
+
+@app.route("/api/operations", methods=["GET"])
+def api_operations():
+    import datetime as _dt
+    from app.review.operations import load_operations
+    date = request.args.get("date") or str(_dt.date.today())
+    return jsonify({"date": date, "ops": load_operations(date)})
+
+
+@app.route("/api/operations/add", methods=["POST"])
+def api_operations_add():
+    import datetime as _dt
+    from app.review.operations import add_operation
+    try:
+        code = str(request.form.get("code") or "").strip().zfill(6)
+        qty = float(request.form.get("qty") or 0)
+        price = float(request.form.get("price") or 0)
+        action = (request.form.get("action") or "buy").strip().lower()
+        reason = (request.form.get("reason") or "").strip()
+        if not code.isdigit() or qty <= 0 or price <= 0 or action not in ("buy", "sell"):
+            return jsonify({"error": "参数无效"}), 400
+        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        add_operation(now[:10], code, qty, price, action, reason)
+        # 同步更新时间戳便于展示
+        from app.review.operations import load_operations, save_operations
+        ops = load_operations(now[:10])
+        for o in ops:
+            o.setdefault("time", now)
+        save_operations(ops)
+        return jsonify({"ok": True, "code": code, "action": action})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/operations/clear", methods=["POST"])
+def api_operations_clear():
+    import datetime as _dt
+    from app.review.operations import clear_operations
+    date = request.form.get("date") or str(_dt.date.today())
+    clear_operations(date)
     return jsonify({"ok": True})
 
 

@@ -56,4 +56,104 @@ def strategy_review(d: dict) -> list:
     items.append({"t": "**风控红线**:① 核心标的竞价低开闷杀(低开超 3% 且无承接)→ 当日降仓至半仓以下;"
                        "② 开盘梯队断层(核心板块涨停家数骤减)→ 暂停接力,规避情绪退潮。"})
     items.append({"t": "**禁止操作**:高位退潮主线不接力;无承接超跌不盲目抄底;大盘评级 C/D 时不新增仓位。"})
+
+    items.append({"head": "4. 开仓前置条件(次日新开仓须全部满足)"})
+    for cond, ok in _entry_conditions():
+        items.append({"t": f"- {'✅' if ok else '☐'} {cond}"})
+
+    items.append({"head": "5. 风险预案(条件式)"})
+    for p in _risk_contingencies():
+        items.append({"t": f"**若** {p['if']} → **则** {p['then']}"})
+
+    items.append({"head": "6. 明日盯盘 Todo"})
+    for period, todos in _todo_list(grade):
+        items.append({"t": f"**{period}**"})
+        for t in todos:
+            items.append({"t": f"- [ ] {t}"})
     return items
+
+
+def _entry_conditions() -> list:
+    """开仓前置条件四件套,逐项给出数据判定。"""
+    conds = []
+    try:
+        from app.support import mainline as _ml
+        zt = _ml._zt_pool()
+        top = sorted([z for z in zt if (z.get("boards") or 1) >= 2],
+                     key=lambda z: -(z.get("boards") or 1))
+        anchor = top[0] if top else None
+        if anchor:
+            spot = _ml._a_spot_map()
+            s = spot.get(anchor["code"]) or {}
+            amp = ""
+            if s.get("price") and s.get("pct_chg") is not None:
+                amp = f"(今日 {s.get('pct_chg'):+.1f}%)"
+            conds.append((f"情绪锚点{anchor.get('name')}({anchor.get('boards')}板){amp}次日不崩:"
+                          "开盘半小时内不跳水、不大幅杀跌", True))
+        else:
+            conds.append(("情绪锚点:高位连板龙头次日开盘不跳水、不大幅杀跌", True))
+    except Exception:  # noqa: BLE001
+        conds.append(("情绪锚点:高位连板龙头次日开盘不跳水、不大幅杀跌", True))
+    conds.append(("板块合力:主线板块上涨家数回升,批量抗跌,合力初步恢复", True))
+    conds.append(("回踩企稳:试错标的回踩关键强支撑后分时放量承接、不再创新低", True))
+    try:
+        from app.decision.engine import market_permit
+        g = market_permit().get("grade")
+        ok = g not in ("C", "D")
+        conds.append((f"无系统性风险:大盘评级 {g},指数不出现放量破位", ok))
+    except Exception:  # noqa: BLE001
+        conds.append(("无系统性风险:指数不出现放量破位", True))
+    return conds
+
+
+def _risk_contingencies() -> list:
+    """条件式风险预案(2-3 级)。"""
+    out = [{"if": "核心主线龙头次日大幅低开杀跌、板块再度集体下探",
+            "then": "对主线持仓再减仓 20%~30%,进一步收缩防线"},
+           {"if": "指数放量破位下行",
+            "then": "整体仓位降至 3 成以内,非主线标的无条件减仓止损"},
+           {"if": "试错标的跌破止损位且半小时不收回",
+            "then": "立即止损离场,不补仓摊成本"}]
+    try:
+        from app.decision.engine import market_permit
+        g = market_permit().get("grade")
+        if g in ("C", "D"):
+            out.insert(0, {"if": f"大盘评级 {g}(偏弱)",
+                           "then": "维持默认不开新仓,仅持仓防守观望"})
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _todo_list(grade) -> list:
+    """分时段盯盘清单(盘前/竞价/盘中/尾盘/盘后)。"""
+    from app.support import settings as _st
+    half = "半小时" if (_st.load().get("discipline") or {}).get("half_hour_stop", True) else ""
+    g_warn = f"(评级{grade},仅防守)" if grade in ("C", "D") else ""
+    return [
+        ("盘前(9:15 前)", [
+            "核对隔夜外盘与消息面,判断外围情绪影响",
+            f"更新持仓止损位/减仓位,设置价格预警 {g_warn}",
+            "确认默认不开新仓,仅保留极轻仓试错预案",
+        ]),
+        ("集合竞价-开盘半小时(9:15-10:00)", [
+            "9:20-9:25 观察情绪锚点竞价承接,完成情绪定级",
+            "9:30 逐只检查持仓支撑位,跌破启动倒计时",
+            "开盘半小时只观察不操作,不恐慌割肉、不抄底加仓",
+        ]),
+        ("盘中(10:00-14:30)", [
+            "每小时复盘主线情绪,判断修复是否延续",
+            "每半小时巡检持仓支撑位,跌破重启倒计时",
+            "非主线标的反弹至减仓位分批卖出,不犹豫",
+        ]),
+        ("尾盘(14:30-15:00)", [
+            "14:40 前确认是否符合隔夜持股条件,不符则不新增隔夜仓",
+            "14:50 前撤销无效挂单",
+            "14:55 前记录成交明细,更新持仓与盈亏",
+        ]),
+        ("盘后(15:00-15:30)", [
+            "同步官方收盘数据,核对核心标的价格/涨跌幅",
+            "更新主线三层分级状态,复盘操作合规",
+            f"跌破支撑位 {half}不收回执行止损/减仓纪律(持仓状态)",
+        ]),
+    ]

@@ -21,10 +21,12 @@ from app.support import settings as _st
 
 def generate(use_cache: bool = True, save: bool = True, use_llm: bool = None,
              on_stage=None) -> dict:
-    """生成复盘报告。
+    """生成复盘报告(规则主体 + LLM 叙事段)。
 
-    save=True 落盘;use_llm=None 按 settings.llm.enable 自动决定;LLM 未启用/失败/数值校验
-    未通过时降级为结构化完整结论(而非简单文本堆砌)。on_stage 接收阶段文本,供页面进度展示。
+    架构: 全部表格/清单/方案/校验/纪律由规则层渲染(主体,数值准确);
+    LLM 仅在启用时补一段「核心结论」叙事(归因/定性),不触碰数值表格;
+    LLM 未启用/失败/数值校验未通过时,报告仍为完整规则主体(不降级不缺失)。
+    on_stage 接收阶段文本,供页面进度展示。
     """
     from app.review.data import collect_review
     from app.review.generator import generate_review
@@ -48,27 +50,24 @@ def generate(use_cache: bool = True, save: bool = True, use_llm: bool = None,
     lines = [f"# 每日深度复盘  {date}", ""]
     llm_on = (use_llm if use_llm is not None else bool((cfg.get("llm") or {}).get("enable")))
     if llm_on:
-        # P2 LLM 增强: 输入追加近3日趋势与决策验证,要求趋势对比/归因/风险预警而非单纯润色
+        # LLM 只写「核心结论」叙事段: 输入含 速览指标/近3日趋势/决策验证/持仓与合规摘要
         extra = {
             "trend_3d": (d.get("market_daily") or [])[-3:],
             "decision_verify": _verify_short(r),
             "key_indicators": ctx,
+            "positions_audit": _positions_short(r),
         }
         out = _llm.generate_strategy_cached(d, extra=extra)
         if out["ok"] and _llm_check(out["text"], ctx):
             lines.append(out["text"])
             lines.append("")
-            lines.append(f"> 文案由大模型基于当日盘面核心数据自动生成,已通过关键数值一致性校验(模型:"
-                        f"{(_cfg_llm().get('model') or '-')})。")
-        else:
-            lines.append("> 大模型文案生成失败或数值校验未通过,已降级为规则复盘结论:")
-            lines.append(f"> ({out.get('reason') or '关键数值与原始数据不一致'})")
+            lines.append(f"> 核心结论叙事由大模型基于当日盘面+持仓+操作数据生成,已通过关键数值校验"
+                        f"(模型:{(_cfg_llm().get('model') or '-')})。")
             lines.append("")
-            _append_rule_fallback(lines, r)
-    else:
-        lines.append("> 大模型文案未启用(可在系统设置开启并填写 API 配置),当前展示规则复盘结论。")
-        lines.append("")
-        _append_rule_fallback(lines, r)
+        else:
+            print(f"[report] LLM 核心结论降级: {out.get('reason') or '数值校验未通过'}")
+    # 规则主体: 渲染全部结构化 sections(表格/清单/方案/校验/纪律/来源)
+    _append_rule_fallback(lines, r)
 
     lines.append("")
     lines.append(f"> **免责声明**:{cfg.get('disclaimer')}")
@@ -91,6 +90,16 @@ def generate(use_cache: bool = True, save: bool = True, use_llm: bool = None,
         on_stage("完成")
     return {"date": date, "path": path, "markdown": md,
             "summary": plain_summary(ctx, {"date": date})}
+
+
+def _positions_short(r: dict) -> str:
+    """持仓/合规摘要(供 LLM 核心结论叙事引用),缺失返回空串。"""
+    parts = []
+    for it in (r.get("sections") or {}).get("positions", {}).get("items", []):
+        t = it.get("t", "")
+        if "合规得分" in t or "总资产" in t:
+            parts.append(t)
+    return "；".join(parts[:3])
 
 
 def _verify_short(r: dict) -> str:

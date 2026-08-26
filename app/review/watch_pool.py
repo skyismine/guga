@@ -59,6 +59,24 @@ def _role_of(seg_key: str, level: str) -> str:
     return "弹性领涨" if seg_key == "aggressive" else "异动领涨"
 
 
+def _rr(it: dict):
+    """盈亏比 = (目标 - 买入)/ (买入 - 止损),取 entry_low 为买入参考。"""
+    lv = it.get("levels") or {}
+    entry = lv.get("entry_low") or lv.get("support")
+    tgt, stop = lv.get("target"), lv.get("stop_loss")
+    if entry and tgt and stop and (entry - stop) > 0:
+        return (tgt - entry) / (entry - stop)
+    return None
+
+
+def _suggest_pos(role: str) -> str:
+    """建议仓位: 情绪/弹性类试错仓 0.5%, 中军 1%, ETF 2%(受 discipline.single_cap 约束)。"""
+    from app.support import settings as _st
+    cap = float((_st.load().get("discipline") or {}).get("single_cap", 0.02) or 0.02)
+    base = {"情绪龙头": 0.005, "中军龙头": 0.01, "弹性领涨": 0.005, "异动领涨": 0.005, "ETF": 0.02}.get(role, 0.005)
+    return f"{min(base, cap) * 100:.1f}%"
+
+
 def _pick(seg: dict) -> dict:
     for it in seg.get("items", []):
         if it.get("error"):
@@ -83,8 +101,10 @@ def _watch_pool_leader(d: dict) -> list:
             lv = it.get("levels") or {}
             rows_out.append([name, role, it.get("code"), it.get("name"),
                              _cell(f"{it.get('pct_chg', 0):+.2f}%"),
-                             f"{_cell(lv.get('support'))}/{_cell(lv.get('resistance'))}",
-                             _OBSERVE_NOTE[seg_key]])
+                             _cell(f"{lv.get('entry_low') or lv.get('support')}~{lv.get('entry_high') or lv.get('resistance')}"),
+                             _cell(lv.get("stop_loss")), _cell(lv.get("target")),
+                             _cell(f"{_rr(it):.1f}" if _rr(it) else "-"),
+                             _suggest_pos(role), _OBSERVE_NOTE[seg_key]])
     # 发酵层: 每板块 弹性领涨
     for r in branch[:3]:
         name = r["industry"]
@@ -95,8 +115,10 @@ def _watch_pool_leader(d: dict) -> list:
         lv = it.get("levels") or {}
         rows_out.append([name, "弹性领涨", it.get("code"), it.get("name"),
                          _cell(f"{it.get('pct_chg', 0):+.2f}%"),
-                         f"{_cell(lv.get('support'))}/{_cell(lv.get('resistance'))}",
-                         _OBSERVE_NOTE["branch"]])
+                         _cell(f"{lv.get('entry_low') or lv.get('support')}~{lv.get('entry_high') or lv.get('resistance')}"),
+                         _cell(lv.get("stop_loss")), _cell(lv.get("target")),
+                         _cell(f"{_rr(it):.1f}" if _rr(it) else "-"),
+                         _suggest_pos("弹性领涨"), _OBSERVE_NOTE["branch"]])
     # 观察层: 每板块 异动领涨
     for r in watch[:3]:
         name = r["industry"]
@@ -107,8 +129,10 @@ def _watch_pool_leader(d: dict) -> list:
         lv = it.get("levels") or {}
         rows_out.append([name, "异动领涨", it.get("code"), it.get("name"),
                          _cell(f"{it.get('pct_chg', 0):+.2f}%"),
-                         f"{_cell(lv.get('support'))}/{_cell(lv.get('resistance'))}",
-                         _OBSERVE_NOTE["watch"]])
+                         _cell(f"{lv.get('entry_low') or lv.get('support')}~{lv.get('entry_high') or lv.get('resistance')}"),
+                         _cell(lv.get("stop_loss")), _cell(lv.get("target")),
+                         _cell(f"{_rr(it):.1f}" if _rr(it) else "-"),
+                         _suggest_pos("异动领涨"), _OBSERVE_NOTE["watch"]])
     return rows_out
 
 
@@ -245,7 +269,8 @@ def watch_pool_review(d: dict) -> list:
     rows1 = _watch_pool_leader(d)
     if rows1:
         items.append({"table": {"title": "",
-                                "cols": ["板块", "角色", "代码", "名称", "当日涨幅", "支撑/压力", "观察要点"],
+                                "cols": ["板块", "角色", "代码", "名称", "当日涨幅",
+                                         "买入区间", "止损", "目标", "盈亏比", "建议仓位", "观察要点"],
                                 "rows": rows1}})
     else:
         items.append({"t": "主线龙头候选暂缺(决策引擎标的数据未就绪)。"})
