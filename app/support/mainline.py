@@ -5,7 +5,7 @@
   权重随市场评级动态切换(A级 5日20%+单日80%, C/D级 5日70%+单日30%, 默认 40%/60%)
 - 趋势强度 30:板块涨跌幅 + 涨停家数
 - 情绪共振 20:市场恐贪指数档位
-- 消息催化 10:财联社电报标题命中概念关键词
+- 消息催化 10:财联社电报标题命中概念关键词(缺失时降级东财要闻,再用同花顺热榜/异动补充)
 
 准入规则:剔除 5日主力资金累计净流出的板块,以及 5日资金净流入但股价累计涨幅≤0 的量价背离板块,
 淘汰板块附带 reject_reason。
@@ -308,13 +308,66 @@ def _news_mentions() -> dict:
         print("[mainline] 财联社电报超时/失败,降级东财要闻统计 news_mentions")
         out = _with_timeout(_count_em, 20, None, name="news_em")
     if out is None:
-        print("[mainline] 东财要闻亦失败,news_mentions 为空(未落盘,下次自动重试)")
+        out = {}
+    # 同花顺热度补充: 财联社/东财新闻缺失时,消息催化因子仍有题材热度支撑(fuyao 官方通道,无反爬)
+    try:
+        from app.support import settings as _st
+        if (_st.load().get("fuyao") or {}).get("news_heat_supplement", True):
+            heat = _ths_heat_mentions()
+            for k, v in heat.items():
+                out[k] = out.get(k, 0) + v
+    except Exception as e:  # noqa: BLE001
+        print(f"[mainline] 同花顺热度补充 news_mentions 失败: {e}")
+    if not out:
+        print("[mainline] 新闻与热度 mentions 均为空(未落盘,下次自动重试)")
         return {}
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False)
     except OSError:
         pass
+    return out
+
+
+def _ths_heat_mentions() -> dict:
+    """同花顺特色数据(热榜/飙升榜/异动) → 概念题材热度 mentions(fuyao 官方通道,无反爬)。
+
+    设计取舍: 消息催化 news_s 是 0/1 布尔,补充源只提高召回(更多概念被命中),不改打分结构;
+    热榜/飙升榜个股经 concept_features 映射到所属概念;异动关键词(keyword_list)直接与
+    概念关键词匹配;每只股票每概念只计 1 次,防重复抬高。任一端点失败不影响其余。
+    """
+    from app.data.fuyao import enabled as _fy_enabled
+    out = {}
+    if not _fy_enabled():
+        return out
+    from app.features.concept_features import get_concepts
+
+    def _bump(codes, kw_list):
+        for c in codes:
+            c = str(c).zfill(6)
+            for con in (get_concepts(c) or []):
+                out[con] = out.get(con, 0) + 1
+        for kw in kw_list:
+            for name in _all_concepts():
+                k = _concept_kw(name)
+                if k and k in kw:
+                    out[name] = out.get(name, 0) + 1
+
+    try:
+        from app.data.fuyao import get_hot_stock_list, get_anomaly_analysis_list
+        hot = get_hot_stock_list("day")[:30]
+        _bump([str(x.get("ticker", ""))[-6:] for x in hot if x.get("ticker")], [])
+        try:
+            from app.data.fuyao import get_skyrocket_list
+            sk = get_skyrocket_list("day")[:20]
+            _bump([str(x.get("ticker", ""))[-6:] for x in sk if x.get("ticker")], [])
+        except Exception:  # noqa: BLE001
+            pass
+        an = get_anomaly_analysis_list()[:20]
+        _bump([str(x.get("thscode", ""))[-6:] for x in an if x.get("thscode")],
+              [k for x in an for k in (x.get("keyword_list") or [])])
+    except Exception as e:  # noqa: BLE001
+        print(f"[mainline] 同花顺热度 mentions 失败: {e}")
     return out
 
 

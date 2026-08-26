@@ -269,6 +269,7 @@ DEFAULTS = {
         "base_url": "https://fuyao.aicubes.cn",
         "ttl": 3600,                 # 数据内存缓存(秒)
         "qps_gap": 0.3,              # 单次请求最小间隔(秒),规避 4001 频率超限
+        "news_heat_supplement": True,  # 财联社/东财新闻缺失时,用同花顺热榜/飙升榜/异动补充消息催化因子
     },
     # ---- 第三轮:前端体验优化开关(Web 展示/交互,不影响任何计算逻辑)
     "web_ui": {
