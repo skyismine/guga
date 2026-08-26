@@ -135,6 +135,12 @@ def get_hot_stock_list(period: str = "day"):
     return (data or {}).get("item") or []
 
 
+def get_hot_stock_list_history(date: str):
+    """历史热股榜排行(date=YYYY-MM-DD,近一年)。"""
+    data = _get("/api/a-share/special-data/hot-stock-list-history", {"date": date}, ttl=86400)
+    return (data or {}).get("item") or []
+
+
 def get_skyrocket_list(period: str = "day"):
     """热度排名飙升榜 Top30(day 日榜 / hour 小时榜)。"""
     data = _get("/api/a-share/special-data/skyrocket-list", {"period": period}, ttl=1800)

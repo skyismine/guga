@@ -258,14 +258,26 @@ def _zt_pool(date=None, refresh=False) -> list:
     return out
 
 
-def _news_mentions() -> dict:
-    """财联社电报中命中概念名的次数(当日缓存)。
+def _normalize_news(cached: dict) -> dict:
+    """兼容新旧缓存格式 → 统一 {概念: {"news": n, "heat": h}}。"""
+    out = {}
+    for k, v in (cached or {}).items():
+        if isinstance(v, dict):
+            out[k] = {"news": int(v.get("news", 0) or 0), "heat": int(v.get("heat", 0) or 0)}
+        else:  # 旧格式 {概念: 次数},视为纯新闻
+            out[k] = {"news": int(v or 0), "heat": 0}
+    return out
 
+
+def _news_mentions() -> dict:
+    """财联社电报/东财要闻 + 同花顺热度 命中概念名的次数(当日缓存)。
+
+    返回 {概念: {"news": n, "heat": h}}:news 为财联社/东财命中数,
+    heat 为同花顺热榜/飙升榜/异动映射的题材热度数,供「独立加权」分级使用。
     容错设计:
     - 财联社电报超时/失败时,降级用东财要闻(stock_info_global_em)统计;
-    - 两级来源均失败才返回空 dict;
-    - 失败不落盘空缓存,次日/下次调用自动重试;
-    - 失败原因打印日志,便于与"真无相关新闻"区分。
+    - 两级来源均失败仍保留 heat(不归零);均空才返回空 dict;
+    - 失败不落盘空缓存,次日/下次调用自动重试。
     """
     path = os.path.join(config.DATA_DIR, f"news_{_today()}.json")
     if os.path.exists(path):
@@ -273,7 +285,7 @@ def _news_mentions() -> dict:
             with open(path, encoding="utf-8") as f:
                 cached = json.load(f)
             if cached:
-                return cached
+                return _normalize_news(cached)
         except (OSError, ValueError):
             pass
 
@@ -309,24 +321,26 @@ def _news_mentions() -> dict:
         out = _with_timeout(_count_em, 20, None, name="news_em")
     if out is None:
         out = {}
-    # 同花顺热度补充: 财联社/东财新闻缺失时,消息催化因子仍有题材热度支撑(fuyao 官方通道,无反爬)
+    res = {k: {"news": int(v or 0), "heat": 0} for k, v in out.items()}
+    # 同花顺热度: 财联社/东财新闻缺失时催化因子仍有题材热度支撑(fuyao 官方通道,无反爬)
     try:
         from app.support import settings as _st
         if (_st.load().get("fuyao") or {}).get("news_heat_supplement", True):
             heat = _ths_heat_mentions()
             for k, v in heat.items():
-                out[k] = out.get(k, 0) + v
+                res.setdefault(k, {"news": 0, "heat": 0})
+                res[k]["heat"] += int(v)
     except Exception as e:  # noqa: BLE001
         print(f"[mainline] 同花顺热度补充 news_mentions 失败: {e}")
-    if not out:
+    if not res:
         print("[mainline] 新闻与热度 mentions 均为空(未落盘,下次自动重试)")
         return {}
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False)
+            json.dump(res, f, ensure_ascii=False)
     except OSError:
         pass
-    return out
+    return res
 
 
 def _ths_heat_mentions() -> dict:
@@ -997,14 +1011,24 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
             trend = pct * 0.8 + 0.2 * zt_norm
         direction = 1.0 if f["pct_chg"] >= 0 else 0.5
         senti = (fg / 100.0) * direction
-        news_s = 1.0 if news.get(name) else 0.0
-        if (weaken_news_on_no_5d_money and news.get(name)
+        # 催化因子: 新闻布尔(10分) + 热度分级(独立维度,不占基础分)
+        m = news.get(name) or {}
+        news_n = int(m.get("news", 0) or 0)
+        heat_n = int(m.get("heat", 0) or 0)
+        news_s = 1.0 if news_n else 0.0
+        heat_enabled = bool(w.get("heat_enabled", True))
+        heat_w = float(w.get("heat", 3)) if heat_enabled else 0.0
+        heat_s = min(1.0, heat_n / 3.0) if heat_enabled else 0.0   # 3 次热度=满分(分级)
+        if (weaken_news_on_no_5d_money and (news_n or heat_n)
                 and f.get("net_5d_yi", 0) <= 0):
-            # 消息脉冲削弱:无5日资金净流入时,单日利好消息不配满分(防一日游行情抬升分数)
+            # 消息/热度脉冲削弱:无5日资金净流入时,催化满分降为低档位(防一日游行情抬升分数)
             news_s = news_weak_ratio
+            heat_s = heat_s * news_weak_ratio
         score = (f["fund_score"] + w.get("trend", 30) * trend
-                 + w.get("sentiment", 20) * senti + w.get("news", 10) * news_s)
-        row = {**f, "score": round(score, 2), "zt_count": z, "news_hits": news.get(name, 0),
+                 + w.get("sentiment", 20) * senti
+                 + w.get("news", 10) * news_s + heat_w * heat_s)
+        row = {**f, "score": round(score, 2), "zt_count": z,
+               "news_hits": news_n + heat_n,
                "breakdown": {
                    "fund": f["fund_score"],
                    "fund_5d": f.get("fund_score_5d"),
@@ -1012,6 +1036,7 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
                    "trend": round(w.get("trend", 30) * trend, 2),
                    "sentiment": round(w.get("sentiment", 20) * senti, 2),
                    "news": round(w.get("news", 10) * news_s, 2),
+                   "heat": round(heat_w * heat_s, 2),
                }}
         if ladder_on:
             row["ladder_score"] = ladder_map[name]["score"]

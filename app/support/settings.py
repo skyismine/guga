@@ -11,8 +11,9 @@ from app import config
 _SETTINGS_PATH = os.path.join(config.DATA_DIR, "settings.json")
 
 DEFAULTS = {
-    # ---- 模块1 主线板块打分权重(合计 100)
-    "score_weights": {"capital": 40, "trend": 30, "sentiment": 20, "news": 10},
+    # ---- 模块1 主线板块打分权重(基础合计 100; heat 为可选独立催化维度,不占基础分)
+    "score_weights": {"capital": 40, "trend": 30, "sentiment": 20, "news": 10,
+                      "heat_enabled": True, "heat": 3},
     "mainline_top_n": 2,          # Top-N 为核心主线
     "mainline_branch_top_n": 5,   # 前 N 名(含主线)标注补涨支线
     "mainline_dynamic_weight": True,  # 资金面动态权重开关:A级 5日20%/单日80%, C/D级 5日70%/单日30%
