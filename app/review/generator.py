@@ -602,7 +602,8 @@ def generate_review(d: Dict) -> Dict:
     模块顺序(与页面渲染一致,Markdown 兼容):
       30秒速览 → 大盘综述(周期定位) → 板块轮动拆解(结构分析) → 主线三层分级研判
       → 明日重点观察标的池 → 核心事件解读 → 资金面与情绪面交叉验证
-      → 当日决策效果验证 → 盘面核心结论 → 明日交易策略
+      → 同花顺特色数据(连板梯队/热榜/龙虎榜/异动) → 当日决策效果验证
+      → 盘面核心结论 → 明日交易策略
     """
     overview = _index_overview(d)
     sector = _sector_rotation(d)
@@ -611,10 +612,12 @@ def generate_review(d: Dict) -> Dict:
     from app.review.verify import verify_review
     from app.review.strategy_today import strategy_review
     from app.review.snapshot import build_snapshot
+    from app.review.special_data import special_data_review
     layers_items = layer_review(d)
     watch_items = watch_pool_review(d)
     events = _events(d)
     capital = _capital_sentiment(d)
+    ths_items = special_data_review(d)
     verify_items = verify_review(d)
     conclusion = _conclusion(d)
     strategy_items = strategy_review(d)
@@ -651,9 +654,10 @@ def generate_review(d: Dict) -> Dict:
         "watch_pool": {"title": "四、明日重点观察标的池", "items": watch_items},
         "events": {"title": "五、核心事件深度解读", "items": events},
         "capital_sentiment": {"title": "六、资金面与情绪面交叉验证", "items": capital},
-        "verify": {"title": "七、当日决策效果验证", "items": verify_items},
-        "conclusion": {"title": "八、盘面核心结论", "items": conclusion},
-        "strategy": {"title": "九、明日交易策略", "items": strategy_items},
+        "ths_special": {"title": "七、同花顺特色数据(连板梯队/热榜/龙虎榜/异动)", "items": ths_items},
+        "verify": {"title": "八、当日决策效果验证", "items": verify_items},
+        "conclusion": {"title": "九、盘面核心结论", "items": conclusion},
+        "strategy": {"title": "十、明日交易策略", "items": strategy_items},
     }
     for sec in sections.values():
         sec["lines"] = _items_to_lines(sec["items"])

@@ -149,9 +149,9 @@ def _append_mkt_all_row() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"[market_features] 全市场宽度获取失败: {e}")
         return
+    rets = pd.Series(universe)
     if len(universe) < 500:
         return  # 快照残缺时放弃本日,防脏数据
-        rets = pd.Series(universe)
     store[key] = {
         "n": int(len(rets)),
         "mkt_all_adv_ratio": float((rets > 0).mean()),
@@ -181,6 +181,83 @@ def _mkt_all_frame(index: pd.DatetimeIndex) -> pd.DataFrame:
     s.index = pd.to_datetime(s.index)
     s = s.sort_index().drop(columns=["n"], errors="ignore")
     return s.reindex(index).ffill()
+
+
+def backfill_mkt_all(days_cap: int = None) -> int:
+    """P2: 用 fuyao 全市场 10 年日K Parquet 回填 mkt_all_ 历史宽度。
+
+    解决的问题: mkt_all_ 上线以来仅靠每日快照增量积累(约需 60 交易日后才有参选资格),
+    回填后立即具备完整历史序列,可参与月度重训特征筛选。
+
+    设计取舍(注释标注):
+    - 数据源为不复权原始价,日收益用 close.pct_change 计算;Parquet 无名称/上市日期字段,
+      无法做 ST/次新过滤,与每日快照口径(过滤 ST/N/C)存在轻微差异——回填只填充
+      快照积累缺失的历史日期,已积累的日期以快照口径为准,不覆盖;
+    - 停牌日 close 为 NaN → 该股该日不参与当日横截面(groupby 天然剔除);
+    - 大市值权重不计(等权),与 _breadth_frame/mkt_all 快照口径一致。
+    返回回填填充的日期数。需先安装 pyarrow,且 settings.fuyao.enabled=True。
+    """
+    from app.data.fuyao import enabled as _fy_enabled
+    from app.data.fuyao import get_market_dump_url as _fy_url
+    if not _fy_enabled():
+        print("[mkt_all] 回填跳过: fuyao 未启用")
+        return 0
+    import pyarrow.parquet as pq
+    import requests
+
+    store = {}
+    try:
+        with open(_MKT_ALL_PATH, encoding="utf-8") as f:
+            store = json.load(f)
+    except (OSError, ValueError):
+        store = {}
+    first_inc = min(store) if store else None   # 已有快照积累的最早日期
+
+    url = _fy_url("daily-k")
+    pq_path = os.path.join(config.DATA_DIR, "market_dump_daily_k.parquet")
+    print(f"[mkt_all] 下载全市场日K Parquet...")
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(pq_path, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+    print(f"[mkt_all] 下载完成 {os.path.getsize(pq_path) / 1e6:.0f}MB")
+
+    tbl = pq.read_table(pq_path, columns=["thscode", "date_ms", "close_price"])
+    df = tbl.to_pandas()
+    df["thscode"] = df["thscode"].astype(str).str.replace(r"(\.SH|\.SZ|\.BJ)$", "", regex=True)
+    df["date"] = pd.to_datetime(df["date_ms"], unit="ms").dt.tz_localize(
+        "UTC").dt.tz_convert("Asia/Shanghai").dt.strftime("%Y-%m-%d")
+    df["ret"] = df.groupby("thscode")["close_price"].pct_change()
+    df = df.dropna(subset=["ret", "date"])
+
+    g = df.groupby("date")
+    feats = pd.DataFrame({
+        "n": g.size(),
+        "mkt_all_adv_ratio": g["ret"].apply(lambda x: float((x > 0).mean())),
+        "mkt_all_avg_ret_1": g["ret"].mean(),
+        "mkt_all_dispersion": g["ret"].std(),
+        "mkt_all_hot_ratio": g["ret"].apply(lambda x: float((x > 0.05).mean())),
+    })
+    feats = feats.sort_index()
+    if days_cap:
+        feats = feats.iloc[-days_cap:]
+
+    filled = 0
+    for date, row in feats.iterrows():
+        if date in store:
+            continue                     # 已有快照积累的日期不覆盖
+        if first_inc and date >= first_inc:
+            continue
+        store[date] = {k: (None if pd.isna(v) else round(float(v), 6))
+                       for k, v in row.items() if k != "n"}
+        store[date]["n"] = int(row["n"])
+        filled += 1
+    if filled:
+        with open(_MKT_ALL_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False)
+    print(f"[mkt_all] 回填 {filled} 个历史交易日(总量 {len(store)})")
+    return filled
 
 
 def _index_frame(days: int) -> pd.DataFrame:
@@ -407,6 +484,11 @@ def basis_label(basis_avg: float) -> str:
 
 
 if __name__ == "__main__":
+    import sys as _sys
+    if "--backfill" in _sys.argv:
+        n = backfill_mkt_all()
+        print(f"回填完成,新增 {n} 个交易日")
+        _sys.exit(0)
     mf = build_market_frame()
     print(f"市场特征列: {len(mf.columns)}")
     print(mf[["market_adv_ratio", "market_fear_greed", "market_basis_avg"]].tail(5).to_string())

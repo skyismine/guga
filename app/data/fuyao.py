@@ -129,6 +129,31 @@ def get_limit_up_ladder():
     return (data or {}).get("item") or []
 
 
+def get_hot_stock_list(period: str = "day"):
+    """同花顺 A 股热股榜 Top30(day=24小时榜 / hour=小时榜)。"""
+    data = _get("/api/a-share/special-data/hot-stock-list", {"period": period}, ttl=1800)
+    return (data or {}).get("item") or []
+
+
+def get_skyrocket_list(period: str = "day"):
+    """热度排名飙升榜 Top30(day 日榜 / hour 小时榜)。"""
+    data = _get("/api/a-share/special-data/skyrocket-list", {"period": period}, ttl=1800)
+    return (data or {}).get("item") or []
+
+
+def get_dragon_tiger_list(board_type: str = "all"):
+    """龙虎榜榜单(all 全部 / org 机构榜 / hot_money 游资榜)。"""
+    data = _get("/api/a-share/special-data/dragon-tiger-list", {"board_type": board_type}, ttl=1800)
+    return (data or {}) if isinstance(data, dict) else {}
+
+
+def get_anomaly_analysis_list(tag_codes: str = None):
+    """当日个股异动原因列表(可选 tag_codes: LIMIT_UP/LIMIT_DOWN/SHARP_RISE/SHARP_FALL...)。"""
+    params = {"tag_codes": tag_codes} if tag_codes else {}
+    data = _get("/api/a-share/special-data/anomaly-analysis-list", params, ttl=1800)
+    return (data or {}).get("item") or []
+
+
 def get_ths_index_list(tag: str = "cn_concept"):
     """同花顺指数目录(概念/行业/区域/特色)。"""
     data = _get("/api/a-share-index/catalog/ths-index-list", {"tag": tag}, ttl=86400)
@@ -169,3 +194,20 @@ def get_calendar_trading_days():
     """近一年交易日序列(升序)。"""
     data = _get("/api/a-share/calendar/trading-days", {}, ttl=86400)
     return (data or {}).get("item") or []
+
+
+def get_market_dump_url(kind: str = "daily-k") -> str:
+    """全市场 Parquet 预签名下载链接(短时效,取后立即下载)。
+
+    kind: daily-k(10年日K) / daily-k-10d(近10交易日) / adjustment-factors(复权因子)。
+    """
+    path = {
+        "daily-k": "/api/dump/market-dumps/daily-k/download-url",
+        "daily-k-10d": "/api/dump/market-dumps/daily-k-10d/download-url",
+        "adjustment-factors": "/api/dump/market-dumps/adjustment-factors/download-url",
+    }[kind]
+    data = _get(path, {}, ttl=0) or {}
+    url = (data.get("presigned_url") or "").strip()
+    if not url:
+        raise RuntimeError(f"fuyao 未返回 {kind} 下载链接")
+    return url
