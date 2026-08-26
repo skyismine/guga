@@ -64,12 +64,23 @@ def is_trading_time(now: Optional[dt.datetime] = None) -> bool:
 
 
 def get_trade_dates(end: str = None, count: int = 60) -> List[pd.Timestamp]:
-    """最近 count 个交易日(基于交易日历接口,失败时用股票历史推算)。"""
+    """最近 count 个交易日(交易日历接口 → fuyao 官方日历兜底 → 股票历史推算)。"""
     try:
         import akshare as ak
         df = ak.tool_trade_date_hist_sina()
         dates = pd.to_datetime(df["trade_date"]).tolist()
         return dates[-count:]
+    except Exception:
+        pass
+    # fuyao 官方交易日历兜底(近一年;不足 count 时继续回退)
+    try:
+        from app.data.fuyao import enabled as _fy_enabled
+        from app.data.fuyao import get_calendar_trading_days as _fy_cal
+        if _fy_enabled():
+            items = _fy_cal()
+            dates = pd.to_datetime([it["date"] for it in items], format="%Y%m%d").tolist()
+            if len(dates) >= count:
+                return dates[-count:]
     except Exception:
         pass
     try:
