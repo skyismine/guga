@@ -58,6 +58,80 @@ def add_operation(date, code, qty, price, action, reason="") -> dict:
     return rows[-1]
 
 
+def apply_op_to_portfolio(op: dict) -> float:
+    """把一条交易写回持仓 CSV(买=加权加仓/新开,卖=减仓/平仓),返回该笔已实现盈亏。"""
+    from app.support.risk import load_portfolio, save_portfolio
+    code = str(op.get("code", "")).zfill(6)
+    qty = float(op.get("qty") or 0)
+    price = float(op.get("price") or 0)
+    action = op.get("action")
+    realized = 0.0
+    pos = load_portfolio()
+    hit = next((p for p in pos if str(p.get("code", "")).zfill(6) == code), None)
+    if action == "buy":
+        if hit:
+            old_q = float(hit["qty"] or 0)
+            old_c = float(hit["cost"] or price)
+            new_q = old_q + qty
+            hit["qty"] = round(new_q, 2)
+            hit["cost"] = round((old_q * old_c + qty * price) / new_q, 4) if new_q else price
+        else:
+            pos.append({"code": code, "qty": qty, "cost": price, "category": "波段"})
+    else:  # sell
+        if hit:
+            old_q = float(hit["qty"] or 0)
+            cost = float(hit["cost"] or price)
+            q = min(qty, old_q)
+            realized = (price - cost) * q
+            hit["qty"] = round(old_q - q, 2)
+            if hit["qty"] <= 1e-9:
+                pos.remove(hit)
+    save_portfolio(pos)
+    return round(realized, 2)
+
+
+def realized_pnl_total() -> float:
+    """已实现盈亏合计 = Σ 各笔卖出操作的 realized_pnl(落盘在操作记录中)。"""
+    return round(sum(float(o.get("realized_pnl") or 0) for o in load_operations()), 2)
+
+
+def account_overview(positions: list, prices: dict = None) -> dict:
+    """账户模型: 总资产 = 初始本金 + 已实现盈亏 + 未实现浮盈; 仓位 = 市值/总资产。
+
+    prices: {code: {price}};缺省用持仓成本近似。initial_capital 未配置时退回市值口径。
+    """
+    from app.support import settings as _st
+    acc = _st.load().get("account") or {}
+    initial = acc.get("initial_capital") or acc.get("total_asset")
+    mv = 0.0
+    unreal = 0.0
+    for p in positions:
+        code = str(p.get("code", "")).zfill(6)
+        px = 0.0
+        if prices and code in prices:
+            px = float((prices[code] or {}).get("price") or 0)
+        if not px:
+            px = float(p.get("cost") or 0)
+        qty = float(p.get("qty") or 0)
+        cost = float(p.get("cost") or 0)
+        mv += qty * px
+        unreal += (px - cost) * qty
+    realized = realized_pnl_total()
+    if initial:
+        total_asset = float(initial) + realized + unreal
+    else:
+        total_asset = mv  # 未配置本金:退回市值口径(仓位≈100%),累计盈亏仍按浮盈+已实现展示
+    avail = total_asset - mv
+    total_pct = (mv / total_asset) if total_asset and total_asset > 0 else 0.0
+    return {
+        "total_asset": round(total_asset, 2), "market_value": round(mv, 2),
+        "available": round(avail, 2), "total_pct": round(total_pct, 4),
+        "realized": round(realized, 2), "unrealized": round(unreal, 2),
+        "cumulative_pnl": round(realized + unreal, 2),
+        "initial_set": bool(initial),
+    }
+
+
 def clear_operations(date=None) -> list:
     rows = load_operations()
     if date:
@@ -113,11 +187,14 @@ def audit_today(today_ops: list, positions: list, levels_map: dict,
 
     # 1) 买卖流水 → 新开仓/追高审计
     snapshot = _fuyao_snapshot(list(prev_codes) + [str(o["code"]).zfill(6) for o in today_ops])
+    # 操作已写回持仓,「昨日持仓」= 当前持仓 - 今日买入的新增代码
+    today_buys = {str(o["code"]).zfill(6) for o in today_ops if o.get("action") == "buy"}
+    base_codes = prev_codes - today_buys
     for op in today_ops:
         code = str(op["code"]).zfill(6)
         action = op.get("action")
         if action == "buy":
-            if no_new and code not in prev_codes:
+            if no_new and code not in base_codes:
                 violations.append(f"违规新开仓 {code}(默认不开新仓纪律)")
             prev_px = (snapshot.get(code) or {}).get("prev_price")
             if prev_px and prev_px > 0:

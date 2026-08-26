@@ -82,7 +82,11 @@ def diagnose(positions: list = None, total_asset: float = None) -> dict:
         r["weight"] = round(r["market_value"] / total_mv, 4) if total_mv else 0.0
 
     from app.support.risk import validate
-    risk = validate(positions, total_asset=total_asset, prices=quotes,
+    from app.review.operations import account_overview
+    # 账户模型: 总资产 = 初始本金 + 已实现盈亏 + 未实现浮盈(未配置本金时退回市值口径)
+    ov = account_overview(positions, prices=quotes)
+    eff_total = ov["total_asset"] if ov.get("initial_set") else None
+    risk = validate(positions, total_asset=eff_total, prices=quotes,
                     fg=(market or {}).get("market", {}).get("market_fear_greed"))
     fg = (market or {}).get("market", {}).get("market_fear_greed")
     return {
@@ -90,11 +94,14 @@ def diagnose(positions: list = None, total_asset: float = None) -> dict:
         "positions": rows,
         "summary": {
             "count": len(rows), "total_market_value": round(total_mv, 2),
-            "total_asset": risk["total_asset"],
+            "total_asset": ov["total_asset"] or risk["total_asset"],
+            "available_cash": ov.get("available"),
+            "cumulative_pnl": ov.get("cumulative_pnl"),
+            "realized_pnl": ov.get("realized"),
             "fear_greed": fg,
             "risk_rating": risk["rating"],
             "risk_tips": risk["tips"],
-            "total_pct": risk["total_pct"],
+            "total_pct": ov.get("total_pct") or risk["total_pct"],
         },
     }
 

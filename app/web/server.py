@@ -1695,7 +1695,7 @@ def api_operations():
 @app.route("/api/operations/add", methods=["POST"])
 def api_operations_add():
     import datetime as _dt
-    from app.review.operations import add_operation
+    from app.review.operations import add_operation, apply_op_to_portfolio
     try:
         code = str(request.form.get("code") or "").strip().zfill(6)
         qty = float(request.form.get("qty") or 0)
@@ -1704,15 +1704,16 @@ def api_operations_add():
         reason = (request.form.get("reason") or "").strip()
         if not code.isdigit() or qty <= 0 or price <= 0 or action not in ("buy", "sell"):
             return jsonify({"error": "参数无效"}), 400
-        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-        add_operation(now[:10], code, qty, price, action, reason)
-        # 同步更新时间戳便于展示
+        now = _dt.datetime.now()
+        op = add_operation(now.strftime("%Y-%m-%d"), code, qty, price, action, reason)
+        # 操作写回持仓(买加权加仓/新开,卖减仓记已实现盈亏)
+        op["realized_pnl"] = apply_op_to_portfolio(op)
+        op["time"] = now.strftime("%H:%M")
         from app.review.operations import load_operations, save_operations
-        ops = load_operations(now[:10])
-        for o in ops:
-            o.setdefault("time", now)
-        save_operations(ops)
-        return jsonify({"ok": True, "code": code, "action": action})
+        save_operations(load_operations(now.strftime("%Y-%m-%d")))
+        _PF_CACHE["data"] = None
+        return jsonify({"ok": True, "code": code, "action": action,
+                        "realized_pnl": op.get("realized_pnl")})
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 500
 

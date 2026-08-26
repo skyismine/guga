@@ -31,26 +31,24 @@ def positions_review(d: dict) -> list:
         return items
 
     acc = _st.load().get("account") or {}
-    total_asset = acc.get("total_asset")
-    diag = _diagnose(positions, total_asset)
+    diag = _diagnose(positions, acc.get("initial_capital"))
     rows = diag.get("positions", [])
     summary = diag.get("summary", {})
-    total_asset = summary.get("total_asset") or total_asset
-    mv = summary.get("total_market_value") or 0.0
-    avail = acc.get("available_cash")
-    if avail is None and total_asset:
-        avail = total_asset - mv
-
     spot = _spot_map()
+    ov = _account_overview(positions, spot)      # 账户模型(总资产=本金+已实现+浮盈)
+    total_asset = ov.get("total_asset")
+    mv = ov.get("market_value")
+    avail = ov.get("available")
+
     fy = _fy_snapshot(positions)
-    pnl_total = sum(float(r.get("market_value") or 0) - float(r.get("qty") or 0) * float(r.get("cost") or 0)
-                    for r in rows)
+    pnl_total = ov.get("cumulative_pnl")
 
     # ---- 账户概览
     items.append({"head": "账户整体概览"})
     items.append({"t": (f"总资产 **{_fmt_asset(total_asset)}** · 持仓市值 **{_fmt_asset(mv)}**"
-                        f" · 可用资金 **{_fmt_asset(avail)}** · 总仓位 **{(summary.get('total_pct') or 0) * 100:.1f}%**"
+                        f" · 可用资金 **{_fmt_asset(avail)}** · 总仓位 **{ov.get('total_pct', 0) * 100:.1f}%**"
                         f" · 累计持仓盈亏 **{_fmt_asset(pnl_total)}**"
+                        f"(已实现 **{_fmt_asset(ov.get('realized'))}** + 未实现 **{_fmt_asset(ov.get('unrealized'))}**)"
                         + (f" · 风险评级 **{_cell(summary.get('risk_rating'))}**" if summary.get("risk_rating") else ""))})
 
     # ---- 持仓明细
@@ -148,6 +146,18 @@ def _spot_map() -> dict:
         return _a_spot_map()
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _account_overview(positions, spot: dict) -> dict:
+    """账户模型封装: spot {code:{price,...}} → prices 口径。"""
+    try:
+        from app.review.operations import account_overview
+        prices = {code: {"price": (v or {}).get("price")} for code, v in spot.items()}
+        return account_overview(positions, prices=prices)
+    except Exception as e:  # noqa: BLE001
+        print(f"[positions] 账户模型失败: {e}")
+        return {"total_asset": 0, "market_value": 0, "available": 0,
+                "total_pct": 0, "realized": 0, "unrealized": 0, "cumulative_pnl": 0}
 
 
 def _fy_snapshot(positions) -> dict:
