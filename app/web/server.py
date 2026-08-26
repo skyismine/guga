@@ -1577,24 +1577,29 @@ def page_portfolio():
         err, summary,
         '<div class="grid"><div class="card"><h3>📋 当前持仓</h3>' + pos_table + "</div>",
         '<div class="card"><h3>➕ 添加/导入持仓</h3>'
-        '<form method="post" action="/api/portfolio/add" style="display:flex;gap:6px;flex-wrap:wrap">'
+        '<form method="post" action="/api/portfolio/add" style="display:flex;gap:6px;flex-wrap:wrap" onsubmit="return pfSubmit(event,this,\'pfAddMsg\')">'
         '<input name="code" placeholder="代码 600519" required style="width:110px">'
         '<input name="qty" type="number" placeholder="数量" required style="width:80px">'
         '<input name="cost" type="number" step="0.001" placeholder="成本" required style="width:90px">'
         '<select name="category"><option>核心</option><option>波段</option><option>观察</option></select>'
-        '<button class="btn">添加</button></form>'
-        '<form method="post" action="/api/portfolio/import" enctype="multipart/form-data" style="margin-top:10px">'
-        '<input type="file" name="file" accept=".csv" required><button class="btn gray">导入 CSV</button></form>'
-        '<form method="post" action="/api/portfolio/clear" style="margin-top:10px">'
-        '<button class="btn red">清空持仓</button></form></div>'
+        '<button class="btn">添加</button><span id="pfAddMsg" class="mut"></span></form>'
+        '<form method="post" action="/api/portfolio/import" enctype="multipart/form-data" style="margin-top:10px" onsubmit="return pfSubmit(event,this,\'pfImpMsg\')">'
+        '<input type="file" name="file" accept=".csv" required><button class="btn gray">导入 CSV</button>'
+        '<span id="pfImpMsg" class="mut"></span></form>'
+        '<form method="post" action="/api/portfolio/clear" style="margin-top:10px" onsubmit="return pfSubmit(event,this,\'pfClearMsg\')">'
+        '<button class="btn red">清空持仓</button><span id="pfClearMsg" class="mut"></span></form></div>'
         '<div class="card"><h3>📝 今日操作记录(复盘合规校验用)</h3>'
-        '<form method="post" action="/api/operations/add" style="display:flex;gap:6px;flex-wrap:wrap">'
+        '<form method="post" action="/api/operations/add" style="display:flex;gap:6px;flex-wrap:wrap" onsubmit="return pfSubmit(event,this,\'opMsg\')">'
         '<input name="code" placeholder="代码 600519" required style="width:110px">'
         '<input name="qty" type="number" placeholder="数量" required style="width:80px">'
         '<input name="price" type="number" step="0.001" placeholder="成交价" required style="width:90px">'
         '<select name="action"><option value="buy">买入</option><option value="sell">卖出</option></select>'
         '<input name="reason" placeholder="备注(可选)" style="width:160px">'
-        '<button class="btn">记录</button></form>' + _ops_table() + '</div></div>',
+        '<button class="btn">记录</button><span id="opMsg" class="mut"></span></form>' + _ops_table() + '</div></div>',
+        '<script>function pfSubmit(ev,form,id){ev.preventDefault();var s=document.getElementById(id);s.innerText="⏳ 提交中…";'
+        'fetch(form.action,{method:"POST",body:new FormData(form)}).then(function(r){return r.json()}).then(function(j){'
+        'if(j.ok){s.innerText="✅ 成功";setTimeout(function(){location.reload()},600)}'
+        'else{s.innerText="❌ "+(j.error||"失败")}}).catch(function(e){s.innerText="❌ "+e});return false}</script>',
         cards,
         '<div class="footer">持仓诊断基于历史量价 + 模型预测 + 板块归属,仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]

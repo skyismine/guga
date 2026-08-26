@@ -17,31 +17,49 @@ from app.support import settings as _st
 
 
 def load_portfolio(path: str = None) -> list:
-    """读取本地持仓 CSV。列:code, qty, cost, category(核心/波段/观察)。"""
+    """读取本地持仓 CSV。列:code, qty, cost, category(核心/波段/观察)。
+
+    容错: 优先 utf-8-sig,失败自动回退 gbk(部分编辑器以 GBK/ANSI 保存中文 CSV);
+    两种编码都失败返回空列表并告警(调用方不应据此覆盖原文件)。
+    """
     path = path or _st.load().get("portfolio_path")
     if not os.path.exists(path):
         return []
+    for enc in ("utf-8-sig", "gbk"):
+        try:
+            return _parse_portfolio(path, enc)
+        except UnicodeDecodeError as e:
+            print(f"[portfolio] {enc} 解码失败: {e}")
+        except (OSError, ValueError) as e:
+            print(f"[portfolio] 持仓读取失败({enc}): {e}")
+            return []
+    return []
+
+
+def _parse_portfolio(path: str, enc: str) -> list:
     out = []
-    try:
-        with open(path, encoding="utf-8-sig", newline="") as f:
-            rows = csv.DictReader(f)
-            for r in rows:
-                code = str(r.get("code") or r.get("股票代码") or "").strip().zfill(6)
-                if not code.isdigit():
-                    continue
-                qty = float(r.get("qty") or r.get("持仓数量") or 0)
-                cost = float(r.get("cost") or r.get("成本价") or 0)
-                cat = (r.get("category") or r.get("持仓分类") or "观察").strip() or "观察"
-                out.append({"code": code, "qty": qty, "cost": cost, "category": cat})
-    except (OSError, ValueError) as e:
-        print(f"[portfolio] 持仓读取失败: {e}")
-        return []
+    with open(path, encoding=enc, newline="") as f:
+        rows = csv.DictReader(f)
+        for r in rows:
+            code = str(r.get("code") or r.get("股票代码") or "").strip().zfill(6)
+            if not code.isdigit():
+                continue
+            qty = float(r.get("qty") or r.get("持仓数量") or 0)
+            cost = float(r.get("cost") or r.get("成本价") or 0)
+            cat = (r.get("category") or r.get("持仓分类") or "观察").strip() or "观察"
+            out.append({"code": code, "qty": qty, "cost": cost, "category": cat})
     return out
 
 
 def save_portfolio(positions: list, path: str = None) -> str:
     path = path or _st.load().get("portfolio_path")
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # 覆盖前保留上一版备份(防止误覆盖/编码损坏导致数据丢失)
+    if os.path.exists(path):
+        try:
+            os.replace(path, path + ".bak")
+        except OSError:
+            pass
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["code", "qty", "cost", "category"])
