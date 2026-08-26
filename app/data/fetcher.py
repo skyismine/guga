@@ -207,6 +207,18 @@ def get_daily_history(code: str, days: int = None, adjust: str = "qfq", use_cach
             time.sleep(0.8)
 
     if df is None or df.empty:
+        # P0 兜底: fuyao 官方 API(需 settings.fuyao.enabled;前复权 forward ≈ 本地 qfq 口径)。
+        # 仅股票走 fuyao:ETF 的 fund 行情端点在部分账号/Key 下不可用,ETF 仍用 akshare 双源。
+        if not is_etf(code):
+            try:
+                from app.data.fuyao import enabled as _fy_enabled
+                from app.data.fuyao import get_daily_history as _fy_hist
+                if _fy_enabled():
+                    df = _fy_hist(code, days, adjust="forward")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"fuyao:{e}")
+
+    if df is None or df.empty:
         kind = "ETF" if is_etf(code) else "股票"
         raise ConnectionError(f"所有数据源均失败 [{kind} {code}]: {errors}")
 

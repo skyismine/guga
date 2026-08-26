@@ -262,6 +262,14 @@ DEFAULTS = {
     # ---- 复盘报告调度(模块3)
     "auto_report_time": "16:00",     # 交易日到点自动生成复盘(收盘后,确保最终收盘数据)
     "need_save_report": False,       # 自动调度是否落盘 Markdown 文件(页面内展示不受影响)
+    # ---- 同花顺金融数据 API(fuyao.aicubes.cn,可选兜底/替换源)
+    "fuyao": {
+        "enabled": False,            # 是否启用(需已配置 api_key)
+        "api_key": "",               # 密钥(仅本地保存,不出网)
+        "base_url": "https://fuyao.aicubes.cn",
+        "ttl": 3600,                 # 数据内存缓存(秒)
+        "qps_gap": 0.3,              # 单次请求最小间隔(秒),规避 4001 频率超限
+    },
     # ---- 第三轮:前端体验优化开关(Web 展示/交互,不影响任何计算逻辑)
     "web_ui": {
         "conclusion_bar": True,     # 优化项1:顶部极简结论卡

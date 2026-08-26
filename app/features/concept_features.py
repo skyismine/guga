@@ -313,7 +313,11 @@ def _fetch_index_close_by_code(code: str, name: str, start_date: str) -> pd.Data
 
 
 def _load_concept_daily(name: str) -> pd.DataFrame:
-    """概念指数日线 DataFrame(index=date, close/volume/amount), 本地缓存 TTL+失败重试。"""
+    """概念指数日线 DataFrame(index=date, close/volume/amount), 本地缓存 TTL+失败重试。
+
+    P1b: fuyao 官方 API 优先(摆脱 THS 反爬),失败回退本地 JS 抓取;
+    缓存文件按本地板块代码命名,两种来源共用同一 pkl。
+    """
     code = _name_to_code().get(name)
     if code is None:
         raise KeyError(name)
@@ -330,13 +334,27 @@ def _load_concept_daily(name: str) -> pd.DataFrame:
         except Exception:
             pass
     last = None
+    # fuyao 优先: 仅当概念名存在于 fuyao 同花顺目录时才走官方 API(避免对不存在的码空转请求)
+    try:
+        from app.data.fuyao import enabled as _fy_enabled
+        from app.data.fuyao import ths_index_map, get_ths_index_daily as _fy_idx
+        if _fy_enabled():
+            ths = ths_index_map().get(name)
+            if ths:
+                df = _fy_idx(ths)
+                with open(path, "wb") as f:
+                    pickle.dump(df, f)
+                return df
+    except Exception as e:  # noqa: BLE001
+        last = e
+        print(f"[concept] {name} fuyao 概念指数兜底失败,回退本地抓取: {e}")
     for i in range(4):
         try:
             df = _fetch_index_close_by_code(code, name, _INDEX_START)
             with open(path, "wb") as f:
                 pickle.dump(df, f)
             return df
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last = e
             time.sleep(1.5 * (i + 1))
     raise last

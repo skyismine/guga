@@ -186,6 +186,33 @@ def collect_limit_up(date: dt.date) -> Dict:
         except Exception:
             pass
         d -= dt.timedelta(days=1)
+    # P1a 兜底: 东财涨停池失败走 fuyao 官方 API(字段近似映射,炸板数缺失标注)
+    try:
+        from app.data.fuyao import enabled as _fy_enabled
+        from app.data.fuyao import get_limit_up_pool as _fy_zt
+        if _fy_enabled():
+            items = _fy_zt(page=1, size=200)
+            if items:
+                lians = [int(it.get("continue_day_cnt") or 1) for it in items]
+                result.update({
+                    "ok": True,
+                    "total": len(items),
+                    "max_lian": max(lians) if lians else 0,
+                    "max_stat": max(lians) if lians else 0,
+                    "zhadan_total": 0,   # fuyao 涨停池无炸板数,由上层容错
+                    "total_money_yi": round(sum(float(it.get("seal_money") or 0)
+                                                for it in items) / 1e8, 2),
+                    "industries": {},
+                    "leaders": [{"code": str(it.get("ticker", ""))[-6:],
+                                 "name": it.get("name", ""),
+                                 "lian": int(it.get("continue_day_cnt") or 1),
+                                 "money_yi": round(float(it.get("seal_money") or 0) / 1e8, 2)}
+                                for it in sorted(items, key=lambda x: -(float(x.get("seal_money") or 0)))[:5]],
+                })
+                result["date"] = str(date)
+                return result
+    except Exception:
+        pass
     return result
 
 

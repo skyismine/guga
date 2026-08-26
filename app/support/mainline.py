@@ -235,6 +235,21 @@ def _zt_pool(date=None, refresh=False) -> list:
         return out
 
     out = _with_timeout(_fetch, 20, [], name="zt_pool")
+    # P1a 兜底: 东财涨停池失败时走 fuyao 官方 API(字段映射到本地 schema)
+    if not out:
+        try:
+            from app.data.fuyao import enabled as _fy_enabled
+            from app.data.fuyao import get_limit_up_pool as _fy_zt
+            if _fy_enabled():
+                items = _fy_zt(page=1, size=200)
+                out = [{"code": str(it.get("ticker", ""))[-6:], "name": it.get("name", ""),
+                        "pct": it.get("price_change_ratio_pct") or 0,
+                        "reason": it.get("limit_up_reason") or "",
+                        "boards": int(it.get("continue_day_cnt") or 1),
+                        "float_yi": 0.0}   # fuyao 无流通市值,置 0 由上层容错
+                       for it in items if it.get("ticker")]
+        except Exception as e:  # noqa: BLE001
+            print(f"[mainline] 涨停池 fuyao 兜底失败: {e}")
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False)
@@ -361,6 +376,18 @@ def _concept_cons(name: str, allow_net: bool = True) -> list:
             return [str(r.iloc[1]).zfill(6) for _, r in df.iterrows()
                     if str(r.iloc[1]).strip().isdigit()]
         codes = _with_timeout(_fetch, 12, [], name=f"cons:{name[:8]}")
+    # P1b 兜底: 东财概念成分失败走 fuyao 官方 THS 成分接口
+    if not codes and allow_net:
+        try:
+            from app.data.fuyao import enabled as _fy_enabled
+            from app.data.fuyao import ths_index_map, get_ths_constituents
+            if _fy_enabled():
+                ths = ths_index_map().get(name)
+                if ths:
+                    it = get_ths_constituents(ths)
+                    codes = [str(x.get("ticker", ""))[-6:] for x in it if x.get("ticker")]
+        except Exception as e:  # noqa: BLE001
+            print(f"[mainline] 概念成分 fuyao 兜底失败: {e}")
     _cons_cache[name] = codes
     return codes
 
