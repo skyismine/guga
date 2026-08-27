@@ -265,8 +265,8 @@ DEFAULTS = {
     "need_save_report": False,       # 自动调度是否落盘 Markdown 文件(页面内展示不受影响)
     # ---- 账户与交易纪律(复盘「持仓/合规/逐仓方案」用)
     "account": {
-        "initial_capital": None,     # 初始总资产/本金(元);总资产 = 本金 + 已实现盈亏 + 未实现浮盈
-        "total_asset": None,         # 兼容旧配置:作为初始本金兜底
+        "initial_capital": None,     # 初始总资产/本金(元);缺省用今日决策 decision.total_asset 作本金
+        "total_asset": None,         # 兼容旧配置:作为本金兜底(优先级低于 initial_capital)
         "available_cash": None,      # 可用资金(元);缺省 = 总资产 - 持仓市值(由账户模型计算)
     },
     "discipline": {

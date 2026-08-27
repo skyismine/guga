@@ -96,13 +96,18 @@ def realized_pnl_total() -> float:
 
 
 def account_overview(positions: list, prices: dict = None) -> dict:
-    """账户模型: 总资产 = 初始本金 + 已实现盈亏 + 未实现浮盈; 仓位 = 市值/总资产。
+    """账户模型: 总资产 = 本金 + 已实现盈亏 + 未实现浮盈; 仓位 = 市值/总资产。
 
-    prices: {code: {price}};缺省用持仓成本近似。initial_capital 未配置时退回市值口径。
+    prices: {code: {price}};缺省用持仓成本近似。
+    本金来源优先级: account.initial_capital → account.total_asset → decision.total_asset
+    (与今日决策共用同一资金配置,避免两处维护)。
     """
     from app.support import settings as _st
-    acc = _st.load().get("account") or {}
-    initial = acc.get("initial_capital") or acc.get("total_asset")
+    cfg = _st.load()
+    acc = cfg.get("account") or {}
+    decision = cfg.get("decision") or {}
+    initial = (acc.get("initial_capital") or acc.get("total_asset")
+               or decision.get("total_asset"))
     mv = 0.0
     unreal = 0.0
     for p in positions:
@@ -120,7 +125,7 @@ def account_overview(positions: list, prices: dict = None) -> dict:
     if initial:
         total_asset = float(initial) + realized + unreal
     else:
-        total_asset = mv  # 未配置本金:退回市值口径(仓位≈100%),累计盈亏仍按浮盈+已实现展示
+        total_asset = mv  # 无本金配置:退回市值口径(仓位≈100%),累计盈亏仍按浮盈+已实现展示
     avail = total_asset - mv
     total_pct = (mv / total_asset) if total_asset and total_asset > 0 else 0.0
     return {
