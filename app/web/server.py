@@ -1597,7 +1597,8 @@ def page_portfolio():
         '<input name="reason" placeholder="备注(可选)" style="width:160px">'
         '<button class="btn">记录</button><span id="opMsg" class="mut"></span></form>' + _ops_table() + '</div></div>',
         '<script>function pfSubmit(ev,form,id){ev.preventDefault();var s=document.getElementById(id);s.innerText="⏳ 提交中…";'
-        'fetch(form.action,{method:"POST",body:new FormData(form)}).then(function(r){return r.json()}).then(function(j){'
+        'var url=form.getAttribute("action")||form.action;'
+        'fetch(url,{method:"POST",body:new FormData(form)}).then(function(r){return r.json()}).then(function(j){'
         'if(j.ok){s.innerText="✅ 成功";setTimeout(function(){location.reload()},600)}'
         'else{s.innerText="❌ "+(j.error||"失败")}}).catch(function(e){s.innerText="❌ "+e});return false}</script>',
         cards,
