@@ -1550,9 +1550,25 @@ def page_portfolio():
     refresh = request.args.get("refresh") == "1"
     c = _get_portfolio(refresh=refresh)
     positions = load_portfolio()
-    rows = "".join(f"<tr><td>{_h(p['code'])}</td><td>{_h(p['category'])}</td><td>{_h(p['qty'])}</td>"
-                   f"<td>{_h(p['cost'])}</td></tr>" for p in positions)
-    pos_table = (f"<div class='tbl'><table><tr><th>代码</th><th>分类</th><th>数量</th><th>成本</th></tr>{rows}"
+    # 名称映射: 股票走全A快照, ETF 走 ETF 快照(均带缓存)
+    try:
+        from app.support import mainline as _ml
+        _spot = _ml._a_spot_map()
+        _etf = _ml._etf_map()
+    except Exception:  # noqa: BLE001
+        _spot, _etf = {}, {}
+    _etf_by_code = {e.get("code"): nm for nm, e in _etf.items()}
+
+    def _nm(code):
+        s = _spot.get(code) or {}
+        if s.get("name"):
+            return s["name"]
+        return _etf_by_code.get(code, code)
+
+    rows = "".join(f"<tr><td>{_h(p['code'])}</td><td>{_h(_nm(p['code']))}</td>"
+                   f"<td>{_h(p['category'])}</td><td>{_h(p['qty'])}</td><td>{_h(p['cost'])}</td></tr>"
+                   for p in positions)
+    pos_table = (f"<div class='tbl'><table><tr><th>代码</th><th>名称</th><th>分类</th><th>数量</th><th>成本</th></tr>{rows}"
                  "</table></div>") if positions else '<div class="mut">尚未导入持仓,可在下方添加(支持 CSV 批量导入:code,qty,cost,category)。</div>'
     cards = "\n".join(_pos_row_html(p) for p in (c["data"] or {}).get("positions", []))
     summary = ""
