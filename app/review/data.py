@@ -86,7 +86,19 @@ def _retry(fn, n: int = 3, slp: float = 1.5):
 
 # ---------------------------------------------------------------- 复盘交易日
 def review_date() -> dt.date:
-    """最近一个交易日(取上证指数日线的最后日期)。"""
+    """最近一个交易日:优先 fuyao 上证指数历史(权威,收盘后含当日),回退本地新浪日线。
+
+    新浪 stock_zh_index_daily 存在滞后一日问题(收盘后当日 bar 未及时发布),
+    导致报告日期落后实际交易日;fuyao 官方通道实时含当日。
+    """
+    try:
+        from app.data.fuyao import enabled as _fy_enabled, get_ths_index_daily
+        if _fy_enabled():
+            df = get_ths_index_daily("000001.SH", days=5)
+            if df is not None and len(df):
+                return pd.Timestamp(df.index[-1]).date()
+    except Exception as e:  # noqa: BLE001
+        print(f"[review] fuyao 交易日判定失败,回退新浪: {e}")
     import akshare as ak
     cache = _load_cache("idx_sh000001", ttl=config.CACHE_TTL_SECONDS * 6)
     if cache is not None and len(cache):
