@@ -107,7 +107,7 @@ python run_analyze.py 600519 300750     # 多只
 ### 3. Web 仪表盘
 
 ```bash
-python run_web.py            # http://127.0.0.1:8000/decision(GUGA_HOST/GUGA_PORT 可覆盖)
+python run_web.py            # http://127.0.0.1:8800/decision(GUGA_HOST/GUGA_PORT 可覆盖)
 ```
 
 | 页面 | 内容 |

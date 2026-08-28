@@ -1,6 +1,6 @@
 """Web 仪表盘:走势预测 + 实时操作建议。
 
-启动: python run_web.py  (默认 http://127.0.0.1:8000)
+ 启动: python run_web.py  (默认 http://127.0.0.1:8800)
 """
 import io
 import json
@@ -2324,7 +2324,7 @@ def main():
     except Exception as e:  # noqa: BLE001
         print(f"  主线稳定器轮询启动失败(不影响主流程): {e}\n")
     host = os.environ.get("GUGA_HOST", "127.0.0.1")
-    port = int(os.environ.get("GUGA_PORT", "8000"))
+    port = int(os.environ.get("GUGA_PORT", "8800"))
     print(f"\n  量化决策仪表盘(今日决策为默认首页): http://{host}:{port}/decision\n")
     app.run(host=host, port=port, debug=False)
 
