@@ -1,5 +1,12 @@
 # 运行本系统所需的依赖(已在 quant_simple 环境中安装验证)
-# 环境: conda 创建 Python 3.14 + 本清单
+# 环境: conda 创建 Python 3.11+(推荐 3.11~3.14, 已在 3.14 验证)
+#   ⚠️ Python < 3.11 无法安装(vectorbt>=1.1.0 要求 >=3.11,<3.15; akshare 1.18.94 要求 >=3.11;
+#      且代码使用 PEP604 类型标注 `int | None`, 需 3.10+)
+#   服务器部署:
+#     conda create -n quant_simple python=3.11 -y
+#     conda activate quant_simple
+#     pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+#     pip install -r requirements.txt
 numpy>=2.0
 pandas>=2.2
 matplotlib>=3.8

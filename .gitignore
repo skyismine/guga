@@ -12,3 +12,5 @@ data_cache/
 *.log
 .DS_Store
 Thumbs.db
+# 数据缓存压缩备份(超大,不入库)
+data_cache.zip
