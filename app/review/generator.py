@@ -6,11 +6,10 @@
    二、板块轮动拆解(结构分析:核心主线/异动脉冲/退潮回落 + 驱动属性标签)
    三、主线三层分级研判(核心/发酵/观察 + 梯队/资金验证/生命周期/演进追踪/格局强度)
    四、明日重点观察标的池(主线龙头观察池 + 有承接超跌标的池)
-   五、核心事件深度解读(要闻表 + 央视联播 + 解读)
-   六、资金面与情绪面交叉验证(资金流向/市场情绪/背离检测/5日趋势)
-   七、当日决策效果验证(主线/标的/模型三档验证)
-   八、盘面核心结论(结论总纲 / 趋势 / 主线 / 风险 / 操作)
-   九、明日交易策略(主线分层策略 / 超跌策略 / 仓位与风控红线)
+   五、资金面与情绪面交叉验证(资金流向/市场情绪/背离检测/5日趋势)
+   六、当日决策效果验证(主线/标的/模型三档验证)
+   七、盘面核心结论(结论总纲 / 趋势 / 主线 / 风险 / 操作)
+   八、明日交易策略(主线分层策略 / 超跌策略 / 仓位与风控红线)
 
 行文本中 `**加粗**` 用于标记强调,页面渲染为加粗;文本统一使用中文冒号。
 """
@@ -300,55 +299,6 @@ def _sector_rotation(d: Dict) -> List[Dict]:
     return items
 
 
-# ================================================================ 三、核心事件深度解读
-_POLICY_KW = {"央行", "国务院", "证监会", "国常会", "政策", "降准", "降息", "LPR", "MLF",
-              "注册制", "印花税", "两融", "退市", "并购", "重组", "IPO", "改革", "开放"}
-_EXTERNAL_KW = {"美联储", "联储", "欧央行", "关税", "北向", "外资", "美元", "美债",
-                "通胀", "就业", "加息", "利率", "海外"}
-_TECH_KW = {"半导体", "芯片", "AI", "人工智能", "科技", "光模块", "算力", "机器人"}
-_FUND_KW = {"业绩", "订单", "涨价", "减产", "招标", "业绩预告", "中报", "扩产", "产能"}
-_SECTOR_KW = {"出口", "光伏", "锂电", "汽车", "地产", "消费", "医药", "新能源", "军工", "有色", "稀土"}
-
-
-def _event_reading(kws) -> str:
-    k = set(kws)
-    parts = []
-    if k & _POLICY_KW:
-        parts.append("属**政策面**信号,影响风险偏好与对应板块估值")
-    if k & _EXTERNAL_KW:
-        parts.append("属**外部因素**,情绪扰动大于实质影响,关注外资与汇率反应")
-    if k & _TECH_KW:
-        parts.append("属**产业催化**,利好科技成长链条,关注次日板块资金验证")
-    if k & _FUND_KW:
-        parts.append("属**基本面验证**,关注业绩兑现与个股持续性")
-    if k & _SECTOR_KW:
-        parts.append("属**行业景气**信号,关注板块资金共振与龙头表现")
-    return ("解读:" + ("、".join(parts) if parts else "市场关注度提升")
-            + "。事件驱动需结合次日竞价与板块资金验证,谨防利好兑现高开低走。")
-
-
-def _events(d: Dict) -> List[Dict]:
-    ev = d.get("events", {})
-    items = []
-    hot = ev.get("hot", []) or []
-    if hot:
-        items.append(_head("当日财经要闻(市场关联度排序)"))
-        erows = [[n["title"], _event_reading(n.get("keywords", []))] for n in hot[:5]]
-        items.append(_table("", ["要闻", "解读"], erows))
-    cctv = ev.get("cctv", []) or []
-    if cctv:
-        items.append(_head("央视《新闻联播》要点"))
-        for c in cctv[:3]:
-            items.append(_t(f"· {c['title']}"))
-        items.append(_t("联播内容反映政策与宏观定调方向,相关领域往往获得增量政策预期。"))
-    if not hot and not cctv:
-        items.append(_t("暂无当日驱动事件数据,建议结合盘后公告与政策动态补充判断。"))
-    else:
-        items.append(_t("解读:当日事件与指数/板块共振方向一致者,次日延续概率更高;"
-                        "若事件方向与盘面背离,则需以盘面资金为准。"))
-    return items
-
-
 # ================================================================ 四、资金面与情绪面分析
 def _capital_sentiment(d: Dict) -> List[Dict]:
     items = []
@@ -601,7 +551,7 @@ def generate_review(d: Dict) -> Dict:
 
     模块顺序(与页面渲染一致,Markdown 兼容):
       30秒速览 → 大盘综述(周期定位) → 板块轮动拆解(结构分析) → 主线三层分级研判(含情绪锚点)
-      → 明日重点观察标的池(含试错池增强) → 核心事件解读 → 资金面与情绪面交叉验证
+      → 明日重点观察标的池(含试错池增强) → 资金面与情绪面交叉验证
       → 同花顺特色数据(连板梯队/热榜/龙虎榜/异动) → 当日决策效果验证 → 盘面核心结论
       → 持仓与交易体系(账户/合规/逐仓方案/纪律) → 明日交易策略与开仓计划
     """
@@ -616,7 +566,6 @@ def generate_review(d: Dict) -> Dict:
     from app.review.positions import positions_review
     layers_items = layer_review(d)
     watch_items = watch_pool_review(d)
-    events = _events(d)
     capital = _capital_sentiment(d)
     ths_items = special_data_review(d)
     verify_items = verify_review(d)
@@ -654,13 +603,12 @@ def generate_review(d: Dict) -> Dict:
         "sector_rotation": {"title": "二、板块轮动拆解(结构分析)", "items": sector},
         "layers": {"title": "三、主线三层分级研判", "items": layers_items},
         "watch_pool": {"title": "四、明日重点观察标的池", "items": watch_items},
-        "events": {"title": "五、核心事件深度解读", "items": events},
-        "capital_sentiment": {"title": "六、资金面与情绪面交叉验证", "items": capital},
-        "ths_special": {"title": "七、同花顺特色数据(连板梯队/热榜/龙虎榜/异动)", "items": ths_items},
-        "verify": {"title": "八、当日决策效果验证", "items": verify_items},
-        "conclusion": {"title": "九、盘面核心结论", "items": conclusion},
-        "positions": {"title": "十、持仓与交易体系(账户/合规/逐仓方案/纪律)", "items": positions_items},
-        "strategy": {"title": "十一、明日交易策略与开仓计划", "items": strategy_items},
+        "capital_sentiment": {"title": "五、资金面与情绪面交叉验证", "items": capital},
+        "ths_special": {"title": "六、同花顺特色数据(连板梯队/热榜/龙虎榜/异动)", "items": ths_items},
+        "verify": {"title": "七、当日决策效果验证", "items": verify_items},
+        "conclusion": {"title": "八、盘面核心结论", "items": conclusion},
+        "positions": {"title": "九、持仓与交易体系(账户/合规/逐仓方案/纪律)", "items": positions_items},
+        "strategy": {"title": "十、明日交易策略与开仓计划", "items": strategy_items},
     }
     for sec in sections.values():
         sec["lines"] = _items_to_lines(sec["items"])
