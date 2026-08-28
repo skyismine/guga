@@ -69,14 +69,6 @@ def _rr(it: dict):
     return None
 
 
-def _suggest_pos(role: str) -> str:
-    """建议仓位: 情绪/弹性类试错仓 0.5%, 中军 1%, ETF 2%(受 discipline.single_cap 约束)。"""
-    from app.support import settings as _st
-    cap = float((_st.load().get("discipline") or {}).get("single_cap", 0.02) or 0.02)
-    base = {"情绪龙头": 0.005, "中军龙头": 0.01, "弹性领涨": 0.005, "异动领涨": 0.005, "ETF": 0.02}.get(role, 0.005)
-    return f"{min(base, cap) * 100:.1f}%"
-
-
 def _pick(seg: dict) -> dict:
     for it in seg.get("items", []):
         if it.get("error"):

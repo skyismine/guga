@@ -29,15 +29,6 @@ def _switch(name: str) -> bool:
     return bool(_cfg().get(name, False))
 
 
-def any_enabled() -> bool:
-    """是否有任一优化开关开启。全关时走 100% 原逻辑直通。"""
-    c = _cfg()
-    return any(c.get(k, False) for k in (
-        "enable_target_stabilizer", "enable_tradable_filter", "enable_advanced_rank",
-        "enable_excess_return_adjust", "enable_sector_boost_stable",
-        "enable_fallback_match"))
-
-
 # ------------------------------------------------------------------ 内存状态
 # P0.1 标的驻留防抖状态:{(sector, role): {code: {cycle, cool_until, removed_at}}}
 _STATE_LOCK = threading.Lock()
@@ -50,11 +41,6 @@ def _reset_state(sector: str, role: str) -> None:
 
 
 # ------------------------------------------------------------------ 可交易性过滤(P0.2)
-def _is_zt_limit(code: str) -> bool:
-    """涨跌停幅度:创业板/科创板 20%,其余 10%(ST 已在候选池剔除)。"""
-    return code.startswith(("30", "68"))
-
-
 def _list_days(code: str) -> int | None:
     """上市交易天数(用历史行数近似)。数据不可用返回 None(不参与过滤)。"""
     try:
@@ -185,123 +171,6 @@ def _cached_hist(code: str):
         return _f._load_cache(code)
     except Exception:  # noqa: BLE001
         return None
-
-
-def _agg_dims(stocks: list, spot: dict, zt_map: dict, corr_cache: dict,
-              sector_name: str, cfg: dict) -> dict:
-    """激进型·情绪龙头各维度原始值:{code: {dim: value}}。
-
-    dims: ladder(连板强度,40%), pct_chg(10/20cm归一化涨幅,30%),
-          correlation(个股与板块指数相关,20%), amount(当日成交额,10%)。
-    """
-    w = ((cfg.get("advanced_rank", {}) or {}).get("aggressive_weights", {}) or {})
-    out = {}
-    for c in stocks:
-        code = str(c["code"])
-        s = spot.get(code) or {}
-        pct = s.get("pct_chg") or 0
-        limit = 0.20 if _is_zt_limit(code) else 0.10
-        boards = int(zt_map.get(code, 0) or 0)
-        corr = corr_cache.get(code)
-        out[code] = {
-            "ladder": boards,
-            "pct_chg": max(0.0, min(1.0, pct / limit)) if limit else 0.0,
-            "correlation": corr if corr is not None else None,
-            "amount": s.get("amount") or 0,
-        }
-    return out
-
-
-def _std_dims(stocks: list, spot: dict, cfg: dict) -> dict:
-    """稳健型·中军龙头各维度原始值:{code: {dim: value}}。
-
-    dims: market_cap(流通市值,40%), avg_amount(20日日均成交额,30%),
-          trend(MA20斜率趋势强度,20%), amount(当日成交额,10%)。
-    """
-    w = ((cfg.get("advanced_rank", {}) or {}).get("steady_weights", {}) or {})
-    out = {}
-    for c in stocks:
-        code = str(c["code"])
-        s = spot.get(code) or {}
-        df = _cached_hist(code)
-        trend = 0.5
-        if df is not None and len(df) >= 25 and "close" in df.columns:
-            ma20 = df["close"].astype(float).rolling(20).mean()
-            m = ma20.dropna()
-            if len(m) >= 5 and m.iloc[-6]:
-                slope = m.iloc[-1] / m.iloc[-6] - 1
-                trend = max(0.0, min(1.0, 0.5 + slope * 20))
-        out[code] = {
-            "market_cap": s.get("float_mv") or s.get("total_mv") or 0,
-            "avg_amount": _avg_amount20(code) or 0,
-            "trend": trend,
-            "amount": s.get("amount") or 0,
-        }
-    return out
-
-
-def _rank_advanced(stocks: list, role: str, spot: dict, sector_name: str,
-                   cfg: dict) -> list:
-    """P1 高级排名:各维度用候选池 min-max 归一后按权重加权,降序取前2。"""
-    w = ((cfg.get("advanced_rank", {}) or {}).get(
-        "aggressive_weights" if role == "aggressive" else "steady_weights", {}) or {})
-    if not stocks:
-        return []
-    corr_cache = {}
-    zt_map = {}
-    if role == "aggressive":
-        try:
-            from app.support import mainline as _ml
-            for z in _ml._zt_pool():
-                zt_map[str(z.get("code"))] = int(z.get("boards", 1) or 1)
-        except Exception:  # noqa: BLE001
-            pass
-        # 个股与板块指数相关性(独立行情庄股相关性低 -> 降分)
-        try:
-            from app.features.concept_features import _get_concept_close
-            idx = _get_concept_close(sector_name)
-            if idx is not None and len(idx) > 5:
-                import pandas as pd
-                ir = pd.Series(idx).astype(float).pct_change().dropna()
-                for c in stocks:
-                    code = str(c["code"])
-                    df = _cached_hist(code)
-                    if df is None or len(df) < 10 or "close" not in df.columns:
-                        continue
-                    sr = df["close"].astype(float).pct_change().dropna()
-                    al = pd.concat([ir, sr], axis=1, join="inner").dropna()
-                    if len(al) >= 5:
-                        corr_cache[code] = float(al.iloc[:, 0].corr(al.iloc[:, 1]))
-        except Exception:  # noqa: BLE001
-            pass
-    dims = _agg_dims(stocks, spot, zt_map, corr_cache, sector_name, cfg) if \
-        role == "aggressive" else _std_dims(stocks, spot, cfg)
-
-    # 每维度 min-max 归一(全等或缺失 -> 0.5 中性)
-    norm = {}
-    for k in w:
-        vals = [dims[c][k] for c in dims if dims[c].get(k) is not None]
-        lo, hi = (min(vals), max(vals)) if vals else (0.0, 0.0)
-        norm[k] = {}
-        for c in dims:
-            v = dims[c].get(k)
-            if v is None:
-                norm[k][c] = 0.5
-            elif hi == lo:
-                norm[k][c] = 0.5
-            else:
-                norm[k][c] = (v - lo) / (hi - lo)
-
-    scored = []
-    for c in stocks:
-        code = str(c["code"])
-        comp = sum(wt * norm[k].get(code, 0.5) for k, wt in w.items())
-        c["rank_score"] = round(comp, 4)
-        c["_adv_dims"] = {k: round(v, 4) for k, v in dims[code].items()
-                          if isinstance(v, (int, float))}
-        scored.append(c)
-    scored.sort(key=lambda x: -x["rank_score"])
-    return scored[:2]
 
 
 # ------------------------------------------------------------------ P2 修正与降级
@@ -457,18 +326,6 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
             stable[role] = [{"rank": 1, "error": "暂无可匹配标的(数据源受限)",
                              "is_stable": False, "match_source": "error"}]
     return {"sector": sector_name, "raw_targets": raw, "stable_targets": stable}
-
-
-def _select(spot, stocks, stocks_std, sector_name: str, cfg: dict):
-    """分档选股:开启高级排名用综合得分,关闭沿用原单一指标排名。"""
-    from app.support import mainline as _ml
-    if cfg.get("enable_advanced_rank"):
-        agg = _rank_advanced(list(stocks), "aggressive", spot, sector_name, cfg)
-        std = _rank_advanced(list(stocks_std), "steady", spot, sector_name, cfg)
-    else:
-        agg = sorted(stocks, key=lambda s: -(s.get("pct_chg") or 0))[:2]
-        std = sorted(stocks_std, key=lambda s: -(s.get("amount") or 0))[:2]
-    return agg, std
 
 
 def _render_item(it: dict, role: str, sector_name: str, sector_level: str,
