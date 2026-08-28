@@ -604,7 +604,6 @@ def generate_review(d: Dict) -> Dict:
       → 明日重点观察标的池(含试错池增强) → 核心事件解读 → 资金面与情绪面交叉验证
       → 同花顺特色数据(连板梯队/热榜/龙虎榜/异动) → 当日决策效果验证 → 盘面核心结论
       → 持仓与交易体系(账户/合规/逐仓方案/纪律) → 明日交易策略与开仓计划
-      → 数据校准与来源
     """
     overview = _index_overview(d)
     sector = _sector_rotation(d)
@@ -615,7 +614,6 @@ def generate_review(d: Dict) -> Dict:
     from app.review.snapshot import build_snapshot
     from app.review.special_data import special_data_review
     from app.review.positions import positions_review
-    from app.review.data_calibration import data_calibration
     layers_items = layer_review(d)
     watch_items = watch_pool_review(d)
     events = _events(d)
@@ -623,7 +621,6 @@ def generate_review(d: Dict) -> Dict:
     ths_items = special_data_review(d)
     verify_items = verify_review(d)
     positions_items = positions_review(d)
-    calibration_items = data_calibration(d)
     conclusion = _conclusion(d)
     strategy_items = strategy_review(d)
 
@@ -664,7 +661,6 @@ def generate_review(d: Dict) -> Dict:
         "conclusion": {"title": "九、盘面核心结论", "items": conclusion},
         "positions": {"title": "十、持仓与交易体系(账户/合规/逐仓方案/纪律)", "items": positions_items},
         "strategy": {"title": "十一、明日交易策略与开仓计划", "items": strategy_items},
-        "calibration": {"title": "十二、数据校准与来源", "items": calibration_items},
     }
     for sec in sections.values():
         sec["lines"] = _items_to_lines(sec["items"])
