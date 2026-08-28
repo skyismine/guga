@@ -679,6 +679,7 @@ def _adjust_signal(item: dict, sector_level: str) -> dict:
 _TRIGGER_TPL = {
     "aggressive": "回踩支撑位 {support} 企稳(缩量)关注,或放量突破压力位 {resistance} 启动信号",
     "steady": "回踩 {entry_low}~{support} 区间分批低吸关注",
+    "repair": "补涨优选:回踩 {support} 企稳低吸,放量启动确认后跟进",
     "etf": "板块异动期折价/平价时关注,回调至 {support} 附近分批观察",
 }
 
@@ -1072,9 +1073,12 @@ def _match_targets(sector_name: str, sector_level: str = "watch",
     st = res.get("stable_targets") or {}
     # 兼容视图:保留原有 per-role 结构(供 plan/页面按原方式读取),items 用稳定输出
     out = {"sector": sector_name, "raw_targets": raw, "stable_targets": st}
-    for role in ("aggressive", "steady", "etf"):
+    _LABEL = {"steady": "稳健型·中军龙头", "aggressive": "激进型·情绪龙头",
+              "etf": "工具型·对应ETF", "repair": "补涨优选·高低切换"}
+    for role in ("aggressive", "steady", "etf", "repair"):
         seg = raw.get(role) or {}
-        out[role] = {"label": seg.get("label", ""), "mood": seg.get("mood", []),
+        out[role] = {"label": seg.get("label", "") or _LABEL.get(role, ""),
+                     "mood": seg.get("mood", []),
                      "items": st.get(role, [])}
     out["candidate_targets"] = st.get("candidate", [])
     out["fallback_targets"] = st.get("fallback", [])
@@ -1106,7 +1110,8 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     if core:
         t = _match_targets(core["name"], sector_level="core", sector_status="core")
         targets[core["name"]] = t
-        role_slots = (("steady", "mid"), ("aggressive", "mood"), ("etf", "etf"))
+        role_slots = (("steady", "mid"), ("aggressive", "mood"),
+                      ("repair", "repair"), ("etf", "etf"))
         blk_used = 0.0
         for role, atype in role_slots:
             seg = t[role]
@@ -1119,6 +1124,10 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
             p = execution_plan(
                 item, total_asset, taste, market_cap=p1["cap"],
                 grade=p1["grade"], asset_type=atype, sector_used_pct=blk_used)
+            # 三档差异化仓位系数: 中军×1.5 / 情绪×0.5 / 补涨×0.6(随标的输出)
+            coef = float(item.get("position_coef") or 1.0)
+            if p.get("ok") and p.get("position_pct"):
+                p["position_pct"] = round(min(1.0, p["position_pct"] * coef), 4)
             plans.setdefault(core["name"], {})[role] = p
             if p.get("ok"):
                 blk_used = min(1.0, blk_used + (p.get("position_pct") or 0.0))

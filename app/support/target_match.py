@@ -140,6 +140,7 @@ def _stabilize_rank(sector: str, role: str, ranked: list, cfg: dict) -> list:
     key = (sector, role)
     with _STATE_LOCK:
         st = _TARGET_STATE.setdefault(key, {})
+        cold = not bool(st)   # 冷启动: 该档从未处理过 → 直接晋升正式,避免首日全空
 
         # 1) 更新上榜周期:本次前2 才累加,否则清零(用 name+code 组合键防同名)
         def _k(it):
@@ -156,7 +157,7 @@ def _stabilize_rank(sector: str, role: str, ranked: list, cfg: dict) -> list:
         for rank, it in enumerate(ranked[:2], 1):
             k = _k(it)
             d = st[k]
-            stable = (d["cycle"] >= need and d["cool_until"] <= now)
+            stable = ((d["cycle"] >= need and d["cool_until"] <= now) or cold)
             it["continue_rank_cycle"] = d["cycle"]
             it["is_stable"] = bool(stable)
             it["match_source"] = "normal" if stable else "candidate_residency"
@@ -352,28 +353,15 @@ def _boost_level(sector_level: str, sector_status: str, cfg: dict) -> str:
 # ------------------------------------------------------------------ 主入口
 def match_targets_v2(sector_name: str, sector_level: str = "watch",
                      sector_status: str = "core") -> dict:
-    """第三层优化版入口,输出分层结果 {raw_targets, stable_targets}。
+    """第三层优化版入口: 三档梯队(中军/情绪/补涨) + 工具ETF + 可选增强。
 
-    sector_status: 来自主线稳定器的层级(core/defensive/watch/candidate/rejected),
-    用于 P2.2 溢价联动与高级选股的正式/候选区分。
-    全关时 stable_targets 结构与原 match_level_targets 完全一致(逐字段拷贝)。
+    选股子逻辑升级为 tier_select 三档综合评分体系(固化默认): 中军(趋势核心) +
+    情绪(领涨弹性) + 补涨优选(高低切换), 三档强制去重, 差异化交易参数。
+    stable_targets 结构: {steady, aggressive, repair, etf, candidate, fallback, error}。
+    P0.1 驻留防抖 / P2.1 超额修正 / P2.3 兜底 仍由原开关控制(可选增强层)。
     """
     from app.decision import engine as _en
     raw = _en.match_level_targets(sector_name, sector_level)
-
-    if not any_enabled():
-        # 100% 兼容原逻辑:stable 直接透传 raw(逐份深拷贝,防上层误改 raw)
-        import copy
-        stable = {
-            "aggressive": copy.deepcopy(raw["aggressive"]["items"]),
-            "steady": copy.deepcopy(raw["steady"]["items"]),
-            "etf": copy.deepcopy(raw["etf"]["items"]),
-            "candidate": [],
-            "fallback": [],
-            "error": "",
-        }
-        return {"sector": sector_name, "raw_targets": raw, "stable_targets": stable}
-
     cfg = _cfg()
     spot = {}
     try:
@@ -388,25 +376,20 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
     except Exception:  # noqa: BLE001
         pass
 
-    # P0.2 前置过滤
+    # P0.2 可交易性前置过滤(可选,默认关)
     if cfg.get("enable_tradable_filter") and stocks:
         stocks = _tradable_filter(stocks, "aggressive", cfg)
-        # 中军流动性阈值不同,用同一批再按中军阈值过滤
-        if cfg.get("tradable_filter", {}).get("steady_min_avg_amount"):
-            stocks_std = _tradable_filter(list(stocks), "steady", cfg)
-        else:
-            stocks_std = list(stocks)
-    else:
-        stocks_std = list(stocks)
 
-    # P1 分档选股
-    agg_cands, std_cands = _select(spot, stocks, stocks_std, sector_name, cfg)
+    # 三档梯队选股(固化默认开启)
+    from app.support import tier_select as _ts
+    tiers = _ts.select_three_tiers(sector_name, sector_level, sector_status, spot, stocks)
 
-    # 预测 + 信号修正(核心函数原样复用)
+    # 预测上下文
     quotes = {}
     try:
         from app.support import mainline as _ml
-        codes = [x["code"] for x in agg_cands + std_cands]
+        codes = [it["code"] for role in ("steady", "aggressive", "repair")
+                 for it in tiers[role]]
         if codes:
             quotes = _ml.get_spot_quotes(codes)
     except Exception:  # noqa: BLE001
@@ -424,52 +407,52 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
     except Exception:  # noqa: BLE001
         pass
 
-    stable = {"aggressive": [], "steady": [], "etf": [], "candidate": [],
-              "fallback": [], "error": ""}
+    stable = {"aggressive": [], "steady": [], "repair": [], "etf": [],
+              "candidate": [], "fallback": [], "error": ""}
 
-    # 正式/候选 分离:P0.1 防抖开启时按驻留判定;关闭时前2直接为正式
-    def _build(role, cands):
-        if cfg.get("enable_target_stabilizer"):
-            formal = _stabilize_rank(sector_name, role, cands, cfg)
-            cands = [c for c in cands if not c.get("is_stable")]
-            stable["candidate"].extend(cands)
-            return formal
-        for i, c in enumerate(cands[:2], 1):
-            c["is_stable"] = True
-            c["continue_rank_cycle"] = 1
-            c["match_source"] = "normal"
-        return cands[:2]
+    # 可选: P0.1 驻留防抖(在三档正式名单上再稳定)
+    formal = {role: list(tiers[role]) for role in ("steady", "aggressive", "repair")}
+    if cfg.get("enable_target_stabilizer"):
+        for role in ("steady", "aggressive", "repair"):
+            ranked = [dict(it) for it in tiers[role]]
+            ok = _stabilize_rank(sector_name, role, ranked, cfg)
+            ok_codes = {x["code"] for x in ok}
+            formal[role] = [it for it in tiers[role] if it["code"] in ok_codes]
 
-    agg_formal = _build("aggressive", agg_cands)
-    std_formal = _build("steady", std_cands)
-
-    # 渲染正式标的(复用原 _predict_one/_adjust_signal,仅做后置修正)
-    for role, formal in (("aggressive", agg_formal), ("steady", std_formal)):
-        for it in formal:
+    # 渲染三档正式(携带差异化交易参数)
+    for role in ("steady", "aggressive", "repair"):
+        for it in formal[role]:
+            it["is_stable"] = True
+            it["continue_rank_cycle"] = 1
+            it.setdefault("match_source", "normal")
             item = _render_item(it, role, sector_name, sector_level, sector_status,
                                 quotes, predictor, market, cfg)
+            for k in ("type", "position_coef", "stop_loss_pct", "target_profit_pct",
+                      "is_pulse_watch", "pos_adjusted", "style"):
+                if k in it:
+                    item.setdefault(k, it[k])
             stable[role].append(item)
 
-    # 候选观察标的也给出基础信息(仅展示,不参与执行计划)
-    for role, cands in (("aggressive", agg_cands), ("steady", std_cands)):
-        for it in cands:
-            if it.get("is_stable"):
-                continue
-            item = _render_item(it, role, sector_name, sector_level, sector_status,
-                                quotes, predictor, market, cfg, candidate=True)
-            stable["candidate"].append(item)
+    # 观察名单(脉冲/未入选, 仅展示不参与执行)
+    for w in tiers.get("watch", []):
+        it = w["it"]
+        role = it.get("type", "steady")
+        item = _render_item(it, role, sector_name, sector_level, sector_status,
+                            quotes, predictor, market, cfg, candidate=True)
+        item.setdefault("is_pulse_watch", True)
+        stable["candidate"].append(item)
 
     # 工具型 ETF:多维度校验 + 排序
     stable["etf"] = _match_etf_v2(sector_name, quotes, predictor, market,
                                   sector_level, sector_status, cfg)
 
-    # P2.3 降级兜底
+    # P2.3 降级兜底(可选)
     if cfg.get("enable_fallback_match"):
         stable = _fallback(stable, sector_name, sector_level, sector_status,
                            spot, quotes, predictor, market, cfg)
 
-    # error 占位保留(与原始逻辑一致)
-    for role in ("aggressive", "steady", "etf"):
+    # error 占位保留
+    for role in ("aggressive", "steady", "repair", "etf"):
         if not stable[role]:
             stable[role] = [{"rank": 1, "error": "暂无可匹配标的(数据源受限)",
                              "is_stable": False, "match_source": "error"}]
@@ -497,7 +480,8 @@ def _render_item(it: dict, role: str, sector_name: str, sector_level: str,
     item = {"code": c["code"], "name": c["name"], "price": round(c["price"], 2),
             "pct_chg": c["pct_chg"], "amount_yi": round(c["amount"] / 1e8, 2)
             if c.get("amount") else None, "float_mv": c.get("float_mv"),
-            "rank": 1, "role": {"aggressive": "情绪龙头", "steady": "中军龙头"}[role],
+            "rank": 1, "role": {"aggressive": "情绪龙头", "steady": "中军龙头",
+                                "repair": "补涨优选"}[role],
             "is_stable": bool(it.get("is_stable")),
             "continue_rank_cycle": int(it.get("continue_rank_cycle", 1)),
             "rank_score": round(it.get("rank_score", 0), 4) if it.get("rank_score") else None,

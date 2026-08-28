@@ -777,7 +777,8 @@ def _layer3_html(targets: dict) -> str:
     parts = []
     for sector, t in (targets or {}).items():
         rows = []
-        for role, seg in (("aggressive", t.get("aggressive")), ("steady", t.get("steady")), ("etf", t.get("etf"))):
+        for role, seg in (("aggressive", t.get("aggressive")), ("steady", t.get("steady")),
+                          ("repair", t.get("repair")), ("etf", t.get("etf"))):
             if not seg:
                 continue
             rows.extend(_target_item_html(it, trigger_on=True) for it in seg.get("items", []))
@@ -825,7 +826,8 @@ def _plan_table_html(plans: dict, sector: str) -> str:
     if not seg:
         return '<div class="mut">暂无执行参数</div>'
     rows = []
-    for role, lab in (("steady", "稳健首选"), ("aggressive", "激进首选"), ("etf", "ETF")):
+    for role, lab in (("steady", "稳健首选"), ("aggressive", "激进首选"),
+                      ("repair", "补涨首选"), ("etf", "ETF")):
         p = seg.get(role) or {}
         if p.get("error") or (not p.get("ok") and p.get("reason")):
             rows.append(f"<tr><th>{lab}</th><td colspan='10' class='mut'>"
@@ -909,7 +911,8 @@ def _save_target_snapshot(data: dict) -> None:
             })
     if not snap["sectors"]:  # plans 空则从 targets 提取
         for sector, t in (data.get("targets") or {}).items():
-            for role, seg in (("aggressive", t.get("aggressive")), ("steady", t.get("steady")), ("etf", t.get("etf"))):
+            for role, seg in (("aggressive", t.get("aggressive")), ("steady", t.get("steady")),
+                              ("repair", t.get("repair")), ("etf", t.get("etf"))):
                 items = (seg or {}).get("items") or []
                 for it in items[:1]:
                     if it.get("error") or not it.get("code"):

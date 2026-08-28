@@ -85,16 +85,30 @@ def _pick(seg: dict) -> dict:
     return {}
 
 
+def _tier_suggest_pos(it: dict, role: str) -> str:
+    """建议仓位: 由 tier 差异化仓位系数推导(基准1% × 系数),受单票红线约束。"""
+    from app.support import settings as _st
+    cap = float((_st.load().get("discipline") or {}).get("single_cap", 0.02) or 0.02)
+    coef = float(it.get("position_coef") or 1.0)
+    base = {"情绪龙头": 0.005, "中军龙头": 0.01, "补涨优选": 0.006,
+            "弹性领涨": 0.005, "异动领涨": 0.005}.get(role, 0.005)
+    return f"{min(base * coef, cap) * 100:.1f}%"
+
+
 def _watch_pool_leader(d: dict) -> list:
-    """子池1: 主线龙头观察池。返回行列表(含层级/板块/角色/标的/价位/观察要点)。"""
+    """子池1: 主线龙头观察池(三档梯队: 中军/情绪/补涨)。返回行列表。"""
     core, branch, watch = _sector_tiers()
     from app.decision import engine as _en
     rows_out = []
-    # 核心层: 每板块 情绪龙头 + 中军龙头
+    _ROLE_TAG = {"steady": "中军龙头", "aggressive": "情绪龙头", "repair": "补涨优选"}
+    _NOTE = {"steady": _OBSERVE_NOTE["steady"], "aggressive": _OBSERVE_NOTE["aggressive"],
+             "repair": "补涨优选:高低切博弈,低位滞涨+承接企稳后低吸,放量启动确认跟进"}
+    # 核心层: 三档配齐(中军为主,情绪为辅,补涨高低切换)
     for r in core[:2]:
         name = r["industry"]
-        res = _en.match_level_targets(name, "core")
-        for seg_key, role in (("aggressive", "情绪龙头"), ("steady", "中军龙头")):
+        res = _en._match_targets(name, "core", "core")
+        for seg_key, role in (("steady", "中军龙头"), ("aggressive", "情绪龙头"),
+                              ("repair", "补涨优选")):
             it = _pick(res.get(seg_key) or {})
             if not it:
                 continue
@@ -104,25 +118,27 @@ def _watch_pool_leader(d: dict) -> list:
                              _cell(f"{lv.get('entry_low') or lv.get('support')}~{lv.get('entry_high') or lv.get('resistance')}"),
                              _cell(lv.get("stop_loss")), _cell(lv.get("target")),
                              _cell(f"{_rr(it):.1f}" if _rr(it) else "-"),
-                             _suggest_pos(role), _OBSERVE_NOTE[seg_key]])
-    # 发酵层: 每板块 弹性领涨
+                             _tier_suggest_pos(it, role), _NOTE[seg_key]])
+    # 发酵层: 情绪标配 + 补涨(符合则)
     for r in branch[:3]:
         name = r["industry"]
-        res = _en.match_level_targets(name, "branch")
-        it = _pick(res.get("aggressive") or {})
-        if not it:
-            continue
-        lv = it.get("levels") or {}
-        rows_out.append([name, "弹性领涨", it.get("code"), it.get("name"),
-                         _cell(f"{it.get('pct_chg', 0):+.2f}%"),
-                         _cell(f"{lv.get('entry_low') or lv.get('support')}~{lv.get('entry_high') or lv.get('resistance')}"),
-                         _cell(lv.get("stop_loss")), _cell(lv.get("target")),
-                         _cell(f"{_rr(it):.1f}" if _rr(it) else "-"),
-                         _suggest_pos("弹性领涨"), _OBSERVE_NOTE["branch"]])
-    # 观察层: 每板块 异动领涨
+        res = _en._match_targets(name, "branch", "branch")
+        for seg_key, role in (("aggressive", "弹性领涨"), ("repair", "补涨优选")):
+            it = _pick(res.get(seg_key) or {})
+            if not it:
+                continue
+            lv = it.get("levels") or {}
+            rows_out.append([name, role, it.get("code"), it.get("name"),
+                             _cell(f"{it.get('pct_chg', 0):+.2f}%"),
+                             _cell(f"{lv.get('entry_low') or lv.get('support')}~{lv.get('entry_high') or lv.get('resistance')}"),
+                             _cell(lv.get("stop_loss")), _cell(lv.get("target")),
+                             _cell(f"{_rr(it):.1f}" if _rr(it) else "-"),
+                             _tier_suggest_pos(it, role),
+                             _OBSERVE_NOTE["branch"] if seg_key == "aggressive" else _NOTE["repair"]])
+    # 观察层: 异动领涨
     for r in watch[:3]:
         name = r["industry"]
-        res = _en.match_level_targets(name, "watch")
+        res = _en._match_targets(name, "watch", "watch")
         it = _pick(res.get("aggressive") or {})
         if not it:
             continue
@@ -132,7 +148,7 @@ def _watch_pool_leader(d: dict) -> list:
                          _cell(f"{lv.get('entry_low') or lv.get('support')}~{lv.get('entry_high') or lv.get('resistance')}"),
                          _cell(lv.get("stop_loss")), _cell(lv.get("target")),
                          _cell(f"{_rr(it):.1f}" if _rr(it) else "-"),
-                         _suggest_pos("异动领涨"), _OBSERVE_NOTE["watch"]])
+                         _tier_suggest_pos(it, "异动领涨"), _OBSERVE_NOTE["watch"]])
     return rows_out
 
 
