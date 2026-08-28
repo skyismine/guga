@@ -1534,6 +1534,9 @@ def _pos_row_html(p) -> str:
     pnl_cls = "up" if (pnl or 0) >= 0 else "down"
     lv = p.get("levels") or {}
     reasons = "".join(f'<div class="mut">· {_h(r)}</div>' for r in p.get("reasons", [])[:3])
+    # 风险块提升为变量(Python<3.12 的 f-string 表达式内不允许反斜杠,需先拼好)
+    risks_html = "".join(f'<div class="flat">! {_h(r)}</div>' for r in p.get("risks", [])) \
+        or '<div class="mut">无</div>'
     return (
         f"<div class='card'><h3>{_h(p.get('name'))} ({_h(p.get('code'))}) "
         f"<span class='tag'>{_h(p.get('category'))}</span>"
@@ -1544,7 +1547,7 @@ def _pos_row_html(p) -> str:
         f"<div class='line'>预测:上涨 <b>{p['prediction']['p_up']:.0%}</b> / 震荡 {p['prediction']['p_flat']:.0%} / 下跌 {p['prediction']['p_down']:.0%} · {_h(p['prediction']['direction_cn'])}</div>"
         f"<div class='line'>支撑 {_h(lv.get('support'))} · 压力 {_h(lv.get('resistance'))} · 止损 {_h(lv.get('stop_loss'))} · 目标 {_h(lv.get('target'))}</div>"
         f"<div class='line'><b>操作方案:</b> {_h(p.get('plan'))}</div>{reasons}</div>"
-        f"<div class='card'><h3>⚠️ 风险</h3>{''.join(f'<div class=\"flat\">! {_h(r)}</div>' for r in p.get('risks', [])) or '<div class=\"mut\">无</div>'}</div></div></div>")
+        f"<div class='card'><h3>⚠️ 风险</h3>{risks_html}</div></div></div>")
 
 
 @app.route("/portfolio")
