@@ -13,8 +13,8 @@ matplotlib>=3.8
 requests>=2.31
 akshare>=1.16
 vectorbt>=1.1.0
-scikit-learn>=1.4
-lightgbm>=4.5
+scikit-learn>=1.4,<2
+lightgbm>=4.6    # 需 >=4.6 兼容新 sklearn(check_array force_all_finite 已移除;旧版+sklearn1.8+ 报错)
 flask>=3.0
 # Web 图表(plotly python 与内置 plotly.js bundle 必须配套;
 #  版本错配会在 import 时报 `Bad property path:scattermapbox`,请用 6.x 并 clean 重装)
