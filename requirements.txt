@@ -16,6 +16,9 @@ vectorbt>=1.1.0
 scikit-learn>=1.4
 lightgbm>=4.5
 flask>=3.0
+# Web 图表(plotly python 与内置 plotly.js bundle 必须配套;
+#  版本错配会在 import 时报 `Bad property path:scattermapbox`,请用 6.x 并 clean 重装)
+plotly>=6.0,<7
 
 # 可选:SilverQuant 实盘/模拟交易(QMT/掘金)依赖,无需实盘可忽略
 # xtquant>=250516.1.1
