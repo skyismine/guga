@@ -196,6 +196,12 @@ def get_ths_index_daily(ths: str, days: int = 400):
     return df[["open", "high", "low", "close", "volume", "turnover"]]
 
 
+def get_index_snapshot(thscodes: str) -> list:
+    """指数行情快照(批量, 含收盘/涨跌幅/成交额), 权威收盘口径。"""
+    data = _get("/api/a-share-index/prices/snapshot", {"thscodes": thscodes}, ttl=600)
+    return (data or {}).get("item") or []
+
+
 def get_calendar_trading_days():
     """近一年交易日序列(升序)。"""
     data = _get("/api/a-share/calendar/trading-days", {}, ttl=86400)

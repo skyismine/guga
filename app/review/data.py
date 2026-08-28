@@ -134,7 +134,28 @@ def _sina_spot_batch(symbols) -> Dict[str, Dict]:
 
 
 def collect_indices(date: dt.date = None) -> list:
-    """各大盘指数收盘点数/涨跌幅。优先新浪实时(收盘后=当日收盘),失败回退日线。"""
+    """各大盘指数收盘点数/涨跌幅。优先 fuyao 官方指数快照(权威收盘口径,解决新浪滞后/抖动),
+    失败回退新浪实时(收盘后=当日收盘),再回退日线。"""
+    # fuyao 官方指数快照优先: 上证/深成/创业板/沪深300/上证50/中证500/中证1000/科创50
+    _INDEX_THS = [("000001.SH", "上证指数"), ("399001.SZ", "深证成指"), ("399006.SZ", "创业板指"),
+                  ("000300.SH", "沪深300"), ("000016.SH", "上证50"), ("000905.SH", "中证500"),
+                  ("000852.SH", "中证1000"), ("000688.SH", "科创50")]
+    try:
+        from app.data.fuyao import enabled as _fy_enabled, get_index_snapshot
+        if _fy_enabled():
+            items = get_index_snapshot(",".join(t for t, _ in _INDEX_THS))
+            rows = []
+            by_ths = {it.get("thscode"): it for it in items}   # 按 thscode 匹配(上证 ticker 是 1A0001)
+            for ths, name in _INDEX_THS:
+                it = by_ths.get(ths)
+                if it and it.get("last_price") is not None:
+                    rows.append({"symbol": ths, "name": name,
+                                 "close": float(it["last_price"]),
+                                 "pct_chg": float(it.get("price_change_ratio_pct") or 0) / 100.0})
+            if rows:
+                return rows
+    except Exception:  # noqa: BLE001
+        pass
     symbols = [s for s, _ in MAJOR_INDICES]
     try:
         spots = _retry(lambda: _sina_spot_batch(symbols), n=2)
@@ -666,6 +687,24 @@ def collect_market_daily(days: int = 10) -> List[Dict]:
             for k in ("advance", "decline", "limit_up", "limit_down"):
                 if cur.get(k) is not None:
                     today_row[k] = cur[k]
+
+    # fuyao 官方指数快照覆盖最新一日: 两市成交额(上证+深成指成交额)与上证收盘/涨跌幅(权威口径)
+    try:
+        from app.data.fuyao import enabled as _fy_enabled, get_index_snapshot
+        if _fy_enabled() and rows:
+            items = {it.get("thscode"): it
+                     for it in get_index_snapshot("000001.SH,399001.SZ")}   # thscode 匹配(上证 ticker 是 1A0001)
+            sh, sz = items.get("000001.SH"), items.get("399001.SZ")
+            if sh:
+                if sh.get("turnover"):
+                    rows[-1]["amount_yi"] = round((float(sh["turnover"]) / 1e8), 1)
+                if sh.get("last_price") is not None:
+                    rows[-1]["close"] = float(sh["last_price"])
+                    rows[-1]["pct_chg"] = float(sh.get("price_change_ratio_pct") or 0) / 100.0
+            if sh and sz and sh.get("turnover") and sz.get("turnover"):
+                rows[-1]["amount_yi"] = round((float(sh["turnover"]) + float(sz["turnover"])) / 1e8, 1)
+    except Exception:  # noqa: BLE001
+        pass
 
     _MD_CACHE["data"] = rows
     _MD_CACHE["t"] = time.time()

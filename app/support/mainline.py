@@ -1054,7 +1054,7 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
 
 def _mark_levels(rows: list) -> None:
     cfg = _st.load()
-    # 主线数量阶段化: 核心≤core_max, 发酵≤branch_max(退潮/高潮 无发酵层)
+    # 主线数量阶段化: 核心≤core_max, 发酵≤branch_max(退潮/高潮 无发酵层); 观察层封顶10个
     try:
         from app.decision.engine import phase_cfg
         _p = phase_cfg()
@@ -1063,9 +1063,17 @@ def _mark_levels(rows: list) -> None:
     except Exception:  # noqa: BLE001
         top_n = cfg.get("mainline_top_n", 2)
         branch_n = cfg.get("mainline_branch_top_n", 5)
+    watch_end = branch_n + 10   # 异动观察层板块上限(用户约束: ≤10)
     for i, r in enumerate(rows):
         r["rank"] = i + 1
-        r["level"] = "core" if i < top_n else ("branch" if i < branch_n else "watch")
+        if i < top_n:
+            r["level"] = "core"
+        elif i < branch_n:
+            r["level"] = "branch"
+        elif i < watch_end:
+            r["level"] = "watch"
+        else:
+            r["level"] = "ignored"   # 超出观察层上限,不参与展示
 
 
 def get_concepts_of(code: str) -> list:
