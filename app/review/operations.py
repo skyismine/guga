@@ -195,6 +195,12 @@ def audit_today(today_ops: list, positions: list, levels_map: dict,
     # 操作已写回持仓,「昨日持仓」= 当前持仓 - 今日买入的新增代码
     today_buys = {str(o["code"]).zfill(6) for o in today_ops if o.get("action") == "buy"}
     base_codes = prev_codes - today_buys
+    # 阶段风控参数(分阶段盈亏比/仓位上限)
+    try:
+        from app.decision.engine import phase_cfg
+        _p = phase_cfg()
+    except Exception:  # noqa: BLE001
+        _p = {"phase": "main", "label": "主升发酵期", "cap": 0.7, "rr_left": 1.5}
     for op in today_ops:
         code = str(op["code"]).zfill(6)
         action = op.get("action")
@@ -208,7 +214,14 @@ def audit_today(today_ops: list, positions: list, levels_map: dict,
                     violations.append(f"{code} 追高买入(较昨收 +{buy_up:.1f}%,超 {chase_pct:.0f}% 阈值)")
             if not (snapshot.get(code) or {}).get("prev_price"):
                 checks.append(f"{code} 昨收缺失,追高判定跳过")
-    # 2) 仓位红线(单票)
+            # 分阶段盈亏比不达标开仓(四阶段体系新增违规项)
+            lv = levels_map.get(code) or {}
+            el, stop, tgt = lv.get("entry_low"), lv.get("stop_loss"), lv.get("target")
+            if el and stop and tgt and el > stop:
+                rr = (tgt - el) / (el - stop)
+                if rr < _p["rr_left"]:
+                    violations.append(f"{code} 盈亏比 {rr:.1f}:1 低于阶段门槛 {_p['rr_left']:.1f}:1 开仓")
+    # 2) 仓位红线(单票) + 分阶段总仓位上限
     mv_sum = 0.0
     if total_asset:
         for p in positions:
@@ -219,6 +232,8 @@ def audit_today(today_ops: list, positions: list, levels_map: dict,
             mv_sum += mv
             if total_asset > 0 and mv / total_asset > single_cap:
                 violations.append(f"{p['code']} 单票仓位 {(mv / total_asset) * 100:.1f}% 超红线 {single_cap * 100:.0f}%")
+    if total_asset and mv_sum / total_asset > float(_p.get("cap", 0.7)) + 1e-6:
+        violations.append(f"总仓位 {mv_sum / total_asset * 100:.1f}% 超阶段({_p.get('label', '')})上限 {float(_p.get('cap', 0.7)) * 100:.0f}%")
     # 3) 破位未止损(今日最低 < stop_loss 且当日未卖出)
     sold_today = {str(o["code"]).zfill(6) for o in today_ops if o.get("action") == "sell"}
     for code, lv in levels_map.items():

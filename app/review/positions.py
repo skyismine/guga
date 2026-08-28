@@ -75,6 +75,15 @@ def positions_review(d: dict) -> list:
 
     # ---- 今日合规校验
     items.append({"head": "今日操作合规校验"})
+    try:
+        from app.decision.engine import phase_cfg
+        _p = phase_cfg()
+        items.append({"t": f"市场阶段 **{_p.get('label')}**:总仓位上限 **{_p.get('cap', 0) * 100:.0f}%**"
+                           f" · 单票上限 **{_p.get('single_cap', 0) * 100:.0f}%**"
+                           f" · 单次新增 **{_p.get('add_cap', 0) * 100:.0f}%**"
+                           f" · 盈亏比门槛 **≥{_p.get('rr_left', 0)}:1**(左侧)"})
+    except Exception:  # noqa: BLE001
+        pass
     today = str(d.get("date") or dt.date.today())
     levels_map = {r["code"]: (r.get("levels") or {}) for r in rows if r.get("levels")}
     from app.review.operations import load_operations, audit_today

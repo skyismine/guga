@@ -1054,8 +1054,15 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
 
 def _mark_levels(rows: list) -> None:
     cfg = _st.load()
-    top_n = cfg.get("mainline_top_n", 2)
-    branch_n = cfg.get("mainline_branch_top_n", 5)
+    # 主线数量阶段化: 核心≤core_max, 发酵≤branch_max(退潮/高潮 无发酵层)
+    try:
+        from app.decision.engine import phase_cfg
+        _p = phase_cfg()
+        top_n = min(int(cfg.get("mainline_top_n", 2)), int(_p.get("core_max", 4)))
+        branch_n = min(int(cfg.get("mainline_branch_top_n", 5)), top_n + int(_p.get("branch_max", 3)))
+    except Exception:  # noqa: BLE001
+        top_n = cfg.get("mainline_top_n", 2)
+        branch_n = cfg.get("mainline_branch_top_n", 5)
     for i, r in enumerate(rows):
         r["rank"] = i + 1
         r["level"] = "core" if i < top_n else ("branch" if i < branch_n else "watch")

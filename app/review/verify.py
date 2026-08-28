@@ -79,6 +79,8 @@ def build_archive_record(d: dict) -> dict:
         from app.decision.engine import market_permit
         p = market_permit()
         m.update({"market_grade": p.get("grade"), "cap": p.get("cap"),
+                  "market_phase": p.get("market_phase"),
+                  "phase_label": p.get("phase_label"),
                   "fear_greed": p.get("fear_greed"), "adv_ratio": p.get("adv_ratio"),
                   "limit_up": p.get("limit_up"), "amount_yi": p.get("amount_yi")})
     except Exception:  # noqa: BLE001

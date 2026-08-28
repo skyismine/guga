@@ -219,6 +219,41 @@ def _boost_level(sector_level: str, sector_status: str, cfg: dict) -> str:
     return sector_level
 
 
+# ------------------------------------------------------------------ 分阶段盈亏比准入(四阶段体系)
+def _trade_rr(item: dict, role: str) -> tuple:
+    """计算交易模式与盈亏比(复用模型 levels)。
+
+    - trade_mode: 现价贴近压力/突破位 → 右侧突破; 否则左侧低吸;
+    - 左侧低吸盈亏比 = (目标-低吸位)/(低吸位-止损); 右侧突破盈亏比 = (目标-突破位)/(突破位-止损);
+    - levels 缺失时返回 rr=None(准入放行, 兜底)。
+    """
+    lv = item.get("levels") or {}
+    price = item.get("price")
+    entry_low, entry_high = lv.get("entry_low"), lv.get("entry_high")
+    stop, tgt = lv.get("stop_loss"), lv.get("target")
+    if price and entry_high and entry_high > 0 and price >= entry_high * 0.98:
+        mode = "right"
+    else:
+        mode = "left"
+    rr = None
+    if mode == "right":
+        if entry_high and stop and tgt and entry_high > stop:
+            rr = (tgt - entry_high) / (entry_high - stop)
+    else:
+        if entry_low and stop and tgt and entry_low > stop:
+            rr = (tgt - entry_low) / (entry_low - stop)
+    return mode, rr
+
+
+def _rr_pass(phase: str, mode: str, rr, pcfg: dict) -> bool:
+    """分阶段盈亏比硬门槛: 不达标剔除(None=数据缺失放行, 兜底)。"""
+    if rr is None:
+        return True
+    if mode == "left":
+        return rr >= pcfg["rr_left"]
+    return pcfg["rr_right"] is not None and rr >= pcfg["rr_right"]
+
+
 # ------------------------------------------------------------------ 主入口
 def match_targets_v2(sector_name: str, sector_level: str = "watch",
                      sector_status: str = "core") -> dict:
@@ -288,7 +323,12 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
             ok_codes = {x["code"] for x in ok}
             formal[role] = [it for it in tiers[role] if it["code"] in ok_codes]
 
-    # 渲染三档正式(携带差异化交易参数)
+    # 渲染三档正式(携带差异化交易参数), 叠加分阶段盈亏比准入与档位禁用
+    from app.decision.engine import get_market_phase, phase_cfg
+    _phase = get_market_phase()
+    _pcfg = phase_cfg(_phase)
+    _allowed = _pcfg.get("tiers") or ["steady", "aggressive", "repair"]
+    rendered = {role: [] for role in ("steady", "aggressive", "repair")}
     for role in ("steady", "aggressive", "repair"):
         for it in formal[role]:
             it["is_stable"] = True
@@ -300,7 +340,21 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
                       "is_pulse_watch", "pos_adjusted", "style"):
                 if k in it:
                     item.setdefault(k, it[k])
-            stable[role].append(item)
+            rendered[role].append(item)
+    # 分阶段硬门槛: 档位禁用 + 盈亏比准入(前置校验, 不达标直接剔除/该档空缺)
+    for role in ("steady", "aggressive", "repair"):
+        if role not in _allowed:
+            stable[role] = []
+            continue
+        kept = []
+        for item in rendered[role]:
+            mode, rr = _trade_rr(item, role)
+            item["trade_mode"] = "右侧突破" if mode == "right" else "左侧低吸"
+            item["trade_rr"] = round(rr, 2) if rr else None
+            if not _rr_pass(_phase, mode, rr, _pcfg):
+                continue
+            kept.append(item)
+        stable[role] = kept
 
     # 观察名单(脉冲/未入选, 仅展示不参与执行)
     for w in tiers.get("watch", []):

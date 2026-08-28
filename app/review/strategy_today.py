@@ -25,6 +25,22 @@ def strategy_review(d: dict) -> list:
     items = []
     core, branch, strength = _strength_ctx()
 
+    # ---- 阶段前置: 当前阶段/仓位上限/盈亏比要求/操作基调(四阶段体系)
+    try:
+        from app.decision.engine import phase_cfg
+        _p = phase_cfg()
+        items.append({"head": "0. 市场阶段与风控基调(全局阶段)"})
+        items.append({"t": f"当前市场阶段 **{_p.get('label')}**:总仓位上限 **{_p.get('cap', 0) * 100:.0f}%**"
+                           f" · 单票上限 **{_p.get('single_cap', 0) * 100:.0f}%**"
+                           f" · 单次新增上限 **{_p.get('add_cap', 0) * 100:.0f}%**"
+                           f" · 盈亏比门槛 左侧≥{_p.get('rr_left')} / 右侧"
+                           + (f"≥{_p.get('rr_right')}" if _p.get("rr_right") else "禁开")
+                           + f" · 操作基调 **{_p.get('keynote')}**。"})
+        if _p.get("add_cap", 0) <= 0:
+            items.append({"t": "⚠ 当前阶段禁止新增开仓/加仓,仅持有管理。"})
+    except Exception:  # noqa: BLE001
+        pass
+
     # 大盘许可与仓位
     cap = None
     grade = None

@@ -130,6 +130,82 @@ def _sector_volume_adj(name: str, vr_raw: float, pct_chg, gain3, grade: str):
     return round(delta, 2), round(vr, 3)
 
 
+# ---------------------------------------------------------------- 第一阶段 市场阶段全局判定
+# 四阶段仓位与盈亏比体系: 评级+情绪+量能+连板 → 全局唯一 market_phase,全系统复用。
+# 字段含义:
+#   cap         分阶段账户总仓位上限(全系统仓位天花板,替代固定上限)
+#   single_cap  单只个股/行业ETF 上限
+#   add_cap     单次新增开仓/加仓上限(<=0 禁止新增)
+#   admission   主线准入线(评分门槛)
+#   core_max/branch_max  核心/发酵主线数量硬约束
+#   rr_left/rr_right     左侧低吸/右侧突破盈亏比门槛(None=禁止该模式)
+#   tiers       允许的标的三档(空档即禁用)
+#   stop_adj    止损幅度阶段化系数(×止损)
+#   stab_cycle_adj  稳定器驻留周期系数
+_PHASE_CFG = {
+    "retreat": {"label": "退潮冰点/缩量磨底", "cap": 0.30, "single_cap": 0.01, "add_cap": 0.02,
+                "admission": 65, "core_max": 2, "branch_max": 0,
+                "rr_left": 2.0, "rr_right": None, "tiers": ["steady", "repair"],
+                "stop_adj": 0.8, "stab_cycle_adj": 1.5, "keynote": "只减不加,极轻仓试错"},
+    "startup": {"label": "启动确认期", "cap": 0.50, "single_cap": 0.02, "add_cap": 0.05,
+                "admission": 60, "core_max": 3, "branch_max": 2,
+                "rr_left": 2.0, "rr_right": 1.5, "tiers": ["steady", "aggressive", "repair"],
+                "stop_adj": 1.0, "stab_cycle_adj": 1.0, "keynote": "回踩低吸+突破试加"},
+    "main":    {"label": "主升发酵期", "cap": 0.70, "single_cap": 0.05, "add_cap": 0.10,
+                "admission": 58, "core_max": 4, "branch_max": 3,
+                "rr_left": 1.5, "rr_right": 1.2, "tiers": ["steady", "aggressive", "repair"],
+                "stop_adj": 1.2, "stab_cycle_adj": 0.8, "keynote": "顺势加仓,持有为主"},
+    "climax":  {"label": "高潮加速期", "cap": 0.50, "single_cap": 0.03, "add_cap": 0.0,
+                "admission": 62, "core_max": 3, "branch_max": 0,
+                "rr_left": 99.0, "rr_right": None, "tiers": ["steady"],
+                "stop_adj": 0.9, "stab_cycle_adj": 1.2, "keynote": "分批兑现,逐步降仓"},
+}
+
+
+def _phase_from_permit(p: dict) -> str:
+    """评级→阶段映射(复用 market_permit 已算指标, 不重复抓取)。"""
+    grade = p.get("grade")
+    fg = p.get("fear_greed")
+    vol = p.get("vol_ratio")
+    zt = p.get("limit_up")
+    if grade in ("C", "D"):
+        return "retreat"                       # 退潮冰点/缩量磨底
+    if grade == "A":
+        # 高潮加速: 情绪高温 或 (放量且涨停家数高 → 普涨/连板飙升)
+        if (fg is not None and fg >= 70) or (vol is not None and vol >= 1.1 and zt is not None and zt >= 60):
+            return "climax"
+        return "main"                          # 主升发酵
+    if grade == "B":
+        return "startup"                       # 启动确认
+    return "retreat"                           # 兜底: 未知评级按退潮防守
+
+
+# 全局阶段缓存(60s): 避免各层重复判定造成口径分歧
+_PHASE_CACHE = {"t": 0.0, "phase": None}
+
+
+def get_market_phase(force: bool = False) -> str:
+    """全局唯一市场阶段标识(60s 缓存, 供主线/标的/风控/复盘全链路复用)。"""
+    now = time.time()
+    if not force and _PHASE_CACHE["phase"] and now - _PHASE_CACHE["t"] < 60:
+        return _PHASE_CACHE["phase"]
+    try:
+        p = market_permit()
+        phase = _phase_from_permit(p)
+    except Exception:  # noqa: BLE001
+        phase = "main"                         # 兜底: 判定异常回退默认主升参数
+    _PHASE_CACHE["t"] = now
+    _PHASE_CACHE["phase"] = phase
+    return phase
+
+
+def phase_cfg(phase: str = None) -> dict:
+    """当前阶段配置(含 phase 键); 阶段异常时回退 main。"""
+    phase = phase or get_market_phase()
+    cfg = _PHASE_CFG.get(phase) or _PHASE_CFG["main"]
+    return {**cfg, "phase": phase}
+
+
 # ---------------------------------------------------------------- 第一层 大盘开仓许可评级
 def _market_vol_ratio(rows: list, amount_yi):
     """大盘量能比 = 截至当前时段累计成交额 / 近5日相同时段平均成交额。
@@ -277,7 +353,11 @@ def market_permit() -> dict:
 
     score = _market_score(fg, adv_ratio, zt, vp, trend)
     grade = _grade(score, zt, adv_ratio, rules)
-    cap = rules["cap"].get(grade, 0.1)
+    # 阶段全局判定(评级+情绪+量能+连板), 总仓位上限动态化为分阶段上限(全系统天花板)
+    phase = _phase_from_permit({"grade": grade, "fear_greed": fg,
+                                "vol_ratio": vol_ratio, "limit_up": zt})
+    pcfg = _PHASE_CFG[phase]
+    cap = pcfg["cap"]
     checks = {
         "大盘打分": {"value": score, "ok": score >= rules["score_full"], "ok_min": score >= rules["score_ok"]},
         "涨停家数": {"value": zt, "ok": zt is not None and zt >= rules["zt_full"],
@@ -297,7 +377,7 @@ def market_permit() -> dict:
                        + (f",量价配合分 {vp}/5" if vp is not None else ""))
     if trend is not None:
         reasons.append(f"趋势强度 {trend}/20({trend_note})")
-    reasons.append(f"大盘综合评分 {score},达 {grade} 级标准(总仓位上限 {cap:.0%})")
+    reasons.append(f"大盘综合评分 {score},达 {grade} 级标准,当前市场阶段「{pcfg['label']}」总仓位上限 {cap:.0%}")
     return {
         "grade": grade,
         "grade_label": {"A": "A级·积极配置", "B": "B级·谨慎配置",
@@ -307,6 +387,9 @@ def market_permit() -> dict:
         "limit_up": zt, "advance": adv, "decline": dec, "adv_ratio": adv_ratio,
         "amount_yi": amount_yi, "vol_ratio": vol_ratio, "vol_ratio_raw": vol_raw,
         "vp_score": vp, "trend_score": trend, "checks": checks, "reasons": reasons,
+        "market_phase": phase,
+        "phase_label": pcfg["label"],
+        "operation_keynote": pcfg["keynote"],
         "date": str(snap.get("market_date") or _today()),
     }
 
@@ -478,6 +561,7 @@ def mainline_select() -> dict:
     """
     dcfg = _cfg()
     mline = dcfg.get("mainline", {})
+    admission = phase_cfg()["admission"]   # 分阶段准入线(退潮上调收紧, 主升下调放宽)
     rows = _ml.sector_scores(use_cache=True)
     zt_pool = _ml._zt_pool()
     zt_available = len(zt_pool) > 0  # 涨停池为空视为数据缺失,跳过涨停家数否决项
@@ -534,7 +618,7 @@ def mainline_select() -> dict:
             item["volume_ratio"] = vr_smooth
             item["score"] = round(r["score"] + delta, 2)
             item["volume_adj"] = delta
-        if item["score"] >= mline.get("pass_score", 60.0):
+        if item["score"] >= admission:
             item["reasons"] = _pass_reasons(r, stats, item["score"])
             if item.get("volume_adj"):
                 vr = item["volume_ratio"] or 0
@@ -551,7 +635,7 @@ def mainline_select() -> dict:
                 vtag = ("放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")) \
                     + ("上涨" if (r.get("pct_chg") or 0) > 0 else "下跌")
                 vtxt = f"(量能比 {vr:.2f} {vtag},量能修正 {item.get('volume_adj') or 0:+.1f} 分)"
-            item["reasons"] = [f"综合评分 {item['score']} 分,低于准入线 {mline.get('pass_score', 60.0)} 分,仅跟踪{vtxt}"]
+            item["reasons"] = [f"综合评分 {item['score']} 分,低于阶段准入线 {admission} 分,仅跟踪{vtxt}"]
             low.append(item)
 
     # ---- 属性池内分级(禁止跨池对比);第五轮:风格偏转仅调整同池相邻且分差小的排序
@@ -611,7 +695,7 @@ def mainline_select() -> dict:
 
     out = {"core": core, "defensive": defensive, "watch": watch,
            "rejected": rejected[: mline.get("watch_n", 3)],
-           "pass_score": mline.get("pass_score", 60.0)}
+           "pass_score": admission}
     if ext_cfg:
         # 第五轮:全局风格偏转信息(复盘展示,不参与打分)
         out["market_style"] = style or _ml.market_style_bias()
@@ -887,12 +971,17 @@ def execution_plan(target: dict, total_asset: float, taste: str,
     - 股数 = 风险金额 / (现价-止损价),金额/股数/最大亏损/占比四者自洽。
     """
     dcfg = _cfg()
+    pcfg = phase_cfg()   # 分阶段仓位矩阵/操作基调/止损系数(全系统单一来源)
     risk_rate = dcfg.get("risk", {}).get(taste, 0.015)
     batch = dcfg.get("batch", {"first": 0.60, "second": 0.40})
     plancfg = dcfg.get("plan", {})
     price = float(target.get("price") or 0)
     if price <= 0:
         return {"ok": False, "reason": "无有效现价"}
+    if pcfg["add_cap"] <= 0:
+        # 高潮加速/退潮: 禁止新增开仓/加仓(风控前置拦截, 而非事后提示)
+        return {"ok": False, "name": target.get("name"), "code": target.get("code"),
+                "reason": f"当前阶段「{pcfg['label']}」禁止新增开仓/加仓(单次上限 0)"}
     lv = target.get("levels") or {}
     atr = target.get("atr14")
     atr = float(atr) if atr else None
@@ -982,7 +1071,7 @@ def execution_plan(target: dict, total_asset: float, taste: str,
                     "reason": f"{grade} 级市场下「{asset_type}」类型禁止新开仓(仓位矩阵 0%)"}
     else:
         single_cap = single_cap if single_cap is not None else _st.load().get("risk", {}).get("single_pct", 0.10)
-    max_mv = total_asset * min(market_cap or 1.0, single_cap)
+    max_mv = total_asset * min(market_cap or 1.0, single_cap, pcfg["single_cap"])  # 阶段单票上限并入
 
     # ---- 单板块总仓位上限(超出则压缩 + 预警)
     pm_block = pm if use_matrix else {}
@@ -1013,6 +1102,21 @@ def execution_plan(target: dict, total_asset: float, taste: str,
     second = shares - first
     max_loss = shares * loss_per_share
 
+    # ---- 分阶段单次新增/加仓上限(硬约束, 开仓前拦截)
+    if pcfg["add_cap"] > 0:
+        add_mv = total_asset * pcfg["add_cap"]
+        if pos_value > add_mv:
+            pos_value = add_mv
+            shares = int(pos_value / avg_cost // 100) * 100
+            shares = max(shares, 100)
+            pos_value = shares * avg_cost
+            first = int(shares * batch.get("first", 0.60) // 100) * 100
+            second = shares - first
+            max_loss = shares * loss_per_share
+
+    # ---- 止损阶段化(退潮收紧20% / 主升放宽20% / 高潮收紧), 且不得高于现价
+    stop = min(stop * pcfg["stop_adj"], price * 0.98)
+
     # ---- 触发条件量化(升级4):盘中按分钟K线判定当前触发状态
     tcfg = dcfg.get("trigger", {})
     trigger_state = {"status": "未触发", "label": "trigger-off", "note": ""}
@@ -1026,6 +1130,10 @@ def execution_plan(target: dict, total_asset: float, taste: str,
         "taste": taste,
         "name": target.get("name"),
         "code": target.get("code"),
+        "market_phase": pcfg["phase"],
+        "phase_label": pcfg["label"],
+        "operation_keynote": pcfg["keynote"],
+        "trade_mode": target.get("trade_mode"),
         "trigger": trigger,
         "trigger_status": trigger_state,
         "mode": mode,

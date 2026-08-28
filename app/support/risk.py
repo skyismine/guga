@@ -104,12 +104,27 @@ def _sector_of(code):
     return mc or (get_concepts(code) or [None])[0]
 
 
+def _phase_risk() -> dict:
+    """分阶段仓位矩阵(全局阶段唯一判定, 复用 engine.phase_cfg)。异常时回退原有规则兜底。"""
+    try:
+        from app.decision.engine import phase_cfg
+        p = phase_cfg()
+        return {"cap": p["cap"], "single_cap": p["single_cap"], "add_cap": p["add_cap"],
+                "phase": p["phase"], "label": p["label"], "keynote": p["keynote"]}
+    except Exception:  # noqa: BLE001
+        rules = _st.load().get("risk", {}) or {}
+        return {"cap": rules.get("max_total_pct", 0.5), "single_cap": rules.get("single_pct", 0.10),
+                "add_cap": rules.get("add_increase_cap", 0.3), "phase": "main",
+                "label": "主升发酵期", "keynote": "顺势加仓,持有为主"}
+
+
 def validate(positions: list, total_asset: float = None,
              prices: dict = None, fg: float = None) -> dict:
-    """校验持仓是否违反仓位规则。返回 {ok, rating, total_market_value,
+    """校验持仓是否违反仓位规则(分阶段矩阵)。返回 {ok, rating, total_market_value,
     total_pct, single_violations, sector_violations, add_violations, tips}。"""
     cfg = _st.load()
     rules = cfg["risk"]
+    ph = _phase_risk()
     positions = positions or []
     codes = [p["code"] for p in positions]
     prices = prices if prices is not None else quotes_of(codes)
@@ -123,9 +138,9 @@ def validate(positions: list, total_asset: float = None,
     for p, v in zip(positions, mv):
         pct = v / total_asset if total_asset else 0.0
         code = p["code"]
-        if pct > rules["single_pct"] + 1e-6:
+        if pct > ph["single_cap"] + 1e-6:
             single.append({"code": code, "pct": round(pct, 4),
-                           "limit": rules["single_pct"]})
+                           "limit": ph["single_cap"]})
         sec = _sector_of(code)
         if sec:
             sector.setdefault(sec, {"pct": 0.0, "codes": []})
@@ -139,13 +154,13 @@ def validate(positions: list, total_asset: float = None,
     sec_v = [{"sector": k, **v, "limit": rules["sector_pct"]}
              for k, v in sector.items() if v["pct"] > rules["sector_pct"] + 1e-6]
 
-    cap = _market_mood_cap(rules, fg)
+    cap = ph["cap"]   # 分阶段总仓位上限(全系统天花板)
     total_ok = total_pct <= cap + 1e-6
     n_viol = len(single) + len(sec_v) + (0 if total_ok else 1) + len(add)
     rating = "低" if n_viol == 0 else ("中" if n_viol == 1 else "高")
     tips = []
     if not total_ok:
-        tips.append(f"总仓位 {total_pct:.1%} 超过恐贪档位上限 {cap:.0%},建议降仓至 {cap:.0%} 以内")
+        tips.append(f"总仓位 {total_pct:.1%} 超过当前阶段({ph['label']})上限 {cap:.0%},建议降仓至 {cap:.0%} 以内")
     for s in single:
         tips.append(f"{s['code']} 仓位 {s['pct']:.1%} 超过单只上限 {s['limit']:.0%}")
     for s in sec_v:
@@ -175,7 +190,7 @@ def max_position(code: str, total_asset: float, price: float = None,
     price = price or quotes_of([code]).get(code, {}).get("price", 0.0)
     if not price:
         return {"ok": False, "reason": "无法获取最新价"}
-    cap_share = rules["single_pct"]
+    cap_share = _phase_risk()["single_cap"]
     mv = total_asset * cap_share
     qty = int(mv / price // config.LOT_SIZE) * config.LOT_SIZE
     return {

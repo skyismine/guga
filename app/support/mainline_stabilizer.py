@@ -335,6 +335,14 @@ def _build_stable(cfg: dict) -> dict:
     down = float(cfg.get("PASS_HYSTERESIS_DOWN", 58.0))
     pass_score = float(cfg.get("pass_score", 60.0))
     watch_n = int(cfg.get("watch_n", 3))
+    # 阶段联动: 退潮加长驻留周期/提高准入, 主升适度放宽灵敏度
+    try:
+        from app.decision.engine import phase_cfg
+        _p = phase_cfg()
+        N = max(1, int(N * _p.get("stab_cycle_adj", 1.0)))
+        pass_score = float(_p["admission"])
+    except Exception:  # noqa: BLE001
+        pass
     now = time.time()
     # 第五轮:全局风格偏转标签(复盘展示,不参与打分)
     style_tag = _ml.market_style_bias().get("tag", "") if cfg.get("enable_extend_factor") else ""
