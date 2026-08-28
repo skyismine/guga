@@ -341,10 +341,12 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
                 if k in it:
                     item.setdefault(k, it[k])
             rendered[role].append(item)
-    # 分阶段硬门槛: 档位禁用 + 盈亏比准入(前置校验, 不达标直接剔除/该档空缺)
+    # 分阶段硬门槛: 档位禁用 + 盈亏比准入(前置校验, 不达标直接剔除/该档空缺), 并区分空缺原因
+    _reason_map = {"steady": "中军龙头", "aggressive": "情绪龙头", "repair": "补涨优选"}
     for role in ("steady", "aggressive", "repair"):
         if role not in _allowed:
-            stable[role] = []
+            stable[role] = [{"rank": 1, "error": f"当前阶段「{_pcfg.get('label', '')}」禁用{_reason_map[role]}档位",
+                             "is_stable": False, "match_source": "phase_disabled"}]
             continue
         kept = []
         for item in rendered[role]:
@@ -354,7 +356,16 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
             if not _rr_pass(_phase, mode, rr, _pcfg):
                 continue
             kept.append(item)
-        stable[role] = kept
+        if kept:
+            stable[role] = kept
+        elif rendered[role]:
+            _rr_txt = f"左侧≥{_pcfg.get('rr_left')} / 右侧" + \
+                (f"≥{_pcfg.get('rr_right')}" if _pcfg.get("rr_right") else "禁开")
+            stable[role] = [{"rank": 1, "error": f"{_reason_map[role]}候选未达当前阶段盈亏比门槛({_rr_txt})",
+                             "is_stable": False, "match_source": "rr_gate"}]
+        else:
+            stable[role] = [{"rank": 1, "error": _no_candidate_reason(spot, stocks),
+                             "is_stable": False, "match_source": "no_data"}]
 
     # 观察名单(脉冲/未入选, 仅展示不参与执行)
     for w in tiers.get("watch", []):
@@ -374,12 +385,22 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
         stable = _fallback(stable, sector_name, sector_level, sector_status,
                            spot, quotes, predictor, market, cfg)
 
-    # error 占位保留
+    # error 占位: ETF 及兜底后仍空的档位
     for role in ("aggressive", "steady", "repair", "etf"):
         if not stable[role]:
-            stable[role] = [{"rank": 1, "error": "暂无可匹配标的(数据源受限)",
+            stable[role] = [{"rank": 1, "error": "暂无匹配ETF(流动性不足或未匹配到)"
+                             if role == "etf" else "暂无可匹配标的",
                              "is_stable": False, "match_source": "error"}]
     return {"sector": sector_name, "raw_targets": raw, "stable_targets": stable}
+
+
+def _no_candidate_reason(spot: dict, stocks: list) -> str:
+    """区分「无候选」的具体数据原因。"""
+    if not spot:
+        return "行情源不可用(全A快照获取失败)"
+    if not stocks:
+        return "板块无成分股(成分接口失败)"
+    return "板块候选不足,暂无匹配标的"
 
 
 def _render_item(it: dict, role: str, sector_name: str, sector_level: str,
