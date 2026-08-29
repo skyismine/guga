@@ -367,8 +367,14 @@ def market_permit() -> dict:
                        "ok_min": adv_ratio is not None and adv_ratio >= rules["adv_ratio_ok"]},
     }
     reasons = []
-    reasons.append(f"恐贪指数 {fg:.0f} 分({fear_greed_label(fg)}),贡献评分 {fg / 100 * 30:.0f}/30")
-    reasons.append(f"涨停 {zt} 家 / 上涨 {adv} 家 vs 下跌 {dec} 家,家数比 {adv_ratio:.2f}")
+    if fg is not None:
+        reasons.append(f"恐贪指数 {fg:.0f} 分({fear_greed_label(fg)}),贡献评分 {fg / 100 * 30:.0f}/30")
+    else:
+        reasons.append("恐贪指数数据缺失,暂按中性计入")
+    if adv_ratio is not None:
+        reasons.append(f"涨停 {zt} 家 / 上涨 {adv} 家 vs 下跌 {dec} 家,家数比 {adv_ratio:.2f}")
+    else:
+        reasons.append(f"涨停 {zt} 家 / 上涨 {adv} 家 vs 下跌 {dec} 家(涨跌家数比数据缺失)")
     if amount_yi:
         reasons.append(f"两市成交额 {amount_yi:,.0f} 亿")
     if vol_ratio is not None:
