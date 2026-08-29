@@ -441,16 +441,15 @@ def market_snapshot() -> dict:
             market_date = _today_str()
         except Exception as e:  # noqa: BLE001
             print(f"[market_features] 实时市场快照降级为日线: {e}")
-    if not _is_trading_time():
-        # 非交易时段: 新浪/东财日线滞后一日,用 fuyao 判定的最新交易日覆盖 market_date
-        # (与 review_date 同口径, 保证「今日决策」日期为真实交易日)
-        try:
-            from app.review.data import review_date
-            rd = str(review_date())
-            if rd > market_date:
-                market_date = rd
-        except Exception:  # noqa: BLE001
-            pass
+    # 统一用 fuyao 判定的最新交易日兜底: 交易时段实时成功时 market_date=今日(rd 不更大,不覆盖);
+    # 实时失败/非交易时段日线滞后时,rd 更新则覆盖为真实交易日(与 review_date 同口径)。
+    try:
+        from app.review.data import review_date
+        rd = str(review_date())
+        if rd > market_date:
+            market_date = rd
+    except Exception:  # noqa: BLE001
+        pass
     snap = {"market_date": market_date,
             "market": {c: (None if pd.isna(row[c]) else round(float(row[c]), 4))
                        for c in frame.columns}}
