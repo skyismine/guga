@@ -123,6 +123,29 @@ def get_limit_up_pool(page: int = 1, size: int = 100):
     return (data or {}).get("item") or []
 
 
+def get_limit_down_pool(page: int = 1, size: int = 100):
+    """跌停池(含首次/最后跌停时间/换手率)。"""
+    data = _get("/api/a-share/special-data/limit-down-pool",
+                {"page": page, "size": size}, ttl=300)
+    return (data or {}).get("item") or []
+
+
+def _pool_total(path: str, ttl: int = 300) -> int:
+    """涨跌停/炸板股票池总家数(分页信息 total,单页请求即可取到)。"""
+    data = _get(path, {"page": 1, "size": 200}, ttl=ttl)
+    return int(((data or {}).get("pagination") or {}).get("total") or 0)
+
+
+def get_limit_up_pool_total(ttl: int = 300) -> int:
+    """当日涨停家数(涨停池 total;date_ms 省略=当前自然日,交易时段实时)。"""
+    return _pool_total("/api/a-share/special-data/limit-up-pool", ttl=ttl)
+
+
+def get_limit_down_pool_total(ttl: int = 300) -> int:
+    """当日跌停家数(跌停池 total;date_ms 省略=当前自然日,交易时段实时)。"""
+    return _pool_total("/api/a-share/special-data/limit-down-pool", ttl=ttl)
+
+
 def get_limit_up_ladder():
     """近30交易日连板梯队矩阵(供复盘梯队完整度)。"""
     data = _get("/api/a-share/special-data/limit-up-ladder", {}, ttl=3600)
@@ -200,6 +223,38 @@ def get_index_snapshot(thscodes: str) -> list:
     """指数行情快照(批量, 含收盘/涨跌幅/成交额), 权威收盘口径。"""
     data = _get("/api/a-share-index/prices/snapshot", {"thscodes": thscodes}, ttl=600)
     return (data or {}).get("item") or []
+
+
+def get_stock_snapshot(thscodes: list, ttl: int = 30) -> dict:
+    """A股行情快照(批量, 每批 ≤500)。返回 {6位代码: 快照项}。
+
+    用于全市场盘中涨跌家数:单批过大(>500)会被上游 400 拒绝,自动分批。
+    """
+    items = []
+    for i in range(0, len(thscodes), 500):
+        batch = thscodes[i:i + 500]
+        data = _get("/api/a-share/prices/snapshot",
+                    {"thscodes": ",".join(batch)}, ttl=ttl)
+        items.extend((data or {}).get("item") or [])
+    return {str(it.get("ticker"))[-6:]: it for it in items if it.get("ticker")}
+
+
+def get_market_snapshot(limit: int = 5000, ttl: int = 30) -> list:
+    """全市场行情快照(官方分页模式,一次取全 A 股)。
+
+    省略 thscodes 时上游按 thscode 升序遍历完整 A 股代码表并按 limit/offset 分页;
+    实测 limit=5000 时仅 2 次请求即可取完 5000+ 只,替代逐批 thscodes 查询。
+    """
+    items, offset = [], 0
+    while True:
+        data = _get("/api/a-share/prices/snapshot",
+                    {"limit": limit, "offset": offset}, ttl=ttl)
+        page = (data or {}).get("item") or []
+        items.extend(page)
+        if len(page) < limit:
+            break
+        offset += limit
+    return items
 
 
 def get_calendar_trading_days():

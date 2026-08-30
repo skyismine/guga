@@ -1,7 +1,7 @@
 """市场情绪数据:股指期货资金/基差、指数行情、全市场涨跌家数(乐咕乐股)。
 
 - 期指资金:IF/IH/IC/IM 连续合约历史日线 + 实时快照,基差 = 期货价/现货指数 - 1
-- 涨跌家数:乐咕乐股市场活跃度(当日上涨/下跌/涨停/跌停/活跃度)
+- 涨跌家数:fuyao 全市场日K(收盘口径,优先) + 乐咕乐股(盘中实时,回退)
 - 全部带本地 pickle 缓存 + TTL
 """
 import datetime as dt
@@ -227,17 +227,159 @@ def get_futures_quotes(use_cache: bool = True) -> Dict:
     return result
 
 
-# ---------------------------------------------------------------- 涨跌家数(乐咕乐股)
-def get_market_activity(use_cache: bool = True) -> Dict:
-    """全市场当日涨跌家数/涨停跌停/活跃度(乐咕乐股快照)。
+# ---------------------------------------------------------------- 涨跌家数(fuyao 全市场日K)
+_FUYAO_DUMP_PAT = re.compile(r"/releases/(\d{8})/")
 
-    交易时段家数盘中持续变化,短 TTL(60s)刷新;非交易时段用长 TTL(4h)。
+
+def _fuyao_dump_path() -> str:
+    """确定全市场日K(近10交易日)本地文件路径,缺失时下载。"""
+    from app.data.fuyao import get_market_dump_url as _fy_url
+    url = _fy_url("daily-k-10d")
+    m = _FUYAO_DUMP_PAT.search(url)
+    release = m.group(1) if m else dt.date.today().strftime("%Y%m%d")
+    path = os.path.join(config.DATA_DIR, f"market_dump_10d_{release}.parquet")
+    if not os.path.exists(path):
+        print(f"[market] 下载 fuyao 全市场日K(近10交易日,{release})...")
+        with requests.get(url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    f.write(chunk)
+    return path
+
+
+def _fuyao_dump_df() -> pd.DataFrame:
+    """读取 fuyao 全市场日K Parquet(index 保持原样,列 thscode/date_ms/close_price)。"""
+    import pyarrow.parquet as pq
+    return pq.read_table(_fuyao_dump_path(),
+                         columns=["thscode", "date_ms", "close_price"]).to_pandas()
+
+
+def _breadth(close: "pd.Series", prev: "pd.Series", thscodes: "pd.Series",
+             date: str, source: str) -> Dict:
+    """由 {股票: 现价/收盘} 与 {股票: 昨收} 计算涨跌家数/涨停跌停(统一口径)。
+
+    涨停/跌停判定:现价是否触及涨跌停价(主板10%/创业科创板20%/北交所30%)。
+    """
+    ret = close / prev - 1
+    ratio = pd.Series(1.10, index=close.index)
+    ratio[thscodes.str.startswith(("30", "68"))] = 1.20
+    ratio[thscodes.str.endswith(".BJ")] = 1.30
+    up = int((ret > 0).sum())
+    down = int((ret < 0).sum())
+    flat = int((ret == 0).sum())
+    limit_up = int((close >= (prev * ratio).round(2) - 1e-9).sum())
+    limit_down = int((close <= (prev * (2 - ratio)).round(2) + 1e-9).sum())
+    total = up + down + flat
+    return {
+        "advance": up, "decline": down, "flat": flat, "suspended": 0,
+        "limit_up": limit_up, "real_limit_up": limit_up,
+        "limit_down": limit_down, "real_limit_down": limit_down,
+        "activity_pct": round(up / total * 100, 2) if total else 0.0,
+        "date": date,
+        "adv_ratio": round(up / (up + down), 4) if (up + down) else None,
+        "source": source,
+    }
+
+
+def _activity_from_fuyao() -> Dict:
+    """全市场涨跌家数(fuyao 全市场日K,按最新交易日收盘口径计算)。
+
+    与乐咕口径差异(注释说明):
+    - 收盘口径:盘中不更新,反映最新完整交易日(fuyao daily-k 为日终快照);
+    - 停牌股无当日 close 行、新上市无 prev_close → 均不参与计数;
+    - 涨停/跌停按收盘价是否触及涨跌停价判定(≈乐咕"真实涨停/跌停"),
+      "触板未封" 的涨停(乐咕统计口径)无法从日K还原,归入 real_limit_up 同值;
+    - 无名称字段无法识别 ST,涨跌停价按主板10%/创业科创板20%/北交所30% 估算,
+      ST(5%)样本占全市场比例极小,对计数影响可忽略。
+    """
+    from app.data.fuyao import enabled as _fy_enabled
+    if not _fy_enabled():
+        raise RuntimeError("fuyao 未启用(settings.fuyao.enabled)")
+    df = _fuyao_dump_df()
+    df["date"] = pd.to_datetime(df["date_ms"], unit="ms").dt.tz_localize(
+        "UTC").dt.tz_convert("Asia/Shanghai").dt.strftime("%Y-%m-%d")
+    last_date = str(df["date"].max())
+    # prev_close 需在整个窗口内逐股 shift,先算再截取最新交易日
+    df["prev_close"] = df.groupby("thscode")["close_price"].shift(1)
+    df = df[df["date"] == last_date].dropna(subset=["prev_close"])
+    return _breadth(df["close_price"], df["prev_close"], df["thscode"],
+                    last_date, "fuyao")
+
+
+def _activity_from_fuyao_realtime() -> Dict:
+    """盘中实时涨跌家数/涨停跌停(fuyao 全市场快照 + 官方涨跌停池)。
+
+    仅交易时段调用;非交易时段 snapshot 回落为上一收盘价,故非盘中仍走 _activity_from_fuyao。
+    - 涨跌家数:全市场快照官方分页(每页 5000,约 2 次请求取全 A 股,短 TTL 盘中刷新);
+    - 涨停/跌停:官方涨跌停池 total(省略 date_ms=当前自然日,交易时段实时,权威且含
+      ST/次新标注);total=0(上游未就绪)或请求失败时,保留快照涨跌停价阈值估算。
+    """
+    from app.data.fuyao import enabled as _fy_enabled
+    from app.data.fuyao import get_market_snapshot as _fy_snap
+    from app.data.fuyao import get_limit_up_pool_total as _fy_lu
+    from app.data.fuyao import get_limit_down_pool_total as _fy_ld
+    if not _fy_enabled():
+        raise RuntimeError("fuyao 未启用(settings.fuyao.enabled)")
+    items = _fy_snap(limit=5000, ttl=_INTRADAY_TTL)
+    df = pd.DataFrame(items)
+    if df.empty:
+        raise RuntimeError("fuyao 全市场快照为空")
+    df = df.dropna(subset=["last_price", "prev_price"])
+    if (df["last_price"] <= 0).all():
+        raise RuntimeError("fuyao 全市场快照无有效报价")
+    today = dt.datetime.now().strftime("%Y-%m-%d")
+    result = _breadth(df["last_price"], df["prev_price"], df["thscode"],
+                      today, "fuyao_rt")
+    for key, fn in (("limit_up", _fy_lu), ("limit_down", _fy_ld)):
+        try:
+            n = int(fn())
+            if n > 0:
+                result[key] = result[f"real_{key}"] = n
+        except Exception as e:  # noqa: BLE001
+            print(f"[market] fuyao {key} 池获取失败,保留快照估算: {e}")
+    return result
+
+
+def _activity_cache_ttl(cached: Dict) -> int:
+    """活动度缓存 TTL(秒):交易时段短刷新(60s),非交易时段长 TTL(4h)。
+
+    交易时段无论缓存来自实时还是收盘口径都 60s 刷新,便于盘中持续跟进;
+    非交易时段数据已定型,4h 内复用。
+    """
+    return _INTRADAY_TTL if _is_trading_time() else config.CACHE_TTL_SECONDS
+
+
+def get_market_activity(use_cache: bool = True) -> Dict:
+    """全市场当日涨跌家数/涨停跌停/活跃度。
+
+    数据源优先级:
+    P1 交易时段:fuyao 全市场实时快照(盘中 60s 刷新);
+    P2 任意时段:fuyao 全市场日K(收盘口径,最新完整交易日);
+    P3 乐咕乐股(原源,盘中 60s 实时)——前两级失败时回退。
     """
     if use_cache:
-        ttl = _INTRADAY_TTL if _is_trading_time() else config.CACHE_TTL_SECONDS
-        cached = _load_cache("activity", ttl=ttl)
+        cached = _load_cache("activity", ttl=None)
         if cached is not None:
-            return cached
+            ttl = _activity_cache_ttl(cached)
+            if time.time() - os.path.getmtime(_path("activity")) <= ttl:
+                return cached
+    if _is_trading_time():
+        try:
+            result = _activity_from_fuyao_realtime()
+        except Exception as e:  # noqa: BLE001
+            print(f"[market] fuyao 实时涨跌家数获取失败,回退收盘口径: {e}")
+        else:
+            _save_cache("activity", result)
+            return result
+    try:
+        result = _activity_from_fuyao()
+    except Exception as e:  # noqa: BLE001
+        print(f"[market] fuyao 涨跌家数获取失败,回退乐咕: {e}")
+    else:
+        _save_cache("activity", result)
+        return result
+    # P3 回退: 乐咕乐股(原源;页面反爬/结构变化时可能抛异常)
     import akshare as ak
     df = ak.stock_market_activity_legu()
     mapping = {r["item"]: r["value"] for _, r in df.iterrows()}
