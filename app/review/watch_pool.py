@@ -270,10 +270,42 @@ def _watch_pool_oversold(d: dict) -> list:
 
 
 # ---------------------------------------------------------------- 入口
+def _prev_day_targets(d: dict) -> list:
+    """决策引擎数据未就绪时,复用前一日推荐标的并标注「T日数据待更新」(杜绝空值)。
+
+    设计目的: 观察池不出现空档,口径仍对齐系统三档(激进/中军/补涨)。
+    """
+    try:
+        import datetime as _dt
+        from app.review import archive
+        prev = archive.prev_day(str(d.get("date") or _dt.date.today()))
+        if not prev:
+            return []
+        spot = {}
+        try:
+            from app.support import mainline as _ml
+            spot = _ml._a_spot_map()
+        except Exception:  # noqa: BLE001
+            pass
+        rows = []
+        for sector, segs in (prev.get("targets") or {}).items():
+            for seg_key, role in (("aggressive", "情绪龙头"), ("steady", "中军龙头")):
+                for it in segs.get(seg_key) or []:
+                    code = it.get("code")
+                    s = spot.get(code) or {}
+                    rows.append([sector, role, code, _cell(s.get("name") or code),
+                                 _cell(f"{s.get('pct_chg', 0):+.2f}%"),
+                                 "-", "-", "-", "-", "-",
+                                 f"T日数据待更新(复用前一日推荐 {it.get('code')})"])
+        return rows
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def watch_pool_review(d: dict) -> list:
     """生成「明日重点观察标的池」结构化 items。"""
     items = []
-    items.append({"head": "子池1 · 主线龙头观察池(复用决策分档选股)"})
+    items.append({"head": "子池1 · 主线龙头观察池(三档梯队: 中军/情绪/补涨)"})
     rows1 = _watch_pool_leader(d)
     if rows1:
         items.append({"table": {"title": "",
@@ -281,7 +313,16 @@ def watch_pool_review(d: dict) -> list:
                                          "买入区间", "止损", "目标", "盈亏比", "建议仓位", "观察要点"],
                                 "rows": rows1}})
     else:
-        items.append({"t": "主线龙头候选暂缺(决策引擎标的数据未就绪)。"})
+        # 数据未就绪: 复用前一日三档推荐, 标注 T日待更新(废弃「暂缺」空档)
+        prev_rows = _prev_day_targets(d)
+        if prev_rows:
+            items.append({"t": "决策引擎当日标的未就绪,以下复用前一日三档推荐并标注「T日数据待更新」。"})
+            items.append({"table": {"title": "",
+                                    "cols": ["板块", "角色", "代码", "名称", "当日涨幅",
+                                             "买入区间", "止损", "目标", "盈亏比", "建议仓位", "观察要点"],
+                                    "rows": prev_rows}})
+        else:
+            items.append({"t": "决策引擎当日标的未就绪,且无前一日推荐可复用。"})
 
     items.append({"head": "子池2 · 有承接的超跌标的池(三层主线及关联赛道)"})
     rows2 = _watch_pool_oversold(d)

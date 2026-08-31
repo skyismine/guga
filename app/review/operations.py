@@ -241,7 +241,7 @@ def audit_today(today_ops: list, positions: list, levels_map: dict,
         low = (snapshot.get(code) or {}).get("low_price")
         if stop and low and low < stop and code not in sold_today:
             violations.append(f"{code} 破位({low:.2f} < 止损 {stop:.2f})未止损")
-    # 4) 汇总
-    score = max(0, 10 - 2 * len(violations))
+    # 4) 汇总: 满分10, 每一项违规扣1分(0分=严重违规; 修正此前按2分扣导致的反转)
+    score = max(0, 10 - len(violations))
     return {"score": score, "violations": violations, "checks": checks,
             "today": today_ops, "single_cap": single_cap}

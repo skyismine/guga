@@ -147,6 +147,8 @@ def _append_rule_fallback(lines: list, r: dict) -> None:
                 lines.append(f"**{it['head']}**")
             elif "table" in it:
                 t = it["table"]
+                if t.get("title"):
+                    lines.append(f"**{t['title']}**")
                 cols = t["cols"]
                 lines.append("| " + " | ".join(cols) + " |")
                 lines.append("|" + "|".join(["---"] * len(cols)) + "|")

@@ -366,6 +366,14 @@ def collect_sector_flow(use_cache: bool = True) -> list:
             "leader": str(r["leader"]),
             "leader_pct": float(r["leader_pct"]) if pd.notna(r["leader_pct"]) else 0.0,
         })
+    # 去重: 同花顺概念资金流偶发重复板块名(同名同值),保留首次出现
+    seen, uniq = set(), []
+    for r in rows:
+        if r["industry"] in seen:
+            continue
+        seen.add(r["industry"])
+        uniq.append(r)
+    rows = uniq
     rows.sort(key=lambda x: x["net_yi"], reverse=True)
     _sf_save("sector_flow", rows)
     return rows

@@ -122,15 +122,24 @@ def layer_summary(d: dict = None) -> dict:
 
 
 def _emotion_anchor_text(d: dict) -> str:
-    """情绪锚点(最高板连板龙头)当日深度解读: 开盘/最高/最低/收盘/振幅/换手/情绪定级。"""
+    """情绪锚点(核心主线最高连板股)当日深度解读: 动态从核心主线选取 + 相关性标注。"""
     try:
         from app.support import mainline as _ml
         zt = _ml._zt_pool()
-        top = sorted([z for z in zt if (z.get("boards") or 1) >= 2],
-                     key=lambda z: -(z.get("boards") or 1))
+        # 动态选取: 优先核心主线所属板块的最高连板股(情绪锚点须与主线同源)
+        try:
+            rows = _ml.sector_scores(use_cache=True) or []
+            core_names = {r["industry"] for r in rows if r.get("level") == "core"}
+        except Exception:  # noqa: BLE001
+            core_names = set()
+        cands = [z for z in zt if (z.get("boards") or 1) >= 2]
+        core_zt = [z for z in cands
+                   if core_names and any(c in (z.get("concept") or "") for c in core_names)]
+        top = sorted(core_zt or cands, key=lambda z: -(z.get("boards") or 1))
         if not top:
             return ""
         anchor = top[0]
+        in_core = any(c in (anchor.get("concept") or "") for c in core_names) if core_names else False
         spot = _ml._a_spot_map()
         fy = {}
         try:
@@ -153,6 +162,10 @@ def _emotion_anchor_text(d: dict) -> str:
             amp = (high - low) / prev * 100
         to = s.get("turnover") or 0
         parts = [f"**{anchor.get('name')}**({anchor.get('boards')}板)"]
+        if not in_core:
+            parts.append("非核心主线,仅市场情绪参考")
+        elif anchor.get("concept"):
+            parts.append(f"所属: {anchor['concept']}")
         if open_p and close:
             parts.append(f"开盘 {open_p:.2f}")
         if close:
@@ -178,12 +191,32 @@ def _emotion_anchor_text(d: dict) -> str:
         return ""
 
 
+def _tier_by_score(score: float) -> str:
+    """主线分级口径严格对齐: ≥60分 核心主线层 / 50~59分 发酵轮动层 / <50分 异动观察层。
+
+    设计目的: 以综合评分为准修正错层板块(不随 rank 层级漂移),与决策引擎准入口径一致。
+    """
+    if score >= 60:
+        return "core"
+    if score >= 50:
+        return "branch"
+    return "watch"
+
+
 def layer_review(d: dict) -> list:
     """生成「主线三层分级研判」结构化 items。"""
     from app.support import mainline as _ml
     rows = _ml.sector_scores(use_cache=True)
     if not rows:
         return [{"t": "主线榜单数据暂缺(决策引擎未就绪)。"}]
+    # 榜单去重(兜底缓存重复板块行)
+    _seen, _rows = set(), []
+    for r in rows:
+        if r["industry"] in _seen:
+            continue
+        _seen.add(r["industry"])
+        _rows.append(r)
+    rows = _rows
 
     # 决策引擎稳定主线(今日决策实际采纳),口径对齐展示
     try:
@@ -225,11 +258,9 @@ def layer_review(d: dict) -> list:
     retired = []   # 退潮主线(前3日在榜、今日已退出)
     for r in rows:
         name = r["industry"]
-        lv = r.get("level")
-        if lv == "rejected":
+        if r.get("level") == "rejected":
             continue
-        if lv not in tier_cfg:
-            lv = "watch"
+        lv = _tier_by_score(r.get("score", 0))   # 口径对齐: ≥60/50-59/<50 分级
         t5 = five.get(name, {})
         cons = _ml._concept_cons(name)
         zt_info = _sector_zt(name, zt, cons)
@@ -257,11 +288,19 @@ def layer_review(d: dict) -> list:
                 retired.append(t["name"])
     retired = sorted(set(retired))
 
+    # 异动观察层仅展示前15(按综合评分), 其余仅统计总数量, 避免信息过载
+    _watch_total = len(tier_rows["watch"])
+    if _watch_total > 15:
+        tier_rows["watch"] = sorted(tier_rows["watch"], key=lambda x: -x["score"])[:15]
+
     for lv in ("core", "branch", "watch"):
         grp = sorted(tier_rows[lv], key=lambda x: -x["score"])
         if not grp:
             continue
-        items.append({"head": f"{tier_cfg[lv]}({len(grp)} 个)"})
+        if lv == "watch" and _watch_total > 15:
+            items.append({"head": f"{tier_cfg[lv]}({len(grp)}/{_watch_total},仅列前 {len(grp)})"})
+        else:
+            items.append({"head": f"{tier_cfg[lv]}({len(grp)} 个)"})
         rows_tbl = []
         for s in grp:
             net5 = _cell(f"{s['net_5d']:+.1f}" if s["net_5d"] is not None else "-")

@@ -51,27 +51,51 @@ def positions_review(d: dict) -> list:
                         f"(已实现 **{_fmt_asset(ov.get('realized'))}** + 未实现 **{_fmt_asset(ov.get('unrealized'))}**)"
                         + (f" · 风险评级 **{_cell(summary.get('risk_rating'))}**" if summary.get("risk_rating") else ""))})
 
-    # ---- 持仓明细
-    items.append({"head": "持仓明细与盈亏状态"})
-    tbl = []
-    for r in rows:
-        code = r["code"]
-        fy_i = fy.get(code) or {}
-        pct = fy_i.get("pct")
-        if pct is None:
-            s = spot.get(code) or {}
-            pct = s.get("pct_chg")
-        tbl.append([
-            _cell(r.get("name") or code), code, _cell(r.get("category") or "-"),
-            f"{r.get('qty') or 0:.0f}",
-            f"{r.get('cost') or 0:.3f}", f"{r.get('price') or 0:.3f}",
-            _cell(f"{pct:+.2f}%" if pct is not None else "-"),
-            _cell(f"{r.get('pnl_pct', 0) * 100:+.1f}%"),
-            _cell(f"{r.get('plan_kind') or '-'}"),
-        ])
-    items.append({"table": {"title": "",
-                            "cols": ["名称", "代码", "分类", "持仓数", "成本", "收盘", "当日涨跌", "持仓盈亏", "属性"],
-                            "rows": tbl}})
+    # ---- 持仓明细(核心/ETF/观察 分层, 市值降序, 观察类折叠)
+    items.append({"head": "持仓明细与盈亏状态(核心/ETF/观察 分层,市值降序)"})
+    _ETF_PFX = ("5", "159", "588")
+    def _bucket(r: dict, mv_pct: float) -> str:
+        code = str(r["code"])
+        if code.startswith(_ETF_PFX) or (r.get("category") or "") in ("ETF", "基金"):
+            return "ETF"
+        if mv_pct < 0.01:  # 小额遗留仓(市值<1%)→观察折叠,避免逐仓方案淹没重点
+            return "观察"
+        if (r.get("plan_kind") in ("核心", "中军")) or (r.get("category") in ("核心", "中军")):
+            return "核心"
+        return "观察"
+    rows_sorted = sorted(rows, key=lambda r: -(r.get("qty") or 0) * (r.get("price") or 0))
+    buckets = {"核心": [], "ETF": [], "观察": []}
+    for r in rows_sorted:
+        _mv = r.get("market_value") or ((r.get("qty") or 0) * (r.get("price") or 0))
+        buckets[_bucket(r, _mv / total_asset if total_asset else 0)].append(r)
+    for bname in ("核心", "ETF", "观察"):
+        grp = buckets[bname]
+        if not grp:
+            continue
+        grp_mv = sum((r.get("qty") or 0) * (r.get("price") or 0) for r in grp)
+        if bname == "观察" and len(grp) > 5:
+            items.append({"t": f"**观察类持仓 {len(grp)} 只**(市值 {_fmt_asset(grp_mv)})已折叠,明细见持仓页;"
+                               f"核心/ETF 之外标的统一按观察对待,不在复盘页逐一展示。"})
+            continue
+        tbl = []
+        for r in grp:
+            code = r["code"]
+            fy_i = fy.get(code) or {}
+            pct = fy_i.get("pct")
+            if pct is None:
+                s = spot.get(code) or {}
+                pct = s.get("pct_chg")
+            tbl.append([
+                _cell(r.get("name") or code), code, _cell(r.get("category") or "-"),
+                f"{r.get('qty') or 0:.0f}",
+                f"{r.get('cost') or 0:.3f}", f"{r.get('price') or 0:.3f}",
+                _cell(f"{pct:+.2f}%" if pct is not None else "-"),
+                _cell(f"{r.get('pnl_pct', 0) * 100:+.1f}%"),
+                _cell(f"{r.get('plan_kind') or '-'}"),
+            ])
+        items.append({"table": {"title": f"{bname}(市值 {_fmt_asset(grp_mv)})",
+                                "cols": ["名称", "代码", "分类", "持仓数", "成本", "收盘", "当日涨跌", "持仓盈亏", "属性"],
+                                "rows": tbl}})
 
     # ---- 今日合规校验
     items.append({"head": "今日操作合规校验"})
@@ -90,14 +114,26 @@ def positions_review(d: dict) -> list:
     ops = load_operations(today)
     audit = audit_today(ops, positions, levels_map, total_asset=total_asset)
     score = audit["score"]
-    items.append({"t": f"今日操作 **{len(ops)}** 笔,合规得分 **{score}/10**"
+    # 区分「新开仓合规」与「存量持仓合规」: 新开仓=今日操作相关(新开仓/追高/盈亏比), 存量=超仓/破位
+    _NEW_KW = ("新开仓", "追高", "盈亏比")
+    new_viol = [v for v in audit["violations"] if any(k in v for k in _NEW_KW)]
+    hold_viol = [v for v in audit["violations"] if not any(k in v for k in _NEW_KW)]
+    items.append({"t": f"今日操作 **{len(ops)}** 笔,合规得分 **{score}/10**(每项违规扣1分,0分=严重违规)"
                        + (f",违规 {len(audit['violations'])} 项" if audit["violations"] else ",无违规。" )})
-    for v in audit["violations"][:5]:
-        items.append({"t": f"⚠ {v}"})
+    if new_viol:
+        items.append({"t": "**新开仓合规**:" + "；".join(f"⚠ {v}" for v in new_viol[:4])})
+    if hold_viol:
+        items.append({"t": "**存量持仓合规**:" + "；".join(f"⚠ {v}" for v in hold_viol[:4])})
     for c in audit["checks"][:3]:
         items.append({"t": f"· {c}"})
     if not ops:
         items.append({"t": "今日无交易记录(合规按持仓状态审计)。"})
+    # 违规整改建议: 超仓标的 → 减仓目标位与优先级(针对存量超仓)
+    _fixes = _remediation(rows, spot, ov.get("total_asset"))
+    if _fixes:
+        items.append({"head": "违规整改建议(超仓减仓目标位)"})
+        for f in _fixes:
+            items.append({"t": f"· **{f['name']}({f['code']})** 仓位 **{f['pct']:.1%}**,建议反弹至 **{f['target_price']:.2f}** 时减仓至 **{f['target_pct']:.0%}** 以内"})
 
     # ---- 明日逐仓操作方案
     items.append({"head": "明日持仓操作方案"})
@@ -175,3 +211,29 @@ def _fy_snapshot(positions) -> dict:
         return _fuyao_snapshot([str(p["code"]).zfill(6) for p in positions])
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _remediation(rows: list, spot: dict, total_asset: float) -> list:
+    """超仓整改建议: 仓位超阶段单票上限的标的 → 减仓目标位(反弹至压力位)与目标仓位。
+
+    设计目的: 存量超仓给可执行减仓方案(而非仅提示违规), 对齐「合规→整改→闭环」。
+    """
+    fixes = []
+    try:
+        from app.decision.engine import phase_cfg
+        cap = phase_cfg()["single_cap"]
+    except Exception:  # noqa: BLE001
+        cap = 0.02
+    if not total_asset:
+        return fixes
+    for r in rows:
+        mv = r.get("market_value") or ((r.get("qty") or 0) * (r.get("price") or 0))
+        pct = mv / total_asset if total_asset else 0
+        if pct <= cap + 1e-6:
+            continue
+        lv = r.get("levels") or {}
+        target_price = lv.get("resistance") or lv.get("target") or (r.get("price") or 0)
+        fixes.append({"name": r.get("name") or r["code"], "code": r["code"],
+                      "pct": pct, "target_price": float(target_price), "target_pct": cap})
+    fixes.sort(key=lambda x: -x["pct"])
+    return fixes

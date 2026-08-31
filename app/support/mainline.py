@@ -1044,6 +1044,14 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
             row["ladder_detail"] = {k: ladder_map[name][k] for k in ("max_board", "tiers", "gap", "zhongjun")}
             row["size_bias"] = size_map[name]
         rows.append(row)
+    # 防御性去重: 上游板块资金若含重复板块名(偶发), 保留首个避免排名/层级重复
+    seen, uniq = set(), []
+    for r in rows:
+        if r["industry"] in seen:
+            continue
+        seen.add(r["industry"])
+        uniq.append(r)
+    rows = uniq
     rows.sort(key=lambda x: x["score"], reverse=True)
     _mark_levels(rows)
     rows.extend(rejected)
