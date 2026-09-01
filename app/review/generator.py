@@ -75,6 +75,7 @@ def _index_overview(d: Dict) -> List[Dict]:
     idx = d.get("indices", [])
     act = d.get("activity", {})
     md = d.get("market_daily", [])
+    lu = d.get("limit_up") or {}
     if not idx:
         return [_t("当日大盘指数数据暂缺。")]
     adv, dec = act.get("advance", 0), act.get("decline", 0)
@@ -95,13 +96,23 @@ def _index_overview(d: Dict) -> List[Dict]:
     ratio = adv / (adv + dec) if (adv + dec) else 0
     effect = ("赚钱效应良好" if ratio > 0.55 and lu_n >= 50
               else ("结构分化明显、赚钱效应一般" if ratio > 0.45 else "赚钱效应偏弱"))
-    width_state = ("全面普涨" if ratio > 0.6 else
-                   ("涨多跌少" if ratio > 0.5 else ("涨跌对半" if ratio > 0.45 else "跌多涨少")))
-    state = "普涨" if up_n >= len(idx) * 0.75 else ("涨多跌少" if up_n > down_n else "涨跌互现")
+    width_state = ("全面普涨" if ratio > 0.7 else
+                   ("涨多跌少" if ratio > 0.55 else ("涨跌对半" if ratio > 0.45 else "跌多涨少")))
+    state = ("普涨" if up_n >= len(idx) * 0.75
+             else ("普跌" if up_n <= len(idx) * 0.25 else "涨跌互现"))
 
     items = []
-    theme = ("指数强势上行、个股结构性分化" if (up_n >= len(idx) * 0.75 and ratio < 0.55)
-             else ("放量普涨、赚钱效应扩散" if ratio > 0.6 else "指数与个股走势分化"))
+    # 主题须同时考虑指数方向(avg/up_n)与个股宽度(ratio),避免指数下跌+缩量仍被定性为「放量普涨」
+    if avg > 0.003 and ratio > 0.55:
+        theme = "指数普涨、赚钱效应扩散"
+    elif avg < -0.005 and ratio > 0.55:
+        theme = "指数回调、个股逆势活跃(结构修复)"
+    elif avg < -0.005:
+        theme = "指数普跌、情绪防御"
+    elif avg > 0.003 and ratio < 0.45:
+        theme = "指数强势、个股分化"
+    else:
+        theme = "指数与个股走势分化"
     items.append(_t(f"今日 A 股呈现“{theme}”格局:主要指数{state},"
                     f"平均涨跌 **{_pct(avg)}**,{len(idx)} 个指数 {up_n} 涨 {down_n} 跌;"
                     f"领涨 **{lead_up['name']}**({_fmt_float(lead_up['close'])} 点,{_pct(lead_up['pct_chg'])}),"
@@ -152,10 +163,11 @@ def _index_overview(d: Dict) -> List[Dict]:
 
     # 涨跌结构 / 宽度
     if (adv + dec) > 0:
-        items.append(_t(f"涨跌结构上,全市场 **{adv:.0f} 只上涨**、**{dec:.0f} 只下跌**,涨跌家数{width_state}、"
-                        f"并非全面普涨;涨停 **{lu_n:.0f} 家** / 跌停 **{ld_n:.0f} 家**,{effect}。"
-                        "上涨集中于权重龙头与细分赛道,多数个股跟涨力度有限,"
-                        + ("市场分化程度较高。" if ratio < 0.55 else "市场广度良好。")))
+        items.append(_t(f"涨跌结构上,全市场 **{adv:.0f} 只上涨**、**{dec:.0f} 只下跌**,涨跌家数{width_state};"
+                        f"涨停 **{lu_n:.0f} 家** / 跌停 **{ld_n:.0f} 家**,{effect}。"
+                        + ("上涨由权重与龙头带动,多数个股跟涨乏力,市场分化程度较高。"
+                           if ratio < 0.55
+                           else "上涨面占优、市场广度良好,但涨停/炸板与情绪面需交叉验证。")))
 
     # ---- P1 周期定位(量能 / 情绪 / 风格) ----
     items.append(_head("周期定位(量能 / 情绪 / 风格)"))
@@ -163,24 +175,34 @@ def _index_overview(d: Dict) -> List[Dict]:
         cur_amt = valid_amt[-1]
         hi, lo = max(valid_amt), min(valid_amt)
         pctile = sum(1 for v in valid_amt if v <= cur_amt) / len(valid_amt)
-        vol_tag = ("放量(高位)" if cur_amt >= hi * 0.95
-                   else ("放量" if pctile >= 0.8 and cur_amt > lo * 1.15
-                         else ("缩量" if pctile <= 0.25 and cur_amt < hi * 0.85 else "平量")))
+        # 量能定级统一按「较昨日」环比(与成交额行一致), 30日分位仅作上下文展示
+        from app.review.emotion import vol_label
+        prev_amt = (md[-2].get("amount_yi") if len(md) > 1 else None)
+        vol_tag = vol_label(cur_amt, prev_amt, percentile=pctile)
+        chg_txt = ""
+        if cur_amt and prev_amt:
+            chg_txt = f",较昨日 {((cur_amt / prev_amt) - 1) * 100:+.1f}%"
         items.append(_t(f"**量能周期**:近{len(valid_amt)}日成交分位 **{pctile:.0%}**"
-                        f"(区间 {lo:.0f}~{hi:.0f} 亿),当前 **{vol_tag}**。"))
+                        f"(区间 {lo:.0f}~{hi:.0f} 亿){chg_txt},当前 **{vol_tag}**。"))
     fg = None
     try:
         from app.features.market_features import market_snapshot, fear_greed_label
         fg = (market_snapshot().get("market") or {}).get("market_fear_greed")
     except Exception:  # noqa: BLE001
         fg = None
+    zhadan_n = lu.get("zhadan_total")
+    max_lian = lu.get("max_lian")
     if fg is not None:
-        emo = ("过热" if fg >= 75 else ("高温" if fg >= 60 else ("中性" if fg >= 40
-                                                                 else ("低温" if fg >= 25 else "寒冷"))))
-        items.append(_t(f"**情绪周期**:恐贪指数 **{fg:.0f}**(0-100 分位),处于 **{emo}** 区,{fear_greed_label(fg)}。"))
+        from app.review.emotion import emotion_zone
+        zone, diverge = emotion_zone(fg=fg, lu_n=lu_n, zhadan_n=zhadan_n, max_lian=max_lian)
+        diverge_txt = (f"(涨停 {lu_n:.0f} 家 / 炸板 {zhadan_n} 次,高位分歧)" if diverge else "")
+        items.append(_t(f"**情绪周期**:恐贪指数 **{fg:.0f}**(0-100 分位),{fear_greed_label(fg)},"
+                        f"处于 **{zone}** 区{diverge_txt}。"))
     elif lu_n is not None:
-        emo = "高温" if lu_n >= 60 else ("中性" if lu_n >= 30 else "低温")
-        items.append(_t(f"**情绪周期**:涨停 **{lu_n:.0f}** 家,处于 **{emo}** 区。"))
+        from app.review.emotion import emotion_zone
+        zone, diverge = emotion_zone(lu_n=lu_n, zhadan_n=zhadan_n, max_lian=max_lian)
+        diverge_txt = (f"(炸板 {zhadan_n} 次,高位分歧)" if diverge else "")
+        items.append(_t(f"**情绪周期**:涨停 **{lu_n:.0f}** 家,处于 **{zone}** 区{diverge_txt}。"))
     style_tag = None
     try:
         from app.support.mainline import market_style_bias
@@ -203,6 +225,14 @@ def _index_overview(d: Dict) -> List[Dict]:
                             f"({'、'.join(prev_tags[-3:])}),今日{'延续' if same == len(prev_tags) else '切换'}。"))
     except Exception:  # noqa: BLE001
         pass
+    # 风格背离提示: 系统动量标签与当日价格结构相左时显式说明, 消除「小盘延续 vs 大盘占优」同页打架
+    if style_tag and big and small and abs(s - b) > 0.003:
+        price_side = "小盘" if s > b else "大盘"
+        sys_side = style_tag.replace("风格", "")
+        if price_side != sys_side:
+            items.append(_t(f"⚠ **风格背离**:当日价格结构呈 **{price_side} 占优**"
+                            f"(沪深300/上证50 {_pct(b)} vs 中证1000/中证500 {_pct(s)}),"
+                            f"但决策系统动量标签仍为 **{style_tag}**,属高低切换的短期脉冲,持续性待连续确认。"))
     return items
 
 
@@ -232,8 +262,10 @@ def _sector_rotation(d: Dict) -> List[Dict]:
         items.append(_t("扩散分支:" + "、".join(f["industry"] for f in spread[:4])
                         + " 同步跟涨,形成板块级资金合力,主线由单一板块向同链条扩散。"))
 
-    # ---- P1 板块结构分类(核心主线 / 异动脉冲 / 退潮回落)+ 驱动属性标签 ----
-    items.append(_head("板块结构分类(核心主线 / 异动脉冲 / 退潮回落)"))
+    # ---- P1 板块结构分类(资金主线 / 异动脉冲 / 退潮回落)+ 驱动属性标签 ----
+    # 注意: 此处「资金主线」仅按当日净流入居前界定(资金结构), 与 section 三 主线分级(评分)口径不同,
+    # 命名上避免使用「核心主线」以防与主线三层分级冲突。
+    items.append(_head("板块结构分类(资金主线 / 异动脉冲 / 退潮回落)"))
     core_s = sorted([f for f in up if f["net_yi"] > 0],
                     key=lambda x: x["net_yi"], reverse=True)[:3]
     pulse = [f for f in up if f["net_yi"] < -0.5][:3]
@@ -241,7 +273,7 @@ def _sector_rotation(d: Dict) -> List[Dict]:
                    key=lambda x: x["net_yi"])[:3]
     struct_rows = []
     for f in core_s:
-        struct_rows.append([f["industry"], "核心主线(资金共振)", _cell(f"{f['pct_chg']:+.2f}%", "up"),
+        struct_rows.append([f["industry"], "资金主线(净流入共振)", _cell(f"{f['pct_chg']:+.2f}%", "up"),
                             _cell(f"{f['net_yi']:+.2f}亿", "up"), _drv_tag(f)])
     for f in pulse:
         struct_rows.append([f["industry"], "异动脉冲(涨但资金流出)", _cell(f"{f['pct_chg']:+.2f}%", "up"),
@@ -282,8 +314,6 @@ def _sector_rotation(d: Dict) -> List[Dict]:
                         "市场风险偏好仍在,但对高位标的追高意愿显著下降。"))
     else:
         items.append(_t("**主线聚焦**:资金向净流入居前的板块集中,赚钱效应呈结构性特征。"))
-    items.append(_t("**指数强、个股分化**:指数普涨而涨跌家数接近,上涨由权重与龙头拉动,"
-                    "多数个股跟涨乏力,选股难度加大。"))
     md = d.get("market_daily", [])
     if md:
         cur = md[-1]
@@ -291,6 +321,20 @@ def _sector_rotation(d: Dict) -> List[Dict]:
         if cur.get("amount_yi") and amt_avg10 and cur["amount_yi"] > amt_avg10:
             items.append(_t("**放量分歧不等于趋势反转**:成交额高于近10日均值说明流动性充裕,"
                             "板块分歧只是内部结构调整,并非系统性风险释放。"))
+    # 指数-个股背离结构(与大盘综述同源, 静态模板改为动态判定, 避免「指数普涨」误述)
+    _avg_idx = _avg(d.get("indices", []), "pct_chg")
+    adv = (d.get("activity") or {}).get("advance", 0)
+    dec = (d.get("activity") or {}).get("decline", 0)
+    if _avg_idx and (adv + dec) > 0:
+        _ratio = adv / (adv + dec)
+        if _avg_idx > 0.003 and _ratio < 0.5:
+            items.append(_t("**指数强、个股分化**:指数上涨而下跌家数偏多,上涨由权重与龙头拉动,"
+                            "多数个股跟涨乏力,选股难度加大。"))
+        elif _avg_idx < -0.003 and _ratio > 0.55:
+            items.append(_t("**指数弱、个股抗跌**:指数回调而多数个股上涨,权重拖累指数,题材高低切换,"
+                            "以结构性修复机会为主。"))
+        else:
+            items.append(_t("**指数与个股同步**:指数方向与涨跌家数一致,结构风险与机会并存,精选个股为主。"))
 
     # 6) 涨停池行业分布(情绪主线)
     lu = d.get("limit_up", {})
@@ -357,25 +401,37 @@ def _capital_sentiment(d: Dict) -> List[Dict]:
                             f"累计净流入 **{total:+.0f} 亿**,资金面{trend}。"))
         if valid_amt:
             avg_amt = sum(valid_amt) / len(valid_amt)
-            items.append(_t(f"两市日均成交额 {avg_amt:.0f} 亿,今日 **{cur.get('amount_yi') or 0:.0f} 亿**,"
-                            + ("量能明显放大、交投活跃、流动性充裕。" if (cur.get('amount_yi') or 0) > avg_amt * 1.1
-                               else ("量能温和。" if (cur.get('amount_yi') or 0) > avg_amt * 0.9
-                                     else "量能有所萎缩、观望情绪浓。"))))
+            # 量能定级统一按「较昨日」环比口径, 日均值仅作上下文(避免 温和/缩量 打架)
+            from app.review.emotion import vol_label
+            prev_amt = (md[-2].get("amount_yi") if len(md) > 1 else None)
+            cur_amt = cur.get("amount_yi") or 0
+            _vt = vol_label(cur_amt, prev_amt)
+            items.append(_t(f"两市日均成交额 {avg_amt:.0f} 亿,今日 **{cur_amt:.0f} 亿**,"
+                            f"量能 **{_vt}**"
+                            + (f"(较昨日 {((cur_amt / prev_amt) - 1) * 100:+.1f}%)。" if prev_amt else "。")))
 
     items.append(_head("2. 市场情绪"))
     act = d.get("activity", {})
     lu = d.get("limit_up", {})
     lu_n = act.get("real_limit_up", act.get("limit_up", 0))
     ld_n = act.get("limit_down", 0)
-    items.append(_t(f"全市场涨停 **{lu_n:.0f} 家**、跌停 **{ld_n:.0f} 家**,"
-                    + ("市场情绪仍处多头区间、赚钱效应充足" if lu_n >= 60
-                       else ("情绪中性、结构性机会为主" if lu_n >= 30 else "情绪偏弱、观望为主"))
-                    + ";情绪主要集中于低位修复赛道,高位科技股追高意愿下降,资金倾向于“避高就低”。"))
+    fg = None
+    try:
+        from app.features.market_features import market_snapshot
+        fg = (market_snapshot().get("market") or {}).get("market_fear_greed")
+    except Exception:  # noqa: BLE001
+        fg = None
+    from app.review.emotion import emotion_zone
+    zone, diverge = emotion_zone(fg=fg, lu_n=lu_n, zhadan_n=lu.get("zhadan_total"),
+                                 max_lian=lu.get("max_lian"))
+    diverge_txt = (f",炸板 {lu.get('zhadan_total')} 次多于涨停,追高胜率低" if diverge else "")
+    items.append(_t(f"全市场涨停 **{lu_n:.0f} 家**、跌停 **{ld_n:.0f} 家**,情绪 **{zone}**{diverge_txt}"
+                    + ";资金偏好“避高就低”,高位科技股追高意愿下降,情绪集中于低位修复赛道。"))
     if lu.get("ok"):
-        items.append(_t(f"涨停池共 {lu['total']} 家,最高连板 **{lu['max_lian']} 板**,"
-                        f"炸板 {lu['zhadan_total']} 次,封板资金合计 {lu['total_money_yi']:.1f} 亿,"
-                        + ("连板高度与封板资金同步走强,短线情绪处于亢奋区,但需警惕退潮。" if lu["max_lian"] >= 5
-                           else "连板高度一般,情绪处于中性区间。")))
+        items.append(_t(f"涨停池(东财涨停池收录口径)共 **{lu['total']}** 家,最高连板 **{lu['max_lian']} 板**,"
+                        f"炸板 {lu['zhadan_total']} 次,封板资金合计 {lu['total_money_yi']:.1f} 亿;"
+                        + ("连板高度与封板资金同步走强,但炸板数高于涨停家数,情绪处于**高位分歧**,追高需谨慎。"
+                           if lu["max_lian"] >= 5 else "连板高度一般,情绪处于中性区间。")))
     diverge = [f for f in flows if f["pct_chg"] > 0 and f["net_yi"] < -0.5] if flows else []
     if diverge:
         items.append(_t("高位风险:涨幅居前但主力净流出的板块 "
@@ -437,7 +493,6 @@ def _events_v2(d: Dict) -> List[Dict]:
     """核心事件深度解读(升级版): 每条要闻标注对应板块/主线层级, 差异化解读, 共振判断。"""
     ev = d.get("events", {})
     hot = ev.get("hot", []) or []
-    cctv = ev.get("cctv", []) or []
     items = []
     try:
         from app.review.layers import _tier_by_score
@@ -472,17 +527,7 @@ def _events_v2(d: Dict) -> List[Dict]:
             erows.append([title[:26], "、".join(matched) or "-", tier or "-",
                           _event_note(kws), reso])
         items.append(_table("", ["要闻", "对应板块", "主线层级", "解读", "共振判断"], erows))
-    if cctv:
-        items.append(_head("央视《新闻联播》要点(市场化筛选)"))
-        econ = [c for c in cctv if any(k in c["title"] for k in
-                ("产业", "经济", "政策", "科技", "改革", "金融", "市场", "企业", "新能源", "消费"))][:4]
-        if econ:
-            for c in econ:
-                items.append(_t(f"· {c['title']}"))
-            items.append(_t("政策定调: 联播聚焦产业/经济/政策方向,相关赛道关注增量预期。"))
-        else:
-            items.append(_t("联播以政务/外交为主,无显著产业经济信号,政策面影响有限。"))
-    if not hot and not cctv:
+    if not hot:
         items.append(_t("暂无当日驱动事件数据,结合盘后公告与政策动态补充判断。"))
     return items
 
@@ -528,8 +573,14 @@ def _market_ctx(d: Dict) -> Dict:
         from app.decision.engine import market_permit
         p = market_permit()
         ctx["grade"] = p.get("grade")
-        vr = p.get("vol_ratio")
-        ctx["vol_tag"] = ("放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")) if vr else None
+        # 量能统一按「较昨日」环比口径(与成交额行「缩量 N 亿」一致), 不用 vol_ratio(近5日均量)避免 平量/缩量 打架
+        _md = d.get("market_daily") or []
+        if len(_md) >= 2:
+            from app.review.emotion import vol_label
+            ctx["vol_tag"] = vol_label(_md[-1].get("amount_yi"), _md[-2].get("amount_yi"))
+        else:
+            vr = p.get("vol_ratio")
+            ctx["vol_tag"] = ("放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")) if vr else None
         fg = p.get("fear_greed")
         ctx["fear_greed"] = fg
         ctx["qualify"] = (f"大盘评级 {p.get('grade')}"
@@ -544,12 +595,12 @@ def _market_ctx(d: Dict) -> Dict:
     lu_n = (d.get("activity") or {}).get("real_limit_up",
                                          (d.get("activity") or {}).get("limit_up", 0)) or 0
     fg = ctx.get("fear_greed")
-    if lu_n >= 60 or (fg is not None and fg >= 70):
-        ctx["emotion_tag"] = "高温"
-    elif lu_n >= 30 or (fg is not None and fg >= 45):
-        ctx["emotion_tag"] = "中性"
-    else:
-        ctx["emotion_tag"] = "低温"
+    _lu = d.get("limit_up") or {}
+    # 统一情绪定级: 恐贪优先 + 高位分歧(炸板>涨停), 避免 中性/高温/亢奋 标签打架
+    from app.review.emotion import emotion_zone
+    _zone, _diverge = emotion_zone(fg=fg, lu_n=lu_n, zhadan_n=_lu.get("zhadan_total"),
+                                   max_lian=_lu.get("max_lian"))
+    ctx["emotion_tag"] = f"{_zone}·高位分歧" if _diverge else _zone
     return ctx
 
 

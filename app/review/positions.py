@@ -35,7 +35,11 @@ def positions_review(d: dict) -> list:
     rows = diag.get("positions", [])
     summary = diag.get("summary", {})
     spot = _spot_map()
-    ov = _account_overview(positions, spot)      # 账户模型(总资产=本金+已实现+浮盈)
+    # 统一持仓/账户/合规 三者价格口径: 用 diag 收盘价(含 ETF 真实收盘价),
+    # 避免 账户模型退化用成本价(ETF) 导致 持仓市值 与 明细合计 不一致。
+    prices_map = {str(r["code"]).zfill(6): {"price": r.get("price")}
+                  for r in rows if r.get("price")}
+    ov = _account_overview(positions, prices_map)      # 账户模型(总资产=本金+已实现+浮盈)
     total_asset = ov.get("total_asset")
     mv = ov.get("market_value")
     avail = ov.get("available")
@@ -112,7 +116,7 @@ def positions_review(d: dict) -> list:
     levels_map = {r["code"]: (r.get("levels") or {}) for r in rows if r.get("levels")}
     from app.review.operations import load_operations, audit_today
     ops = load_operations(today)
-    audit = audit_today(ops, positions, levels_map, total_asset=total_asset)
+    audit = audit_today(ops, positions, levels_map, total_asset=total_asset, prices=prices_map)
     score = audit["score"]
     # 区分「新开仓合规」与「存量持仓合规」: 新开仓=今日操作相关(新开仓/追高/盈亏比), 存量=超仓/破位
     _NEW_KW = ("新开仓", "追高", "盈亏比")
@@ -193,11 +197,10 @@ def _spot_map() -> dict:
         return {}
 
 
-def _account_overview(positions, spot: dict) -> dict:
-    """账户模型封装: spot {code:{price,...}} → prices 口径。"""
+def _account_overview(positions, prices: dict) -> dict:
+    """账户模型封装: prices {code:{price}} → account_overview 口径(缺价代码回退成本)。"""
     try:
         from app.review.operations import account_overview
-        prices = {code: {"price": (v or {}).get("price")} for code, v in spot.items()}
         return account_overview(positions, prices=prices)
     except Exception as e:  # noqa: BLE001
         print(f"[positions] 账户模型失败: {e}")
@@ -227,7 +230,8 @@ def _remediation(rows: list, spot: dict, total_asset: float) -> list:
     if not total_asset:
         return fixes
     for r in rows:
-        mv = r.get("market_value") or ((r.get("qty") or 0) * (r.get("price") or 0))
+        # 与 audit_today 同口径: 用 diag 收盘价(round2)×数量, 避免与存量合规百分比差 0.1pp
+        mv = (r.get("qty") or 0) * (r.get("price") or 0)
         pct = mv / total_asset if total_asset else 0
         if pct <= cap + 1e-6:
             continue

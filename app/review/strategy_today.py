@@ -53,11 +53,15 @@ def strategy_review(d: dict) -> list:
 
     mult = {"强": 1.0, "中": 0.85, "弱": 0.6}.get(strength, 0.7)
     pos = round(min(0.95, (cap or 0.5) * mult), 2) if cap is not None else None
-    per_core = round((pos or 0) / max(1, len(core)), 2) if pos else None
+    per_core = round((pos or 0) / max(1, len(core)), 2) if (pos and core) else None
 
     items.append({"head": "1. 主线分层操作策略"})
-    items.append({"t": f"**核心主线层**({ '、'.join(core) if core else '暂无' }): 优先仓位,单板块建议仓位 **{per_core or '-'}/总仓位 {pos or '-'}**,"
-                       "分歧低吸为主,不追高打板;缩量回踩支撑位企稳即承接,放量滞涨减半。"})
+    if core:
+        items.append({"t": f"**核心主线层**({ '、'.join(core) }): 优先仓位,单板块建议仓位 **{per_core or '-'}/总仓位 {pos or '-'}**,"
+                           "分歧低吸为主,不追高打板;缩量回踩支撑位企稳即承接,放量滞涨减半。"})
+    else:
+        items.append({"t": "**核心主线层**:当前无核心主线(无≥60分板块),不设主线优先仓;"
+                           "资金高低切换阶段,以发酵轮动层轻仓试错与超跌承接为主,控制总仓位。"})
     items.append({"t": f"**发酵轮动层**({ '、'.join(branch) if branch else '暂无' }): 轻仓试错,首板/启动点跟进,快进快出,"
                        "不及预期当日出局,不留隔夜仓。"})
     items.append({"t": "**异动观察层**: 仅观察不操作,确认晋级发酵层后再跟进。"})
@@ -93,11 +97,6 @@ def strategy_review(d: dict) -> list:
     for p in _risk_contingencies():
         items.append({"t": f"**若** {p['if']} → **则** {p['then']}"})
 
-    items.append({"head": "6. 明日盯盘 Todo(必做/预警/可选 分级)"})
-    for period, todos in _todo_list(grade):
-        items.append({"t": f"**{period}**"})
-        for lv, t in todos:
-            items.append({"t": f"- [ ] [{lv}] {t}"})
     return items
 
 
@@ -151,38 +150,3 @@ def _risk_contingencies() -> list:
     except Exception:  # noqa: BLE001
         pass
     return out
-
-
-def _todo_list(grade) -> list:
-    """分时段盯盘清单(盘前/竞价/盘中/尾盘/盘后), 每项标注 必做/预警/可选 分级。"""
-    from app.support import settings as _st
-    half = "半小时" if (_st.load().get("discipline") or {}).get("half_hour_stop", True) else ""
-    g_warn = f"(评级{grade},仅防守)" if grade in ("C", "D") else ""
-    B, W, O = "**必做**", "**预警**", "*可选*"
-    return [
-        ("盘前(9:15 前)", [
-            (B, "核对隔夜外盘与消息面,判断外围情绪影响"),
-            (B, f"更新持仓止损位/减仓位,设置价格预警 {g_warn}"),
-            (O, "确认默认不开新仓,仅保留极轻仓试错预案"),
-        ]),
-        ("集合竞价-开盘半小时(9:15-10:00)", [
-            (B, "9:20-9:25 观察情绪锚点竞价承接,完成情绪定级"),
-            (B, "9:30 逐只检查持仓支撑位,跌破启动倒计时"),
-            (W, "开盘半小时只观察不操作,不恐慌割肉、不抄底加仓"),
-        ]),
-        ("盘中(10:00-14:30)", [
-            (B, "每小时复盘主线情绪,判断修复是否延续"),
-            (B, "每半小时巡检持仓支撑位,跌破重启倒计时"),
-            (W, "非主线标的反弹至减仓位分批卖出,不犹豫"),
-        ]),
-        ("尾盘(14:30-15:00)", [
-            (B, "14:40 前确认是否符合隔夜持股条件,不符则不新增隔夜仓"),
-            (W, "14:50 前撤销无效挂单"),
-            (B, "14:55 前记录成交明细,更新持仓与盈亏"),
-        ]),
-        ("盘后(15:00-15:30)", [
-            (B, "同步官方收盘数据,核对核心标的价格/涨跌幅"),
-            (B, "更新主线三层分级状态,复盘操作合规"),
-            (W, f"跌破支撑位 {half}不收回执行止损/减仓纪律(持仓状态)"),
-        ]),
-    ]

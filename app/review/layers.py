@@ -105,11 +105,16 @@ def _driver_text(name: str, row: dict, events: list) -> str:
 
 
 def layer_summary(d: dict = None) -> dict:
-    """轻量主线摘要(供 30秒速览 / 明日策略 复用,与实盘决策引擎同源,避免口径漂移)。"""
+    """轻量主线摘要(供 30秒速览 / 明日策略 复用,与 section 三 主线分层口径严格一致)。
+
+    口径统一: 一律用 `_tier_by_score`(≥60 核心 / 50-59 发酵 / <50 观察)分级,
+    不再读取 mainline 的 rank 型 level 字段——避免「30秒速览显示有核心主线/强度强、
+    section 三 却显示无核心主线/强度弱」的自相矛盾。
+    """
     from app.support import mainline as _ml
     rows = _ml.sector_scores(use_cache=True) or []
-    core = [r["industry"] for r in rows if r.get("level") == "core"]
-    branch = [r["industry"] for r in rows if r.get("level") == "branch"]
+    core = [r["industry"] for r in rows if _tier_by_score(r.get("score", 0)) == "core"]
+    branch = [r["industry"] for r in rows if _tier_by_score(r.get("score", 0)) == "branch"]
     active = len(core) + len(branch)
     strength = "强" if core and len(branch) >= 1 else ("中" if core else "弱")
     if core and active <= 2:
@@ -129,7 +134,8 @@ def _emotion_anchor_text(d: dict) -> str:
         # 动态选取: 优先核心主线所属板块的最高连板股(情绪锚点须与主线同源)
         try:
             rows = _ml.sector_scores(use_cache=True) or []
-            core_names = {r["industry"] for r in rows if r.get("level") == "core"}
+            core_names = {r["industry"] for r in rows
+                          if _tier_by_score(r.get("score", 0)) == "core"}
         except Exception:  # noqa: BLE001
             core_names = set()
         cands = [z for z in zt if (z.get("boards") or 1) >= 2]
@@ -342,22 +348,8 @@ def layer_review(d: dict) -> list:
                    "无明确主线": "**无明确主线**:缺乏资金共振板块,短线以超跌反弹与个股行情为主"}
     pattern = pattern_map.get(_pat, pattern_map["无明确主线"])
 
-    # 强度评级:核心层涨停梯队 + 资金 + 连板高度
-    strength_pts = 0
-    for s in tier_rows["core"]:
-        strength_pts += min(4, s["zt"] // 2) + min(3, s["max_board"])
-        if s["net_yi"] > 0:
-            strength_pts += 1
-        if (s["net_5d"] or 0) > 0:
-            strength_pts += 1
-    if core_n == 0:
-        strength = "弱"
-    elif strength_pts >= 8:
-        strength = "强"
-    elif strength_pts >= 4:
-        strength = "中"
-    else:
-        strength = "弱"
+    # 强度评级: 复用 layer_summary(score 阈值口径), 保证 section 三 与 30秒速览/明日策略 一致
+    strength = layer_summary(d).get("strength", "弱")
     items.append({"head": "主线格局与强度判定"})
     items.append({"t": f"格局: {pattern}。整体强度评级 **{strength}**。"})
     risks = []

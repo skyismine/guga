@@ -9,31 +9,41 @@ import datetime as dt
 
 
 def _cell(v) -> str:
-    return str(v) if v is not None else "-"
+    """单元格文本: None→-,并折叠换行/连续空白(防拆坏 Markdown 表格行)。"""
+    return " ".join(str(v).split()) if v is not None else "-"
+
+
+_BOARD_LABEL = {"two_board": "2连板", "three_board": "3连板", "four_board": "4连板",
+                "five_board": "5连板", "six_board": "6连板", "seven_over": "7板及以上"}
+_BOARD_NUM = {"two_board": 2, "three_board": 3, "four_board": 4,
+              "five_board": 5, "six_board": 6, "seven_over": 7}
 
 
 def _ladder_review() -> dict:
-    """连板梯队摘要: 最近交易日各板位家数 + 最高板 + 明日晋级观察(seal_nextday)。"""
+    """连板梯队摘要: 最近交易日各板位家数 + 最高板 + 次日晋级观察(seal_nextday)。
+
+    注意: fuyao limit-up-ladder 返回近30日矩阵且按日期「新→旧」排列,
+    最近一个交易日必须取最新日期(取列表末尾会把旧日期当今日)。
+    """
     from app.data.fuyao import get_limit_up_ladder, enabled
     if not enabled():
         return {}
     lad = get_limit_up_ladder()
     if not lad:
         return {}
-    last = lad[-1]
+    last = max(lad, key=lambda x: x.get("date", ""))   # 最近交易日(列表新→旧,末尾是最旧的一天)
     date = last.get("date", "")
     boards = last.get("boards") or {}
     counts = {}
     promote = []
-    for key, cap in (("two_board", 2), ("three_board", 3), ("four_board", 4),
-                     ("five_board", 5), ("six_board", 6), ("seven_over", 7)):
+    for key in _BOARD_NUM:
         arr = boards.get(key) or []
         if arr:
             counts[key] = len(arr)
             for s in arr[:4]:
                 if s.get("seal_nextday") is True:
                     promote.append(s.get("name"))
-    max_board = max([k for k, v in counts.items() if v], default="")
+    max_board = max([_BOARD_NUM[k] for k in counts], default=0)
     return {"date": date, "counts": counts, "max_board": max_board,
             "promote": promote[:6]}
 
@@ -72,8 +82,9 @@ def special_data_review(d: dict) -> list:
     ladder = _ladder_review()
     if ladder:
         items.append({"head": "连板梯队(近30日矩阵,收盘)"})
-        counts_txt = "、".join(f"{k.replace('_', '')}板 {v} 只" for k, v in ladder.get("counts", {}).items()) or "无连板"
-        items.append({"t": f"梯队日期 {ladder.get('date', '')}:{counts_txt};"
+        counts_txt = ("、".join(f"{_BOARD_LABEL.get(k, k)} {v} 只" for k, v in ladder.get("counts", {}).items())
+                      or "无连板")
+        items.append({"t": f"梯队日期 {ladder.get('date', '')}(最近交易日,最高 **{ladder.get('max_board', 0)} 板**):{counts_txt};"
                            f"次日晋级观察(今日封板/明日确认):"
                            + ("、".join(f"**{n}**" for n in ladder.get("promote", [])) or "无") + "。"})
     else:
@@ -110,7 +121,7 @@ def special_data_review(d: dict) -> list:
         items.append({"head": "当日个股异动(题材归因)"})
         rows = [[it.get("stock_name"), _cell(it.get("tag_name")),
                  _cell((it.get("keyword_list") or []) and "、".join(it.get("keyword_list")[:4])),
-                 _cell((it.get("analysis_content") or "-")[:20])] for it in anomaly[:6]]
+                 _cell(it.get("analysis_content") or "-")] for it in anomaly[:6]]
         items.append({"table": {"title": "", "cols": ["标的", "异动", "题材关键词", "解读"],
                                 "rows": rows}})
     else:

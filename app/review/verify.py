@@ -339,10 +339,43 @@ def verify_review(d: dict) -> list:
                 n_total += 1
                 if pred_up == actual_up:
                     n_correct += 1
+    model_acc = None
     if n_total:
-        acc = n_correct / n_total
-        items.append({"t": f"模型方向预测样本 **{n_total}** 个,准确率 **{acc:.0%}**"
+        model_acc = n_correct / n_total
+        items.append({"t": f"模型方向预测样本 **{n_total}** 个,准确率 **{model_acc:.0%}**"
                            + ("(>55% 达标;样本小,仅作参考)。" if n_total < 10 else "。" )})
     else:
         items.append({"t": "昨日推荐标的收盘数据不可得,模型验证暂缺。"})
+
+    # ---------- 决策链路综合结论(消除「标的全命中/模型 0%/主线留存弱」同页矛盾) ----------
+    _concl = _link_conclusion(len(mrows), len(hits), total, up_hit, retain, prev_core,
+                              model_acc, n_total)
+    if _concl:
+        items.append({"head": "决策链路综合结论"})
+        for c in _concl:
+            items.append({"t": c})
     return items
+
+
+def _link_conclusion(n_line, n_hit, n_target, n_up, retain, prev_core,
+                     model_acc=None, model_n=0):
+    """决策链路多维校验 → 统一结论(把主线跑赢/留存/标的命中/模型方向串成一致叙事)。"""
+    out = []
+    # 主线价格跑赢 vs 留存
+    if n_line and n_hit is not None and len(prev_core):
+        retain_n = len(retain)
+        if retain_n < max(1, len(prev_core) // 2 + 1):
+            out.append("**结论:当日主线价格跑赢达标,但核心主线留存率偏低**,"
+                       "说明选对方向(当日涨幅好)≠ 主线能持续,主线筛选稳定性仍是短板,需重估主线质量。")
+    # 标的命中 vs 模型方向
+    if n_target and model_acc is not None:
+        up_pct = n_up / n_target
+        if up_pct >= 0.7 and model_acc <= 0.4:
+            out.append(f"**结论:推荐标的命中率({up_pct:.0%})与模型方向准确率({model_acc:.0%})显著背离**,"
+                       f"标的多按非模型信号(资金/题材/技术)选中而上行,GBM 方向信号在当前位置失真,"
+                       "次日应以资金与题材信号为主、模型方向仅作参考并择机校准。")
+        elif up_pct < 0.5:
+            out.append("**结论:推荐标的整体命中率不足,对应板块明日下调优先级**,决策链路需收缩标的覆盖面。")
+    if not out and (n_line or n_target):
+        out.append("**结论:当日决策链路各环节方向一致(价格跑赢/标的命中/模型方向同向)**,可维持现有选股与模型策略。")
+    return out[:2]

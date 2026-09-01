@@ -421,7 +421,7 @@ PAGE_REVIEW = r"""<!DOCTYPE html>
 <div class="wrap">
   <header>
     <h1>📝 A股每日深度复盘</h1>
-    <span class="mut">{{ date }} · 数据来源:东财/同花顺/新浪/央视联播</span>
+    <span class="mut">{{ date }} · 数据来源:东财/同花顺/新浪</span>
   </header>
 
   {% if error %}<div class="card err">{{ error }}</div>{% endif %}

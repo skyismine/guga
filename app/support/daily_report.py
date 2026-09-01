@@ -155,7 +155,8 @@ def _append_rule_fallback(lines: list, r: dict) -> None:
                 for row in t["rows"]:
                     cells = []
                     for c in row:
-                        cells.append(str(c.get("v", "")) if isinstance(c, dict) else str(c))
+                        v = str(c.get("v", "")) if isinstance(c, dict) else str(c)
+                        cells.append(" ".join(v.split()))
                     lines.append("| " + " | ".join(cells) + " |")
             lines.append("")
 

@@ -8,7 +8,7 @@
 - 北向资金:东财 stock_hsgt_fund_flow_summary_em;
 - 大盘资金(可选):stock_market_fund_flow;
 - 近10日市场日度(量能/主力资金/涨停):东财 push2his kline + fflow + stock_zt_pool_em(支持历史交易日),涨跌家数当日取乐咕并逐日存档累积;
-- 事件:东财要闻 stock_info_global_em + 央视联播 news_cctv。
+- 事件:东财要闻 stock_info_global_em。
 
 每类数据独立容错 + 本地缓存 + 重试,单个失败不影响整体复盘。
 """
@@ -807,7 +807,7 @@ def collect_market_daily(days: int = 10) -> List[Dict]:
     return rows
 
 
-# ---------------------------------------------------------------- 事件(要闻 + 联播)
+# ---------------------------------------------------------------- 事件(要闻)
 def collect_events(date: dt.date = None) -> Dict:
     import akshare as ak
     news = []
@@ -821,14 +821,6 @@ def collect_events(date: dt.date = None) -> Dict:
             })
     except Exception as e:  # noqa: BLE001
         dal.record_missing("events_news", False, f"东财要闻失败: {e}")
-    cctv = []
-    try:
-        dfc = _retry(lambda: ak.news_cctv(), n=2)
-        for _, r in dfc.iterrows():
-            cctv.append({"title": str(r.get("title", "")),
-                         "date": str(r.get("date", ""))})
-    except Exception as e:  # noqa: BLE001
-        dal.record_missing("events_cctv", False, f"央视联播失败: {e}")
     # 筛选当日相关 + 关键词
     if date is not None:
         ds = str(date)
@@ -839,10 +831,8 @@ def collect_events(date: dt.date = None) -> Dict:
         hits = [k for k in _KEYWORDS if k in text]
         if hits:
             hot.append({**n, "keywords": hits})
-    _q("events", 1.0 if news or cctv else 0.0, "eastmoney+cctv",
-       "要闻/联播" if news or cctv else "事件数据缺失")
-    return {"news_total": len(news), "news": news[:15], "hot": hot[:10],
-            "cctv": cctv[:6]}
+    _q("events", 1.0 if news else 0.0, "eastmoney", "要闻" if news else "事件数据缺失")
+    return {"news_total": len(news), "news": news[:15], "hot": hot[:10]}
 
 
 # ---------------------------------------------------------------- 汇总

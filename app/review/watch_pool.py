@@ -288,15 +288,19 @@ def _prev_day_targets(d: dict) -> list:
         except Exception:  # noqa: BLE001
             pass
         rows = []
+        _seen = set()   # 同标的多板块/多角色只保留首个, 避免 920021 等重复三行
         for sector, segs in (prev.get("targets") or {}).items():
             for seg_key, role in (("aggressive", "情绪龙头"), ("steady", "中军龙头")):
                 for it in segs.get(seg_key) or []:
                     code = it.get("code")
+                    if code in _seen:
+                        continue
+                    _seen.add(code)
                     s = spot.get(code) or {}
                     rows.append([sector, role, code, _cell(s.get("name") or code),
                                  _cell(f"{s.get('pct_chg', 0):+.2f}%"),
                                  "-", "-", "-", "-", "-",
-                                 f"T日数据待更新(复用前一日推荐 {it.get('code')})"])
+                                 "复用前一日推荐(买入区间/止损/目标待更新,当日涨幅为实际收盘)"])
         return rows
     except Exception:  # noqa: BLE001
         return []

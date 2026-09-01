@@ -177,10 +177,12 @@ def _fuyao_snapshot(codes: list) -> dict:
 
 
 def audit_today(today_ops: list, positions: list, levels_map: dict,
-                total_asset: float = None) -> dict:
+                total_asset: float = None, prices: dict = None) -> dict:
     """今日合规审计。today_ops 已按今日日期过滤;levels_map {code: {stop_loss, resistance,...}}。
 
     返回 {score, violations, checks, today: [...]}。total_asset 缺失时仓位类检查降级。
+    prices: {code: {price}} 统一收盘价口径(与持仓页/账户模型一致,含 ETF 真实收盘价),
+    缺失时回退 fuyao 快照 / 成本价。
     """
     dcfg = _st.load().get("discipline") or {}
     no_new = bool(dcfg.get("no_new_position", False))
@@ -225,8 +227,11 @@ def audit_today(today_ops: list, positions: list, levels_map: dict,
     mv_sum = 0.0
     if total_asset:
         for p in positions:
+            code = str(p["code"]).zfill(6)
             qty = float(p.get("qty") or 0)
-            px = (snapshot.get(str(p["code"]).zfill(6)) or {}).get("last_price") \
+            # 统一价格口径: 优先传入的收盘价, 再回退 fuyao 快照 / 成本(ETF 不再退化为成本)
+            px = (prices or {}).get(code, {}).get("price") \
+                or (snapshot.get(code) or {}).get("last_price") \
                 or float(p.get("cost") or 0)
             mv = qty * px
             mv_sum += mv
