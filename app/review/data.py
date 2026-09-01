@@ -562,8 +562,12 @@ def _em_kline_save(secid: str, data: Dict) -> None:
         pass
 
 
-def _em_json(url: str, n: int = 3) -> Dict:
-    """东财 push2his 直连 JSON(指数日线/资金流历史)。"""
+def _em_json(url: str, n: int = 2) -> Dict:
+    """东财 push2his 直连 JSON(指数日线/资金流历史)。
+
+    连接级错误(403/断连/限流)重试无意义,立即抛出走本地缓存兜底;
+    仅对 HTTP 空数据等软错误重试,避免不可达时每次请求白白阻塞 ~10s。
+    """
     last = None
     for i in range(n):
         try:
@@ -572,6 +576,8 @@ def _em_json(url: str, n: int = 3) -> Dict:
             if j is not None and j.get("data") is not None:
                 return j
             last = ValueError(f"eastmoney 返回空数据: rc={j.get('rc') if j else None}")
+        except requests.exceptions.RequestException:  # 连接级失败:重试无意义
+            raise
         except Exception as e:  # noqa: BLE001
             last = e
         time.sleep(1.0)

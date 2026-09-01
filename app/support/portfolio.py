@@ -59,7 +59,7 @@ def diagnose(positions: list = None, total_asset: float = None) -> dict:
             plan, plan_kind = _plan(p, price, pnl, pred, advice, cfg)
             row.update({
                 "ok": True,
-                "name": get_stock_name(p["code"]),
+                "name": q.get("name") or get_stock_name(p["code"]),
                 "price": round(price, 2),
                 "pnl_pct": round(pnl, 4) if pnl is not None else None,
                 "market_value": round(mv, 2),

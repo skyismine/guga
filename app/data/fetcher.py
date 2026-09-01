@@ -322,36 +322,84 @@ _QUOTE_FIELDS = ("name", "open", "prev_close", "price", "high", "low",
                  "ask5_volume", "ask5", "date", "time", "status")
 
 
+def _spot_local_fallback(codes) -> Dict[str, Dict]:
+    """本地日快照兜底:全A快照(spot_{date}.json)+ ETF 快照(etf_{date}.json)。
+
+    新浪/东财实时接口被限流或不可达(403/断连)时,用系统每日必然生成的
+    data_cache/spot_*.json 与 etf_*.json 提供 name/price,避免逐只联网阻塞页面。
+    """
+    out = {}
+    try:
+        from app.support.mainline import _a_spot_map, _etf_map
+        spot = _a_spot_map()
+        for c in codes:
+            it = spot.get(c) or {}
+            if it.get("price"):
+                out[c] = {"name": it.get("name", ""), "price": float(it.get("price")),
+                          "pct_chg": float(it.get("pct_chg") or 0),
+                          "amount": float(it.get("amount") or 0),
+                          "source": "local_snapshot"}
+        etf = _etf_map()
+        for c in codes:
+            if c in out:
+                continue
+            it = next((v for v in etf.values() if v.get("code") == c), None)
+            if not it or not it.get("price"):
+                continue
+            nm = next((n for n, v in etf.items() if v.get("code") == c), c)
+            out[c] = {"name": nm, "price": float(it.get("price")),
+                      "pct_chg": 0.0, "amount": float(it.get("amount_wan") or 0) * 1e4,
+                      "source": "local_snapshot"}
+    except Exception:  # noqa: BLE001  本地兜底失败不抛错,按无行情继续
+        pass
+    return out
+
+
 def get_spot_quote(code: str) -> Dict:
-    """实时快照(新浪行情接口,轻量快速)。内存缓存 30s;附 data_quality 标注。"""
+    """实时快照(新浪行情接口,轻量快速)。内存缓存 30s;附 data_quality 标注。
+
+    新浪不可达(403/断连)时回退本地日快照,保证页面/风控仍可用不联网卡死。
+    """
     code = str(code).zfill(6)
     _key = dal.cache_key("spot", code, date=dal.today_str())
     hit = dal.mem_get(_key)
     if hit is not None:
         return hit
     symbol = code_to_symbol(code)
-    resp = requests.get(_SINA_HQ.format(symbols=symbol),
-                        headers={"Referer": _SINA_REFERER}, timeout=10)
-    resp.encoding = "gbk"
-    m = re.search(r'="(.*)"', resp.text)
-    if not m or not m.group(1):
-        raise ConnectionError(f"新浪实时行情无数据: {code}")
-    parts = m.group(1).split(",")
-    quote = dict(zip(_QUOTE_FIELDS, parts))
-    for k in ("open", "prev_close", "price", "high", "low", "volume", "amount"):
-        try:
-            quote[k] = float(quote[k])
-        except (TypeError, ValueError):
-            quote[k] = 0.0
-    quote["pct_chg"] = (quote["price"] - quote["prev_close"]) / quote["prev_close"] if quote["prev_close"] else 0.0
-    quote["datetime"] = f"{quote.get('date')} {quote.get('time')}"
-    dal.attach_quality(quote, 1.0, "sina_hq", "实时快照")
-    dal.mem_set(_key, quote, 30)
-    return quote
+    try:
+        resp = requests.get(_SINA_HQ.format(symbols=symbol),
+                            headers={"Referer": _SINA_REFERER}, timeout=10)
+        resp.encoding = "gbk"
+        m = re.search(r'="(.*)"', resp.text)
+        if m and m.group(1):
+            parts = m.group(1).split(",")
+            quote = dict(zip(_QUOTE_FIELDS, parts))
+            for k in ("open", "prev_close", "price", "high", "low", "volume", "amount"):
+                try:
+                    quote[k] = float(quote[k])
+                except (TypeError, ValueError):
+                    quote[k] = 0.0
+            quote["pct_chg"] = (quote["price"] - quote["prev_close"]) / quote["prev_close"] if quote["prev_close"] else 0.0
+            quote["datetime"] = f"{quote.get('date')} {quote.get('time')}"
+            dal.attach_quality(quote, 1.0, "sina_hq", "实时快照")
+            dal.mem_set(_key, quote, 30)
+            return quote
+    except Exception as _e:  # noqa: BLE001  实时失败降级本地快照
+        _fault(_e, f"新浪实时行情失败({code}),回退本地快照")
+    fb = _spot_local_fallback([code]).get(code)
+    if fb:
+        dal.attach_quality(fb, 0.6, "local_snapshot", "本地日快照(实时接口不可达)")
+        dal.mem_set(_key, fb, 30)
+        return fb
+    raise ConnectionError(f"新浪实时行情无数据: {code}")
 
 
 def get_spot_quotes(codes: List[str]) -> Dict[str, Dict]:
-    """批量实时快照。内存缓存 30s;每条附 data_quality 标注。"""
+    """批量实时快照。内存缓存 30s;每条附 data_quality 标注。
+
+    本地日快照优先(spot/etf json,非交易时段即当日收盘价,零网络等待);
+    快照缺失的代码再走新浪实时,仍失败则跳过(不阻塞调用方)。
+    """
     codes = [str(c).zfill(6) for c in codes]
     _today = dal.today_str()
     out = {}
@@ -363,29 +411,38 @@ def get_spot_quotes(codes: List[str]) -> Dict[str, Dict]:
         else:
             fresh_codes.append(c)
     if fresh_codes:
-        symbols = ",".join(code_to_symbol(c) for c in fresh_codes)
-        resp = requests.get(_SINA_HQ.format(symbols=symbols),
-                            headers={"Referer": _SINA_REFERER}, timeout=10)
-        resp.encoding = "gbk"
-        for line in resp.text.strip().splitlines():
-            m = re.match(r'var hq_str_(\w+)="(.*)";?', line)
-            if not m:
-                continue
-            symbol, payload = m.group(1), m.group(2)
-            if not payload:
-                continue
-            parts = payload.split(",")
-            q = dict(zip(_QUOTE_FIELDS, parts))
-            for k in ("open", "prev_close", "price", "high", "low", "volume", "amount"):
-                try:
-                    q[k] = float(q[k])
-                except (TypeError, ValueError):
-                    q[k] = 0.0
-            q["pct_chg"] = (q["price"] - q["prev_close"]) / q["prev_close"] if q["prev_close"] else 0.0
-            dal.attach_quality(q, 1.0, "sina_hq", "实时快照")
-            c = symbol_to_code(symbol)
+        for c, q in _spot_local_fallback(fresh_codes).items():
+            dal.attach_quality(q, 0.6, "local_snapshot", "本地日快照(收盘价)")
             out[c] = q
             dal.mem_set(dal.cache_key("spot", c, date=_today), q, 30)
+        live_codes = [c for c in fresh_codes if c not in out]
+        if live_codes:
+            try:
+                symbols = ",".join(code_to_symbol(c) for c in live_codes)
+                resp = requests.get(_SINA_HQ.format(symbols=symbols),
+                                    headers={"Referer": _SINA_REFERER}, timeout=10)
+                resp.encoding = "gbk"
+                for line in resp.text.strip().splitlines():
+                    m = re.match(r'var hq_str_(\w+)="(.*)";?', line)
+                    if not m:
+                        continue
+                    symbol, payload = m.group(1), m.group(2)
+                    if not payload:
+                        continue
+                    parts = payload.split(",")
+                    q = dict(zip(_QUOTE_FIELDS, parts))
+                    for k in ("open", "prev_close", "price", "high", "low", "volume", "amount"):
+                        try:
+                            q[k] = float(q[k])
+                        except (TypeError, ValueError):
+                            q[k] = 0.0
+                    q["pct_chg"] = (q["price"] - q["prev_close"]) / q["prev_close"] if q["prev_close"] else 0.0
+                    dal.attach_quality(q, 1.0, "sina_hq", "实时快照")
+                    c = symbol_to_code(symbol)
+                    out[c] = q
+                    dal.mem_set(dal.cache_key("spot", c, date=_today), q, 30)
+            except Exception as _e:  # noqa: BLE001  实时失败按已有快照继续
+                _fault(_e, "新浪批量行情失败,按本地快照继续")
     return out
 
 
