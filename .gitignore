@@ -12,5 +12,9 @@ data_cache/
 *.log
 .DS_Store
 Thumbs.db
+# 临时分析/截图产物
+_engine_full.txt
+_filelist.txt
+_rule*.png
 # 数据缓存压缩备份(超大,不入库)
 data_cache.zip
