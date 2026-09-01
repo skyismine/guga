@@ -1451,10 +1451,34 @@ def page_decision():
         '<details open><summary><b>③ 标的精准匹配</b></summary>' + layer3 + '</details>'
         '<details open><summary><b>④ 执行参数</b></summary>' + core_plan + '</details></div>',
         yrev,
+        _system_health_card(d),
         _sector_modal_html(),
         '<div class="footer">决策引擎由四层漏斗自动收敛:市场许可 → 主线遴选 → 标的匹配 → 执行参数。仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
     return _shell("decision", "今日决策", "\n".join(content))
+
+
+def _system_health_card(d: dict) -> str:
+    """6.2 系统健康卡片(熔断状态/错误率/决策trace_id/配置版本)。"""
+    try:
+        from app.support import fault as _flt
+        from app.support import settings as _st
+        h = _flt.global_health()
+        ci = _st.config_info()
+        mods = "".join(
+            f"<span class='{'up' if v['open'] else 'mut'}'>●{m}</span> "
+            for m, v in (h.get("modules") or {}).items())
+        tip = "系统异常,建议观望" if h.get("global_open") else "运行正常"
+        return ("<div class='card'><h3>🩺 系统健康(6.2/6.3)</h3>"
+                f"<div>状态:<b class='{'down' if h.get('global_open') else 'up'}'> {tip}</b> · "
+                f"错误率 {h.get('error_rate', 0):.1%}(阈值{h.get('threshold', 0.3):.0%}) · "
+                f"滚动样本 {h.get('window', 0)} · 熔断模块: {mods or '无'}</div>"
+                f"<div class='mut'>trace_id: {_h((d or {}).get('trace_id') or '-')} · "
+                f"配置版本 v{ci.get('version', 1)} · 环境 {ci.get('env', 'dev')} · "
+                f"配置校验 {'✓' if ci.get('valid') else '✗ 已回退上一版本'}</div>"
+                f"<div class='mut' style='font-size:12px'>日志/告警: data_cache/logs · 保留30天</div></div>")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 @app.route("/api/decision")
@@ -2288,6 +2312,86 @@ def api_settings_reset():
     return jsonify({"ok": True})
 
 
+# ---------------------------------------------------------------- 6.2/6.3 系统监控与配置管理
+@app.route("/api/system/health", methods=["GET"])
+def api_system_health():
+    """系统健康: 模块熔断状态 / 全局错误率 / 数据质量 / 模型准确率 / 配置版本。"""
+    from app.support import fault as _flt
+    from app.support import settings as _st
+    out = {"health": _flt.global_health(),
+           "config": _st.config_info()}
+    try:
+        from app.support import model_monitor as _mm
+        out["model"] = _mm.health()
+    except Exception:  # noqa: BLE001
+        out["model"] = {"healthy": True, "reason": "监控未就绪"}
+    return jsonify(out)
+
+
+@app.route("/api/system/logs", methods=["GET"])
+def api_system_logs():
+    """最近系统日志(按级别过滤)。"""
+    from app.support import fault as _flt
+    import os
+    lines = []
+    log_dir = os.path.join(config.DATA_DIR, "logs")
+    level = _request.args.get("level", "ERROR")
+    if os.path.isdir(log_dir):
+        files = sorted(os.listdir(log_dir))[-5:]
+        for f in files:
+            p = os.path.join(log_dir, f)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    for ln in fh:
+                        try:
+                            e = json.loads(ln)
+                            if e.get("level") == level:
+                                lines.append({"ts": e.get("ts"), "module": e.get("module"),
+                                              "message": e.get("message"), "trace_id": e.get("trace_id")})
+                        except Exception:  # noqa: BLE001
+                            continue
+            except OSError:
+                continue
+    return jsonify({"logs": lines[-100:]})
+
+
+@app.route("/api/settings/info", methods=["GET"])
+def api_settings_info():
+    from app.support import settings as _st
+    return jsonify(_st.config_info())
+
+
+@app.route("/api/settings/rollback", methods=["POST"])
+def api_settings_rollback():
+    from app.support import settings as _st
+    try:
+        cfg = _st.rollback()
+        return jsonify({"ok": True, "config": cfg})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+
+def _wire_alert_hook():
+    """启动时注入告警回调: 配置 webhook(钉钉/企业微信/通用)则推送, 否则仅日志。"""
+    from app.support import fault as _flt
+    try:
+        from app.support import settings as _st
+        webhook = (_st.load().get("alert") or {}).get("webhook") or ""
+    except Exception:  # noqa: BLE001
+        webhook = ""
+    if not webhook:
+        return
+    def _hook(entry):
+        import requests as _rq
+        try:
+            _rq.post(webhook, json={"msgtype": "text", "text": {"content":
+                     f"[guga {entry['level']}] {entry['module']}: {entry['message']} ({entry['ts']})"}},
+                     timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+    _flt.set_alert_hook(_hook)
+
+
 def _warm_startup_cache():
     """服务启动后后台预热今日决策,避免用户首次访问触发慢速冷计算。"""
     import threading as _th
@@ -2309,6 +2413,7 @@ def _warm_startup_cache():
 
 
 def main():
+    _wire_alert_hook()
     if getattr(config, "RETRAIN_WEB_AUTO", True):
         from app.scheduler import start_daemon
         start_daemon(verbose=True)

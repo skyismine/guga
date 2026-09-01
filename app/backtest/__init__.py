@@ -1,1 +1,1 @@
-from app.backtest import vbt_validate
+"""回测框架包(6.4): 事件驱动日线回测 + 指标体系 + Markdown 报告。"""

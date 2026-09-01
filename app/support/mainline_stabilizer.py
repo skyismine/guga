@@ -373,8 +373,27 @@ def _build_stable(cfg: dict) -> dict:
         rank_delta_thresh=cfg.get("rank_delta_thresh"),
         weaken_news_on_no_5d_money=cfg.get("weaken_news_on_no_5d_money", True))
     if not rows:
+        # 6.1 主线数据未更新: 回退上一交易日主线并标注(降级不空池)
+        try:
+            from app.review import archive
+            _prev = archive.prev_day(_today())
+            _pst = (_prev or {}).get("stable") or {}
+            _core_n = _pst.get("core")
+            _def_n = _pst.get("defensive")
+            _core = {"name": _core_n} if _core_n else None
+            _defen = {"name": _def_n} if _def_n else None
+            for _it in (_core, _defen):
+                if _it:
+                    _it.update(score=0, pct_chg=0, net_yi=0, zt_count=0, leader="",
+                               reasons=["主线未更新,复用上一交易日主线"], is_stable_result=True,
+                               degraded=True, degrade_reason="主线未更新(数据源异常)")
+            if _core or _defen:
+                return {"core": _core, "defensive": _defen, "watch": [], "rejected": [],
+                        "candidate": [], "pass_score": pass_score, "degraded": True}
+        except Exception:  # noqa: BLE001
+            pass
         return {"core": None, "defensive": None, "watch": [], "rejected": [],
-                "candidate": [], "pass_score": pass_score}
+                "candidate": [], "pass_score": pass_score, "degraded": True}
 
     zt_pool = _ml._zt_pool()
     zt_available = len(zt_pool) > 0

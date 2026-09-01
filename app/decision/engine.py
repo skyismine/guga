@@ -1358,9 +1358,42 @@ def _predict_one(code, predictor, quotes, market):
                 _mm.record(code, out)
         except Exception:  # noqa: BLE001
             pass
+        from app.support import fault as _flt
+        _flt.record_success("model.predict")
         return out
     except Exception as e:  # noqa: BLE001
-        return {"error": f"{type(e).__name__}: {e}"}
+        from app.support import fault as _flt
+        _flt.record_failure("model.predict", str(e))
+        _flt.error("model.predict", f"模型预测失败 {code},降级为技术面规则替代", exc=e,
+                   context={"code": code})
+        # 6.1 模型不可用 → 技术面规则替代(RSI/MACD/KDJ/BB 定方向)
+        try:
+            from app.data.fetcher import get_daily_history as _gdh
+            df = _gdh(code)
+            tech = _tech_indicators(df)
+            up = 0
+            if tech.get("rsi") is not None and tech["rsi"] >= 55:
+                up += 1
+            if tech.get("macd") == "金叉":
+                up += 1
+            if (tech.get("kdj") or {}).get("j") is not None and tech["kdj"]["j"] > 80:
+                up += 1
+            if tech.get("bb_pos") is not None and tech["bb_pos"] >= 0.8:
+                up += 1
+            direction = "上涨" if up >= 2 else ("下跌" if up == 0 and tech else "震荡")
+            close = df["close"].astype(float)
+            ret3d = float(close.iloc[-1] / close.iloc[-4] - 1) if len(close) >= 4 else None
+            return {
+                "p_up": round(0.6 if direction == "上涨" else (0.3 if direction == "震荡" else 0.2), 4),
+                "p_flat": 0.3, "p_down": round(0.2 if direction == "上涨" else (0.4 if direction == "震荡" else 0.6), 4),
+                "direction": direction, "action": "观望", "action_key": "wait",
+                "levels": {}, "atr14": None, "ret3d": round(ret3d, 4) if ret3d is not None else None,
+                "ma5": None, "ma10": None, "volume_ratio": None, "tech": tech,
+                "reasons": ["模型不可用,技术面规则替代"],
+                "degraded": True, "degrade_reason": "模型不可用,技术面规则替代",
+            }
+        except Exception as e2:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}; 技术面替代失败: {type(e2).__name__}"}
 
 
 def match_level_targets(sector_name: str, sector_level: str = "watch") -> dict:
@@ -1527,6 +1560,24 @@ def execution_plan(target: dict, total_asset: float, taste: str,
                    market_cap: float = None, single_cap: float = None,
                    grade: str = None, asset_type: str = None,
                    sector_used_pct: float = 0.0, sector_cap_pct: float = None) -> dict:
+    """6.1 执行参数计算守卫: 异常 → 保守输出(空仓建议) + "计算异常" 标注。"""
+    try:
+        return _execution_plan_impl(target, total_asset, taste, market_cap, single_cap,
+                                    grade, asset_type, sector_used_pct, sector_cap_pct)
+    except Exception as e:  # noqa: BLE001
+        from app.support import fault as _flt
+        _flt.error("execution_plan", f"执行参数计算异常 {target.get('code')}", exc=e,
+                   context={"code": target.get("code"), "name": target.get("name")})
+        _flt.record_failure("execution_plan", str(e))
+        return {"ok": False, "name": target.get("name"), "code": target.get("code"),
+                "reason": f"计算异常,建议观望/空仓({type(e).__name__})",
+                "degraded": True, "degrade_reason": "执行参数计算异常"}
+
+
+def _execution_plan_impl(target: dict, total_asset: float, taste: str,
+                         market_cap: float = None, single_cap: float = None,
+                         grade: str = None, asset_type: str = None,
+                         sector_used_pct: float = 0.0, sector_cap_pct: float = None) -> dict:
     """第四层:单标的精确执行参数(ATR止损 / 分批建仓 / 目标价 / 仓位)。
 
     market_cap:市场评级总仓位上限;single_cap:单只标的上限(旧模式)。
@@ -1997,6 +2048,10 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     taste = taste or dcfg.get("taste", "balanced")
 
     p1 = market_permit()
+    from app.support import fault as _flt
+    trace_id = _flt.new_trace_id()
+    _flt.info("decision", "决策链路开始(第一层市场许可)", trace_id=trace_id,
+              context={"grade": p1["grade"], "phase": p1["market_phase"], "score": p1["score"]})
     # 第四轮改造:主线输出统一经外层防抖稳定器取「stable」稳定结果;
     # 原始流水线结果进 layer2_raw 仅作调试/回测,不再直接驱动今日决策。
     # 惰性导入避免 engine->mainline_stabilizer->engine 的循环依赖。
@@ -2006,6 +2061,11 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     p2 = mout["stable"]
     core = p2.get("core")
     defensive = p2.get("defensive")
+    _flt.info("decision", "第二层主线遴选", trace_id=trace_id,
+              context={"core": (core or {}).get("name"),
+                       "defensive": (defensive or {}).get("name"),
+                       "core_conf": (core or {}).get("confidence"),
+                       "degraded": bool((p2 or {}).get("degraded"))})
 
     layers = {"layer1": p1, "layer2": p2,
               "layer2_raw": mout.get("raw"),
@@ -2055,6 +2115,11 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
 
     # 5.4 跨标的约束后处理: 板块集中度(前二≤50%/产业链) + 相关性 + 总风险预算
     plans, risk_check = _risk_postpass(plans, total_asset, p1["grade"], p1["market_phase"])
+    _flt.info("decision", "决策链路完成", trace_id=trace_id,
+              context={"plans_ok": {s: [r for r, p in (seg or {}).items() if p and p.get("ok")]
+                                    for s, seg in plans.items()},
+                       "risk": risk_check.get("total_risk"),
+                       "health": _flt.global_health()["global_open"]})
 
     # 极简结论
     core_stock = ""
@@ -2090,6 +2155,17 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
         "targets": targets,
         "plans": plans,
         "risk_check": risk_check,
+        "trace_id": trace_id,
+        "trace": {
+            "trace_id": trace_id,
+            "layer1": {"grade": p1["grade"], "score": p1["score"],
+                       "phase": p1["market_phase"], "reasons": p1["reasons"][-3:]},
+            "layer2": {"core": core and core["name"], "defensive": defensive and defensive["name"],
+                       "degraded": bool((p2 or {}).get("degraded"))},
+            "risk_check": risk_check,
+            "health": _flt.global_health(),
+        },
+        "health": _flt.global_health(),
     }
 
 

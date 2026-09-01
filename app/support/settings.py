@@ -3,12 +3,188 @@
 所有参数内置默认值,Web「系统设置」页可改写并持久化到 data_cache/settings.json,
 运行时以 json 覆盖默认值为准(缺失字段回退默认)。
 """
+import datetime as dt
 import json
 import os
+import shutil
 
 from app import config
 
 _SETTINGS_PATH = os.path.join(config.DATA_DIR, "settings.json")
+_META_FILE = os.path.join(config.DATA_DIR, "settings.meta.json")
+# 环境隔离: GUGA_ENV=dev|test|prod; 非 dev 时叠加 settings.{env}.json 覆盖
+_ENV = os.environ.get("GUGA_ENV", "dev")
+_ENV_OVERRIDE_FILE = os.path.join(config.DATA_DIR, f"settings.{_ENV}.json")
+# 版本与最近有效配置(供非法配置回退)
+_VERSION = 1
+_LAST_VALID = None
+
+# 6.3 配置校验规则: 路径 -> (类型, 范围)
+_VALIDATE_RULES = {
+    "decision.total_asset": ("number", 1000, 1e12),
+    "decision.taste": ("choices", ["conservative", "balanced", "aggressive"]),
+    "decision.market.score_full": ("number", 0, 100),
+    "decision.market.score_ok": ("number", 0, 100),
+    "decision.market.score_hold": ("number", 0, 100),
+    "decision.mainline.STABILIZE_CYCLE": ("number", 1, 10),
+    "decision.mainline.COOLDOWN_MINUTE": ("number", 0, 120),
+    "decision.signal.max_delta": ("number", 0, 5),
+    "decision.exec_param.concentration.single_sector": ("number", 0, 1),
+    "decision.exec_param.risk_budget.total_pct": ("number", 0, 1),
+    "decision.exec_param.risk_budget.single_pct": ("number", 0, 0.1),
+    "target_match.candidate_pool_size": ("number", 1, 20),
+    "target_match.model_monitor.accuracy_threshold": ("number", 0, 1),
+    "etf_min_amount": ("number", 0, 1e9),
+    "mainline_top_n": ("number", 1, 10),
+    "monitor.refresh_sec": ("number", 10, 3600),
+    "score_weights.capital": ("number", 0, 100),
+    "score_weights.trend": ("number", 0, 100),
+    "llm.enable": ("bool",),
+    "fuyao.enabled": ("bool",),
+    "web_ui.conclusion_bar": ("bool",),
+}
+# 敏感信息环境变量覆盖(不落盘)
+_ENV_MAP = {
+    "FUYAO_API_KEY": ("fuyao", "api_key"),
+    "LLM_API_KEY": ("llm", "api_key"),
+    "GUGA_ALERT_WEBHOOK": ("alert", "webhook"),
+}
+
+
+def _validate(cfg: dict) -> tuple:
+    """类型 + 范围校验。返回 (ok, errors)。"""
+    errors = []
+    for path, spec in _VALIDATE_RULES.items():
+        node = cfg
+        for part in path.split("."):
+            if not isinstance(node, dict) or part not in node:
+                node = None
+                break
+            node = node[part]
+        if node is None:
+            continue
+        want = spec[0]
+        if want == "bool":
+            if not isinstance(node, bool):
+                errors.append(f"{path}: 应为布尔,实际 {type(node).__name__}")
+        elif want == "number":
+            if not isinstance(node, (int, float)):
+                errors.append(f"{path}: 应为数值,实际 {type(node).__name__}")
+                continue
+            if spec[1] is not None and node < spec[1]:
+                errors.append(f"{path}: {node} < 下限 {spec[1]}")
+            if spec[2] is not None and node > spec[2]:
+                errors.append(f"{path}: {node} > 上限 {spec[2]}")
+        elif want == "choices":
+            if node not in spec[1]:
+                errors.append(f"{path}: 非法取值 {node}")
+    return (not errors), errors
+
+
+def _env_overrides(cfg: dict) -> None:
+    for env, (a, b) in _ENV_MAP.items():
+        v = os.environ.get(env)
+        if v:
+            cfg.setdefault(a, {})[b] = v
+
+
+def _read_meta() -> dict:
+    try:
+        with open(_META_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"version": 1, "updated_at": None, "env": _ENV}
+
+
+def load() -> dict:
+    """读取生效配置(默认 + json 覆盖 + 环境覆盖 + 敏感信息env)。校验失败回退上一版本。"""
+    global _LAST_VALID
+    cfg = json.loads(json.dumps(DEFAULTS))
+    try:
+        with open(_SETTINGS_PATH, encoding="utf-8") as f:
+            over = json.load(f)
+        over.pop("_meta", None)
+        _deep_update(cfg, over)
+        if _ENV != "dev" and os.path.exists(_ENV_OVERRIDE_FILE):
+            with open(_ENV_OVERRIDE_FILE, encoding="utf-8") as f:
+                _deep_update(cfg, json.load(f))
+        _env_overrides(cfg)
+    except (OSError, ValueError):
+        _env_overrides(cfg)
+    ok, errors = _validate(cfg)
+    if not ok:
+        # 非法配置拒绝加载: 回退最近有效配置 + 告警
+        if _LAST_VALID is not None:
+            from app.support import fault as _flt
+            _flt.warning("settings", "配置校验失败,回退上一版本", context={"errors": errors[:6]})
+            return json.loads(json.dumps(_LAST_VALID))
+    else:
+        _LAST_VALID = json.loads(json.dumps(cfg))
+    return cfg
+
+
+def save(over: dict) -> None:
+    """合并覆盖并持久化(校验通过才落盘, 保存前版本化备份)。"""
+    global _LAST_VALID, _VERSION
+    cfg = load()
+    _deep_update(cfg, over)
+    ok, errors = _validate(cfg)
+    if not ok:
+        raise RuntimeError(f"配置校验失败,拒绝保存: {'; '.join(errors[:6])}")
+    os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
+    meta = _read_meta()
+    _VERSION = int(meta.get("version", 1)) + 1
+    if os.path.exists(_SETTINGS_PATH):
+        try:
+            shutil.copy(_SETTINGS_PATH, os.path.join(
+                config.DATA_DIR, f"settings.{_VERSION - 1}.bak.json"))
+        except OSError:
+            pass
+    with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    with open(_META_FILE, "w", encoding="utf-8") as f:
+        json.dump({"version": _VERSION, "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                   "env": _ENV}, f, ensure_ascii=False, indent=2)
+    _LAST_VALID = json.loads(json.dumps(cfg))
+
+
+def rollback() -> dict:
+    """回滚到上一版本配置(settings.{version-1}.bak.json)。"""
+    meta = _read_meta()
+    prev = max(0, int(meta.get("version", 1)) - 1)
+    bak = os.path.join(config.DATA_DIR, f"settings.{prev}.bak.json")
+    if not os.path.exists(bak):
+        from app.support import fault as _flt
+        _flt.warning("settings", "回滚失败: 无上一版本备份", context={"version": prev})
+        return load()
+    shutil.copy(bak, _SETTINGS_PATH)
+    with open(_META_FILE, "w", encoding="utf-8") as f:
+        json.dump({"version": prev, "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                   "env": _ENV}, f, ensure_ascii=False, indent=2)
+    return load()
+
+
+def config_info() -> dict:
+    """配置版本 / 环境 / 校验状态 / 备份清单。"""
+    meta = _read_meta()
+    baks = sorted(f for f in os.listdir(config.DATA_DIR)
+                  if f.startswith("settings.") and f.endswith(".bak.json"))
+    ok, errors = _validate(load())
+    return {"version": meta.get("version", 1), "updated_at": meta.get("updated_at"),
+            "env": _ENV, "env_override": os.path.exists(_ENV_OVERRIDE_FILE),
+            "valid": ok, "validation_errors": errors[:8],
+            "backups": [f for f in baks[-10:]]}
+
+
+def reset() -> None:
+    global _LAST_VALID
+    _LAST_VALID = None
+    try:
+        if os.path.exists(_SETTINGS_PATH):
+            os.remove(_SETTINGS_PATH)
+    except OSError:
+        pass
+
 
 DEFAULTS = {
     # ---- 模块1 主线板块打分权重(基础合计 100; heat 为可选独立催化维度,不占基础分)
@@ -21,6 +197,8 @@ DEFAULTS = {
     "leader_min_market_cap": 20.0,   # 情绪龙头剔除 <20 亿小票(亿)
     "leader_exclude": ["ST", "退"],  # 龙头剔除名称关键词
     "etf_min_amount": 5000.0,        # ETF 日均成交额下限(万元)
+    # ---- 6.2 告警(webhook, 可用 GUGA_ALERT_WEBHOOK 环境变量覆盖, 不落盘密钥)
+    "alert": {"webhook": ""},
     # ---- 模块2 持仓诊断
     "portfolio_path": os.path.join(config.DATA_DIR, "portfolio.csv"),
     "band_diff_pct": 0.06,       # 深度套牢做差价:高抛/回补区间幅度
@@ -403,38 +581,6 @@ DEFAULTS = {
         "raw_debug": False,         # 原始未防抖信号(raw)调试展示(默认折叠)
     },
 }
-
-
-def load() -> dict:
-    """读取生效配置(默认值 + json 覆盖)。"""
-    cfg = json.loads(json.dumps(DEFAULTS))
-    try:
-        with open(_SETTINGS_PATH, encoding="utf-8") as f:
-            over = json.load(f)
-        _deep_update(cfg, over)
-    except (OSError, ValueError):
-        pass
-    return cfg
-
-
-def save(over: dict) -> None:
-    """合并覆盖并持久化(仅写入存在键,其余用默认值补齐)。"""
-    cfg = load()
-    _deep_update(cfg, over)
-    try:
-        os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
-        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        raise RuntimeError(f"设置保存失败: {e}")
-
-
-def reset() -> None:
-    try:
-        if os.path.exists(_SETTINGS_PATH):
-            os.remove(_SETTINGS_PATH)
-    except OSError:
-        pass
 
 
 def _deep_update(base: dict, patch: dict) -> None:
