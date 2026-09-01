@@ -177,6 +177,15 @@ DEFAULTS = {
             },
             "low_pos_ret3d": 0.05,     # 近3日涨幅<此值 视为低位启动(上修信号)
             "high_pos_ret3d": 0.15,    # 近3日涨幅>=此值 视为短期高位(下修信号)
+            # ---- 4.4 多维信号修正(累计±2档上限) ----
+            "phase_adjust": {          # 市场阶段修正
+                "retreat": -1, "startup": 0, "main": 0, "climax": 0,
+                "main_core_boost": 1,  # 主升期核心板块额外上修1档
+            },
+            "vol_price": {"enabled": True, "up_vol": 1, "up_shrink": -1, "down_vol": -2},
+            "technical": {"enabled": True, "break_up": 1, "break_down": -2},
+            "fund_flow": {"enabled": True, "up": 1, "down": -1},   # 近3日资金连续流入/流出(数据缺失跳过)
+            "max_delta": 2,            # 单标的信号累计上修/下修不超过2档
             "note": True,              # 输出信号修正说明
         },
         # 第四层 不同风险偏好的单笔风险系数(占总资金)
@@ -264,6 +273,10 @@ DEFAULTS = {
             "steady_min_avg_amount": 100000000,     # 中军龙头20日日均成交额下限(元)
             "etf_min_avg_amount": 80000000,         # ETF 20日日均成交额下限(元)
             "etf_max_premium": 0.005,               # ETF 场内溢价率上限(5%)
+            # ---- 4.1 候选筛选增强 ----
+            "min_avg_amount_base": 50000000,   # 全档位基础流动性下限(元,日均成交额<此值剔除)
+            "exclude_kw": ["ST", "退市", "风险警示", "*"],   # 名称剔除关键词(ST/退市/风险警示)
+            "bad_news_kw": ["立案", "处罚", "退市", "预亏", "大幅减持", "质押平仓"],  # 利空剔除
         },
         "advanced_rank": {                   # P1 权重(维度缺失时自动归一化到可用维度)
             "aggressive_weights": {
@@ -272,6 +285,16 @@ DEFAULTS = {
             "steady_weights": {
                 "market_cap": 0.4, "avg_amount": 0.3, "trend": 0.2, "amount": 0.1,
             },
+        },
+        # ---- 4.1 候选池规模(每个角色初始候选数) ----
+        "candidate_pool_size": 5,
+        # ---- 4.2 分模式盈亏比双口径(短5日/中20日) ----
+        "trade_rr_dual": {"enabled": True, "atr_mult": 1.0, "rr5_res_bias": 0.02},
+        # ---- 4.3 模型集成投票 + 性能监控(开关默认开启,叠加注解不改变GBM主判) ----
+        "enable_model_ensemble": True,       # 技术指标+市场环境 与 GBM 方向一致性投票(输出注解/轻度调权)
+        "model_monitor": {
+            "enabled": True, "accuracy_threshold": 0.55,  # 准确率<此值告警暂停参考
+            "window_days": 60, "min_samples": 20,
         },
     },
     # ---- 大模型文案(可选接入,OpenAI 兼容接口)

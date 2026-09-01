@@ -73,18 +73,28 @@ def _tradable_filter(stocks: list, role: str, cfg: dict) -> list:
 
     - 个股通用:一字涨停/一字跌停、盘中临停、停牌(实时快照 high==low 判定);
     - 次新股:上市天数 < min_list_days;
-    - 流动性:20日日均成交额低于档位阈值。
+    - 流动性:20日日均成交额低于档位阈值(并叠加全档位基础下限 min_avg_amount_base);
+    - 4.1 名称剔除:ST/退市/风险警示 与 利空关键词(bad_news_kw)。
     任一维度数据不可用时跳过该维度(不误杀)。
     """
     tf = cfg.get("tradable_filter", {}) or {}
     min_days = int(tf.get("min_list_days", 60) or 0)
     agg_min = float(tf.get("aggressive_min_avg_amount", 30_000_000) or 0)
     std_min = float(tf.get("steady_min_avg_amount", 100_000_000) or 0)
-    min_amt = agg_min if role == "aggressive" else std_min
+    base_min = float(tf.get("min_avg_amount_base", 50_000_000) or 0)
+    min_amt = max(agg_min if role == "aggressive" else std_min, base_min)
+    exclude_kw = tf.get("exclude_kw", ["ST", "退市", "风险警示", "*"])
+    bad_kw = tf.get("bad_news_kw", [])
 
     out = []
     for s in stocks:
         code = str(s.get("code") or "").zfill(6)
+        name = str(s.get("name") or "")
+        # 4.1 名称剔除(ST/退市/风险警示/带星) 与 利空关键词
+        if any(k and k.upper() in name.upper() for k in exclude_kw):
+            continue
+        if any(k and k in name for k in bad_kw):
+            continue
         # 一字板/临停/停牌:盘中快照 high==low 视为一字锁死(无成交机会)
         try:
             from app.support import mainline as _ml
@@ -254,6 +264,47 @@ def _rr_pass(phase: str, mode: str, rr, pcfg: dict) -> bool:
     return pcfg["rr_right"] is not None and rr >= pcfg["rr_right"]
 
 
+def _trade_rr_dual(item: dict, role: str, df=None) -> tuple:
+    """分模式盈亏比双口径(4.2): 短期(5日区间)与中期(20日levels)。
+
+    - 左侧低吸: rr = (压力位-低吸价)/(低吸价-止损位), 止损位=支撑位下方ATR;
+    - 右侧突破: rr = (目标价-突破价)/(突破价-回踩位), 目标价=突破位+ATR幅度;
+    - 输出 (mode, rr_5d, rr_20d, note), 根据交易模式选择参考。
+    """
+    lv = item.get("levels") or {}
+    price = item.get("price")
+    entry_low, entry_high = lv.get("entry_low"), lv.get("entry_high")
+    stop, tgt = lv.get("stop_loss"), lv.get("target")
+    atr = float(item.get("atr14") or 0) or 0.0
+    mode = "right" if (price and entry_high and entry_high > 0 and price >= entry_high * 0.98) else "left"
+    # 中期(20日 levels 平台, 现有口径)
+    rr20 = None
+    if mode == "right":
+        if entry_high and stop and tgt and entry_high > stop:
+            rr20 = (tgt - entry_high) / (entry_high - stop)
+    else:
+        if entry_low and stop and tgt and entry_low > stop:
+            rr20 = (tgt - entry_low) / (entry_low - stop)
+    # 短期(5日高低区间 + ATR 止损/目标)
+    rr5 = None
+    df = df or _cached_hist(str(item.get("code") or "").zfill(6))
+    if df is not None and len(df) >= 6 and "close" in df.columns:
+        c = df["close"].astype(float)
+        hi5, lo5 = float(c.tail(5).max()), float(c.tail(5).min())
+        if mode == "right":
+            brk = hi5
+            tgt5 = brk + atr
+            if atr > 0:
+                rr5 = (tgt5 - brk) / atr
+        else:
+            buy = lo5
+            stop5 = lo5 - atr
+            if buy > stop5:
+                rr5 = (hi5 - buy) / (buy - stop5)
+    note = f"盈亏比 短(5日){round(rr5, 2) if rr5 else '无'} / 中(20日){round(rr20, 2) if rr20 else '无'}"
+    return mode, rr5, rr20, note
+
+
 # ------------------------------------------------------------------ 主入口
 def match_targets_v2(sector_name: str, sector_level: str = "watch",
                      sector_status: str = "core") -> dict:
@@ -353,6 +404,14 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
             mode, rr = _trade_rr(item, role)
             item["trade_mode"] = "右侧突破" if mode == "right" else "左侧低吸"
             item["trade_rr"] = round(rr, 2) if rr else None
+            # 4.2 分模式盈亏比双口径(短5日/中20日)
+            try:
+                m2, rr5, rr20, note = _trade_rr_dual(item, role)
+                item["trade_rr_5d"] = round(rr5, 2) if rr5 else None
+                item["trade_rr_20d"] = round(rr20, 2) if rr20 else None
+                item["trade_rr_note"] = note
+            except Exception:  # noqa: BLE001
+                pass
             if not _rr_pass(_phase, mode, rr, _pcfg):
                 continue
             kept.append(item)

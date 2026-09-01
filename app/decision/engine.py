@@ -1129,9 +1129,11 @@ def _shift_signal(sig: str, delta: int) -> str:
 
 
 def _adjust_signal(item: dict, sector_level: str) -> dict:
-    """叠加板块等级修正 + 位置修正,统一为 5 档信号并输出修正说明。
+    """多维信号修正(4.4): 板块等级 + 位置 + 市场阶段 + 量价 + 技术形态 + 资金流。
 
-    item 需含 action_key / ret3d;修改 item["signal"]/item["action"]/item["adj_notes"]。
+    累计上修/下修不超过 max_delta 档(默认±2);每项修正输出原因与数据支撑。
+    item 需含 action_key / ret3d / levels / pct_chg / volume_ratio;
+    修改 item["signal"]/item["action"]/item["adj_notes"]。
     """
     dcfg = _cfg()
     scfg = dcfg.get("signal", {})
@@ -1140,12 +1142,19 @@ def _adjust_signal(item: dict, sector_level: str) -> dict:
     base = _ACTION_TO_SIGNAL.get(item.get("action_key"), "观望")
     sig = base
     notes = []
+    _MAX = int(scfg.get("max_delta", 2) or 2)
+
+    def _adj(d, why):
+        nonlocal sig
+        if not d:
+            return
+        sig = _shift_signal(sig, d)
+        notes.append(f"{why}({'上修' if d > 0 else '下修'} {abs(d)} 档)")
 
     # 1) 板块等级修正:核心主攻上修 1 档
     boost = scfg.get("sector_boost", {}).get(sector_level, 0)
     if boost:
-        sig = _shift_signal(sig, boost)
-        notes.append(f"核心主线溢价上修 {boost} 档")
+        _adj(boost, f"核心主线溢价 {sector_level}")
 
     # 2) 位置修正:低位启动上修 / 短期高位下修
     low_pos = scfg.get("low_pos_ret3d", 0.05)
@@ -1153,11 +1162,72 @@ def _adjust_signal(item: dict, sector_level: str) -> dict:
     ret3d = item.get("ret3d")
     if ret3d is not None:
         if ret3d < low_pos and ret3d > 0:
-            sig = _shift_signal(sig, 1)
-            notes.append(f"低位启动(近3日 {ret3d:+.1%}),信号上修关注")
+            _adj(1, f"低位启动(近3日 {ret3d:+.1%})")
         elif ret3d >= high_pos:
-            sig = _shift_signal(sig, -1)
-            notes.append(f"短期高位(近3日 {ret3d:+.1%}),信号下修防回落")
+            _adj(-1, f"短期高位(近3日 {ret3d:+.1%})")
+
+    # 3) 市场阶段修正:退潮期整体下修1档;主升期核心板块上修1档
+    try:
+        _phase = get_market_phase()
+        _phase_label = phase_cfg(_phase).get("label", _phase)
+    except Exception:  # noqa: BLE001
+        _phase, _phase_label = "main", "主升发酵期"
+    padj = scfg.get("phase_adjust", {})
+    pd = int(padj.get(_phase, 0) or 0)
+    if pd:
+        _adj(pd, f"市场阶段「{_phase_label}」")
+    if _phase == "main" and sector_level == "core":
+        b2 = int(padj.get("main_core_boost", 0) or 0)
+        if b2:
+            _adj(b2, f"主升期核心板块 {sector_level}")
+
+    # 4) 量价配合修正:放量上涨上修/缩量上涨下修/放量下跌下修2档
+    vp = scfg.get("vol_price", {})
+    if vp.get("enabled", True):
+        vr = item.get("volume_ratio")
+        pct = item.get("pct_chg")
+        if vr is not None and pct is not None:
+            if pct > 0 and vr >= 1.05:
+                _adj(int(vp.get("up_vol", 1)), f"放量上涨(量比 {vr:.2f})")
+            elif pct > 0 and vr < 0.95:
+                _adj(int(vp.get("up_shrink", -1)), f"缩量上涨(量比 {vr:.2f})")
+            elif pct < 0 and vr >= 1.05:
+                _adj(int(vp.get("down_vol", -2)), f"放量下跌(量比 {vr:.2f})")
+
+    # 5) 技术形态修正:突破压力位上修 / 跌破支撑位下修2档
+    tech = scfg.get("technical", {})
+    if tech.get("enabled", True):
+        lv = item.get("levels") or {}
+        price = item.get("price")
+        if price and lv.get("resistance") and float(lv["resistance"]) > 0 and price >= float(lv["resistance"]):
+            _adj(int(tech.get("break_up", 1)), f"突破压力位 {lv['resistance']}")
+        elif price and lv.get("support") and float(lv["support"]) > 0 and price <= float(lv["support"]):
+            _adj(int(tech.get("break_down", -2)), f"跌破支撑位 {lv['support']}")
+
+    # 6) 资金流修正:近3日连续流入(近似)/连续流出
+    fund = scfg.get("fund_flow", {})
+    if fund.get("enabled", True):
+        try:
+            from app.data.fetcher import _load_cache as _flc
+            df = _flc(str(item.get("code") or "").zfill(6))
+            if df is not None and len(df) >= 5 and "close" in df.columns:
+                rets = df["close"].astype(float).pct_change().dropna().tail(3)
+                if len(rets) == 3 and float(rets.min()) > 0:
+                    _adj(int(fund.get("up", 1)), "近3日资金连续流入(连续收涨)")
+                elif len(rets) == 3 and float(rets.max()) < 0:
+                    _adj(int(fund.get("down", -1)), "近3日资金连续流出(连续收跌)")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 累计修正限幅 ±max_delta 档
+    b_idx = _SIGNAL_RANK.get(base, 0)
+    f_idx = _SIGNAL_RANK.get(sig, 0)
+    if f_idx - b_idx > _MAX:
+        sig = _SIGNAL_LEVELS[b_idx + _MAX]
+        notes.append(f"累计修正已达上限(+{_MAX}档)")
+    elif b_idx - f_idx > _MAX:
+        sig = _SIGNAL_LEVELS[b_idx - _MAX]
+        notes.append(f"累计修正已达下限(-{_MAX}档)")
 
     item["signal"] = sig
     item["action"] = sig
@@ -1173,6 +1243,82 @@ _TRIGGER_TPL = {
 }
 
 
+def _tech_indicators(df) -> dict:
+    """技术指标(4.3): RSI14 / MACD(金叉死叉) / KDJ / 布林带位置。数据不足返回 {}。"""
+    out = {}
+    try:
+        c = df["close"].astype(float)
+        if len(c) < 30 or "low" not in df.columns or "high" not in df.columns:
+            return out
+        diff = c.diff()
+        up = diff.clip(lower=0).rolling(14).mean()
+        dn = (-diff.clip(upper=0)).rolling(14).mean()
+        rs = up / dn.replace(0, 1e-9)
+        rsi = 100 - 100 / (1 + rs)
+        if rsi.notna().iloc[-1]:
+            out["rsi"] = round(float(rsi.iloc[-1]), 1)
+        ema12 = c.ewm(span=12, adjust=False).mean()
+        ema26 = c.ewm(span=26, adjust=False).mean()
+        dif = ema12 - ema26
+        dea = dif.ewm(span=9, adjust=False).mean()
+        out["macd"] = "金叉" if float(dif.iloc[-1]) > float(dea.iloc[-1]) else "死叉"
+        lo = df["low"].astype(float)
+        hi = df["high"].astype(float)
+        rsv = (c - lo.rolling(9).min()) / (hi.rolling(9).max() - lo.rolling(9).min()).replace(0, 1e-9)
+        k = rsv.ewm(com=2).mean()
+        d = k.ewm(com=2).mean()
+        j = 3 * k - 2 * d
+        out["kdj"] = {"k": round(float(k.iloc[-1]), 1), "d": round(float(d.iloc[-1]), 1),
+                      "j": round(float(j.iloc[-1]), 1)}
+        ma20 = c.rolling(20).mean()
+        sd = c.rolling(20).std()
+        if sd.notna().iloc[-1] and float(sd.iloc[-1]) > 0:
+            out["bb_pos"] = round(float((c.iloc[-1] - (ma20.iloc[-1] - 2 * sd.iloc[-1]))
+                                        / max(4 * float(sd.iloc[-1]), 1e-9)), 2)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _ensemble_vote(tech: dict, pred: dict) -> dict:
+    """规则-模型集成投票(4.3): GBM 方向 + 技术指标(RSI/MACD/KDJ/BB) + 市场环境加权投票。
+
+    不替换 GBM 主判: 一致时保持原 p_up, 分歧时按集成方向轻度调权(±0.03)并注解。
+    """
+    gbm_up = float(pred.get("p_up") or 0.5)
+    gbm_dir = 1 if gbm_up >= 0.55 else (-1 if float(pred.get("p_down") or 0) >= 0.55 else 0)
+    votes = [("GBM", gbm_dir, 0.5)]
+    if tech.get("rsi") is not None:
+        tdir = 1 if tech["rsi"] >= 55 else (-1 if tech["rsi"] <= 45 else 0)
+        votes.append(("RSI", tdir, 0.2))
+    if tech.get("macd") == "金叉":
+        votes.append(("MACD", 1, 0.15))
+    elif tech.get("macd") == "死叉":
+        votes.append(("MACD", -1, 0.15))
+    kdj = tech.get("kdj") or {}
+    if kdj.get("k") is not None and kdj.get("d") is not None:
+        if kdj["k"] > kdj["d"] and kdj["j"] > 80:
+            votes.append(("KDJ", 1, 0.1))
+        elif kdj["k"] < kdj["d"] and kdj["j"] < 20:
+            votes.append(("KDJ", -1, 0.1))
+    if tech.get("bb_pos") is not None:
+        votes.append(("BB", 1 if tech["bb_pos"] >= 0.8 else (-1 if tech["bb_pos"] <= 0.2 else 0), 0.1))
+    env_dir = 0
+    try:
+        _g = market_permit().get("grade")
+        env_dir = 1 if _g in ("A", "B") else (-1 if _g in ("C", "D") else 0)
+    except Exception:  # noqa: BLE001
+        pass
+    votes.append(("ENV", env_dir, 0.2))
+    wsum = sum(w for _, d, w in votes if d != 0)
+    ssum = sum(d * w for _, d, w in votes)
+    ens_dir = 0 if wsum <= 0 else (1 if ssum / wsum >= 0.3 else (-1 if ssum / wsum <= -0.3 else 0))
+    agree = (ens_dir == 0) or (gbm_dir == ens_dir)
+    return {"agree": agree, "ensemble_dir": ens_dir,
+            "p_up_adj": round(gbm_up + 0.03 * ens_dir, 4) if not agree else round(gbm_up, 4),
+            "note": f"集成投票 {'一致' if agree else '分歧'}: " + "/".join(v[0] for v in votes)}
+
+
 def _predict_one(code, predictor, quotes, market):
     try:
         df, pred, adv = _one(code, predictor, quotes, market, _st.load())
@@ -1181,7 +1327,15 @@ def _predict_one(code, predictor, quotes, market):
         ret3d = float(close.iloc[-1] / close.iloc[-4] - 1) if len(close) >= 4 else None
         ma5 = float(close.rolling(5).mean().iloc[-1]) if len(close) >= 5 else None
         ma10 = float(close.rolling(10).mean().iloc[-1]) if len(close) >= 10 else None
-        return {
+        # 4.3 技术指标 + 量能比 + 集成投票注解 + 模型监控
+        tech = _tech_indicators(df)
+        vr = None
+        if len(df) >= 20 and "volume" in df.columns:
+            v = df["volume"].astype(float)
+            base = float(v.iloc[:-1].tail(19).mean())
+            if base > 0:
+                vr = round(float(v.iloc[-1] / base), 3)
+        out = {
             "p_up": round(pred["p_up"], 4), "p_flat": round(pred["p_flat"], 4),
             "p_down": round(pred["p_down"], 4), "direction": pred["direction_cn"],
             "action": adv["action_cn"], "action_key": adv["action"],
@@ -1190,8 +1344,21 @@ def _predict_one(code, predictor, quotes, market):
             "ret3d": round(ret3d, 4) if ret3d is not None else None,
             "ma5": round(ma5, 2) if ma5 is not None else None,
             "ma10": round(ma10, 2) if ma10 is not None else None,
+            "volume_ratio": vr,
             "reasons": adv.get("reasons", [])[:3],
         }
+        if tech:
+            out["tech"] = tech
+        try:
+            tmc = _st.load().get("target_match") or {}
+            if tmc.get("enable_model_ensemble"):
+                out["ensemble"] = _ensemble_vote(tech, out)
+            if (tmc.get("model_monitor") or {}).get("enabled"):
+                from app.support import model_monitor as _mm
+                _mm.record(code, out)
+        except Exception:  # noqa: BLE001
+            pass
+        return out
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
 

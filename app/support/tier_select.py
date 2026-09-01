@@ -371,6 +371,20 @@ def _tier_quota_by_level(sector_level: str, cons_n: int) -> dict:
     return base
 
 
+# ------------------------------------------------------------------ 4.1 候选池规模(每角色初始候选数)
+def _cap_candidates(pool: list, role: str, n: int) -> list:
+    """按角色快速预筛, 候选池保留 top-n(默认5)再进入综合评分, 降低噪声与接口成本。"""
+    if n <= 0 or len(pool) <= n:
+        return pool
+    if role == "steady":
+        key = lambda r: -(r.get("amount") or 0)
+    elif role == "aggressive":
+        key = lambda r: -((float(r.get("pct_chg") or 0) * 3 + float(r.get("amount") or 0) / 1e7))
+    else:
+        key = lambda r: -(r.get("amount") or 0)
+    return sorted(pool, key=key)[:n]
+
+
 # ------------------------------------------------------------------ 位置修正
 def _position_adjust(it: dict, role: str) -> None:
     """近3日累计涨幅超阈值 → 下修评级与仓位系数, 高位防回落优先。"""
@@ -396,6 +410,13 @@ def select_three_tiers(sector_name: str, sector_level: str, sector_status: str,
     无符合标的时对应档位为空(不硬凑), 供上层渲染。
     """
     steady_pool, aggressive_pool = _split_pools(stocks, spot)
+    # 4.1 候选池规模: 每角色初始候选 n 只(默认5)再进入综合评分
+    try:
+        _pool_n = int((_st.load().get("target_match") or {}).get("candidate_pool_size", 5) or 5)
+    except Exception:  # noqa: BLE001
+        _pool_n = 5
+    steady_pool = _cap_candidates(steady_pool, "steady", _pool_n)
+    aggressive_pool = _cap_candidates(aggressive_pool, "aggressive", _pool_n)
     cons_n = len(stocks)
     quota = _tier_quota_by_level(sector_status if sector_status in ("core", "defensive", "branch")
                                  else sector_level, cons_n)
