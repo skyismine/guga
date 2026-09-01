@@ -29,6 +29,15 @@ _SINA_SPOT = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.p
 _HIST_TTL_SECONDS = 24 * 3600
 
 
+def _fault(e: BaseException, note: str = ""):
+    """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("fetcher", note or "处理降级(按缺省继续)", exc=e)
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
+
+
 # ---------------------------------------------------------------- 工具
 def code_to_symbol(code: str) -> str:
     """6xxxxx->sh, 0/3xxxxx->sz, 4/8/9xxxxx->bj, 5xxxxx->sh基金"""
@@ -71,8 +80,8 @@ def get_trade_dates(end: str = None, count: int = 60) -> List[pd.Timestamp]:
         df = ak.tool_trade_date_hist_sina()
         dates = pd.to_datetime(df["trade_date"]).tolist()
         return dates[-count:]
-    except Exception:
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     # fuyao 官方交易日历兜底(近一年;不足 count 时继续回退)
     try:
         from app.data.fuyao import enabled as _fy_enabled
@@ -82,8 +91,8 @@ def get_trade_dates(end: str = None, count: int = 60) -> List[pd.Timestamp]:
             dates = pd.to_datetime([it["date"] for it in items], format="%Y%m%d").tolist()
             if len(dates) >= count:
                 return dates[-count:]
-    except Exception:
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     try:
         df = get_daily_history("600519", days=max(count * 2, 120))
         return list(df.index[-count:])
@@ -291,15 +300,15 @@ def get_stock_name(code: str) -> str:
     try:
         quote = get_spot_quote(code)
         return quote.get("name", code)
-    except Exception:
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     try:
         lst = get_stock_list()
         hit = lst[lst["code"] == code]
         if not hit.empty:
             return str(hit.iloc[0]["name"])
-    except Exception:
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     return code
 
 

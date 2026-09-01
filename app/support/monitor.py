@@ -19,6 +19,15 @@ _STATE = {"running": False, "thread": None, "last_check": None, "last_count": 0}
 _alerts_loaded = {}
 
 
+def _fault(e: BaseException, note: str = ""):
+    """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("monitor", note or "处理降级(按缺省继续)", exc=e)
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
+
+
 def _alerts_path(date: str = None) -> str:
     date = date or dt.date.today().strftime("%Y-%m-%d")
     return os.path.join(config.DATA_DIR, f"alerts_{date}.json")
@@ -110,8 +119,8 @@ def _check_position(code, price, pct_chg, amount, cfg, predictor, quotes) -> lis
             if adv["action"] in ("sell", "reduce"):
                 out.append({"rule": "signal", "level": "warning",
                             "msg": f"模型建议:{adv['action_cn']} ({pred['direction_cn']})"})
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
     return out
 
 
@@ -127,8 +136,8 @@ def check_once(positions: list = None) -> list:
         try:
             from app.support.mainline import _zt_pool
             codes = [z["code"] for z in _zt_pool()[:20]]
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
     if not codes:
         return []
 
@@ -151,8 +160,8 @@ def check_once(positions: list = None) -> list:
                 if f["net_yi"] >= mon.get("sector_net_yi", 5.0) and f["pct_chg"] >= mon.get("sector_pct", 2.0):
                     out.append({"rule": "sector", "level": "info",
                                 "msg": f"板块异动:{f['industry']} 涨 {f['pct_chg']:+.2f}%,净流入 {f['net_yi']:.1f} 亿"})
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
 
     if rules.get("mood", True):
         try:
@@ -164,8 +173,8 @@ def check_once(positions: list = None) -> list:
             elif fg is not None and fg >= mon.get("fg_extreme_high", 80):
                 out.append({"rule": "mood", "level": "info",
                             "msg": f"恐贪指数 {fg} 极度贪婪,谨防冲高回落,注意止盈纪律"})
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
     return out
 
 

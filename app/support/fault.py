@@ -31,10 +31,35 @@ _GLOBAL = {"ok": 0, "fail": 0}
 _GLOBAL_TRIP = {"open": False, "until": 0.0}
 _ALERT_HOOK = None      # 可注入告警回调(webhook/邮件), 默认仅日志
 
-_CB_FAIL_THRESHOLD = 5      # 连续失败次数
+_CB_FAIL_THRESHOLD = 5      # 连续失败次数(可由 settings.system 覆盖)
 _CB_OPEN_MINUTES = 10       # 熔断时长(分钟)
 _GLOBAL_ERROR_RATE = 0.30   # 全局错误率阈值
 _GLOBAL_WINDOW = 30         # 滚动窗口
+
+
+def _sys_cfg() -> dict:
+    """熔断/日志参数(settings.system, 缺省回退内置默认, 避免魔法数字散落)。"""
+    try:
+        from app.support import settings as _st
+        return (_st.load().get("system") or {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _fail_threshold() -> int:
+    return int(_sys_cfg().get("cb_fail_threshold", _CB_FAIL_THRESHOLD) or _CB_FAIL_THRESHOLD)
+
+
+def _open_minutes() -> int:
+    return int(_sys_cfg().get("cb_open_minutes", _CB_OPEN_MINUTES) or _CB_OPEN_MINUTES)
+
+
+def _error_rate_thr() -> float:
+    return float(_sys_cfg().get("global_error_rate", _GLOBAL_ERROR_RATE) or _GLOBAL_ERROR_RATE)
+
+
+def _global_window() -> int:
+    return int(_sys_cfg().get("global_window", _GLOBAL_WINDOW) or _GLOBAL_WINDOW)
 
 
 def _ts() -> str:
@@ -86,8 +111,10 @@ def set_alert_hook(fn) -> None:
     _ALERT_HOOK = fn
 
 
-def cleanup_logs(keep_days: int = 30) -> int:
-    """清理超过保留天数的日志文件, 返回删除数。"""
+def cleanup_logs(keep_days: int = None) -> int:
+    """清理超过保留天数的日志文件(默认 settings.system.log_keep_days)。"""
+    if keep_days is None:
+        keep_days = int(_sys_cfg().get("log_keep_days", 30) or 30)
     cutoff = time.time() - keep_days * 86400
     n = 0
     for f in os.listdir(_LOG_DIR):
@@ -132,24 +159,25 @@ def record_failure(module: str, err: str) -> bool:
     st["last_error"] = str(err)
     _GLOBAL["fail"] += 1
     _trim_global()
-    if st["fail"] >= _CB_FAIL_THRESHOLD and st["open_until"] <= time.time():
-        st["open_until"] = time.time() + _CB_OPEN_MINUTES * 60
+    thr = _fail_threshold()
+    mins = _open_minutes()
+    if st["fail"] >= thr and st["open_until"] <= time.time():
+        st["open_until"] = time.time() + mins * 60
         st["opens"] += 1
         st["last_open"] = _ts()
         log("fault", "ERROR",
-            f"模块 {module} 连续失败 {st['fail']} 次,触发熔断 {_CB_OPEN_MINUTES} 分钟",
+            f"模块 {module} 连续失败 {st['fail']} 次,触发熔断 {mins} 分钟",
             context={"last_error": st["last_error"], "opens": st["opens"]})
         return True
     return False
 
 
 def _trim_global() -> None:
-    """限制全局窗口为最近 _GLOBAL_WINDOW 次。"""
+    """限制全局窗口为最近 _GLOBAL_WINDOW 次(settings.system.global_window)。"""
     total = _GLOBAL["ok"] + _GLOBAL["fail"]
-    if total > _GLOBAL_WINDOW:
-        # 简单衰减: 保留窗口内比例(按比例削减历史计数)
-        keep = _GLOBAL_WINDOW
-        scale = keep / total
+    win = _global_window()
+    if total > win:
+        scale = win / total
         _GLOBAL["ok"] = int(_GLOBAL["ok"] * scale)
         _GLOBAL["fail"] = int(_GLOBAL["fail"] * scale)
 
@@ -163,10 +191,12 @@ def global_health() -> dict:
     """全局健康: 错误率 + 全局熔断状态 + 各模块熔断状态。"""
     total = _GLOBAL["ok"] + _GLOBAL["fail"]
     rate = global_error_rate()
+    thr = _error_rate_thr()
+    mins = _open_minutes()
     g_open = bool(_GLOBAL_TRIP["open"] and _GLOBAL_TRIP["until"] > time.time())
-    if not g_open and total >= 5 and rate > _GLOBAL_ERROR_RATE:
-        _GLOBAL_TRIP.update(open=True, until=time.time() + _CB_OPEN_MINUTES * 60)
-        log("fault", "CRITICAL", f"全局错误率 {rate:.0%} 超阈值 {_GLOBAL_ERROR_RATE:.0%},全局熔断",
+    if not g_open and total >= 5 and rate > thr:
+        _GLOBAL_TRIP.update(open=True, until=time.time() + mins * 60)
+        log("fault", "CRITICAL", f"全局错误率 {rate:.0%} 超阈值 {thr:.0%},全局熔断",
             context={"window": total})
         g_open = True
     if g_open and _GLOBAL_TRIP["until"] <= time.time():
@@ -177,7 +207,7 @@ def global_health() -> dict:
                 m: {"open": st["open_until"] > time.time(), "fail": st["fail"],
                     "opens": st["opens"], "last_error": st["last_error"]}
                 for m, st in _CB.items()},
-            "threshold": _GLOBAL_ERROR_RATE, "open_minutes": _CB_OPEN_MINUTES}
+            "threshold": thr, "open_minutes": mins}
 
 
 def guarded(module: str, fn, fallback=None, trace_id: str = None, context: dict = None):

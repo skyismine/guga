@@ -840,6 +840,7 @@ def _plan_table_html(plans: dict, sector: str) -> str:
                  if p.get("code") else "-")
         trig = _h(p.get("trigger")) if p.get("trigger") else "-"
         mode_tag = f"<br><span class='mut' style='font-size:12px'>模式: {_h(p.get('mode_note') or '')}</span>"
+        expl = _h(p.get("explain")) if p.get("explain") else ""
         # 升级4:触发状态标签(未触发/触发中/已触发)
         ts = p.get("trigger_status") or {}
         ts_cls = {"trigger-on": "up", "trigger-off": "mut", "trigger-unknown": "mut"}.get(ts.get("label"), "mut")
@@ -859,7 +860,7 @@ def _plan_table_html(plans: dict, sector: str) -> str:
             f"{('<br>' + format(b.get('third', {}).get('ratio', 0) * 100, '.0f') + '% @ ' + _h(b.get('third', {}).get('price'))) if b.get('third') else ''}</td>"
             f"<td class='mut'>{trig}</td>"
             f"<td>{ts_html}</td>"
-            f"<td class='mut'>{_h(p.get('note'))}</td></tr>")
+            f"<td class='mut'>{_h(p.get('explain') or p.get('note'))}</td></tr>")
     return ("<div class='tbl'><table><tr><th>档位</th><th>标的</th><th>现价</th><th>止损</th><th>目标1/2</th>"
             "<th>建议仓位</th><th>分批方案</th><th>触发条件</th><th>触发状态</th><th>说明</th></tr>"
             + "\n".join(rows) + "</table></div>")
@@ -1452,6 +1453,7 @@ def page_decision():
         '<details open><summary><b>④ 执行参数</b></summary>' + core_plan + '</details></div>',
         yrev,
         _system_health_card(d),
+        _glossary_card(d),
         _sector_modal_html(),
         '<div class="footer">决策引擎由四层漏斗自动收敛:市场许可 → 主线遴选 → 标的匹配 → 执行参数。仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
@@ -1477,6 +1479,31 @@ def _system_health_card(d: dict) -> str:
                 f"配置版本 v{ci.get('version', 1)} · 环境 {ci.get('env', 'dev')} · "
                 f"配置校验 {'✓' if ci.get('valid') else '✗ 已回退上一版本'}</div>"
                 f"<div class='mut' style='font-size:12px'>日志/告警: data_cache/logs · 保留30天</div></div>")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _glossary_card(d: dict) -> str:
+    """术语速查 + 历史决策效果追踪(6.x 可视化/解释)。"""
+    try:
+        g = (d or {}).get("glossary") or {}
+        if not g:
+            return ""
+        items = "".join(f"<li><b>{_h(k)}</b>: {_h(v)}</li>" for k, v in list(g.items())[:14])
+        dt_txt = ""
+        try:
+            from app.support import decision_tracker as _dt
+            _dt.backfill_actuals()
+            m = _dt.metrics()
+            if m.get("ok"):
+                dt_txt = (f"<div>📈 决策效果追踪: 评级方向准确率 <b>{m.get('grade_accuracy', 0):.0%}</b> · "
+                          f"推荐标的方向准确率 <b>{m.get('stock_direction_accuracy', 0):.0%}</b> · "
+                          f"次日上涨胜率 <b>{m.get('stock_up_win_rate', 0):.0%}</b>"
+                          f"(样本 {m.get('stock_samples', 0)})</div>")
+        except Exception:  # noqa: BLE001
+            pass
+        return (f"<details class='card'><summary><b>📖 术语速查与决策效果</b></summary>{dt_txt}"
+                f"<ul style='columns:2;font-size:12px'>{items}</ul></details>")
     except Exception:  # noqa: BLE001
         return ""
 
@@ -2325,6 +2352,12 @@ def api_system_health():
         out["model"] = _mm.health()
     except Exception:  # noqa: BLE001
         out["model"] = {"healthy": True, "reason": "监控未就绪"}
+    try:
+        from app.support import decision_tracker as _dt
+        _dt.backfill_actuals()
+        out["decision"] = _dt.metrics()
+    except Exception:  # noqa: BLE001
+        out["decision"] = {"ok": False, "reason": "决策追踪未就绪"}
     return jsonify(out)
 
 

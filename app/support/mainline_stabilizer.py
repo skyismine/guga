@@ -90,6 +90,7 @@ _SWITCH = {
 }
 # 后台轮询与并发访问共享状态的互斥锁 + 最近一次稳定输出(供 get_output 快速读取)
 _LOCK = threading.RLock()
+_COMPUTING = threading.Event()   # 单飞标志: 后台轮询计算中, 并发访问直接复用最近输出(不重复抓取)
 _LAST_OUTPUT = {"t": 0.0, "data": None}
 _poll_thread = None
 _poll_stop = threading.Event()
@@ -616,28 +617,34 @@ def _sw_stats() -> dict:
 
 # ------------------------------------------------------------------ 对外入口
 def stabilize() -> dict:
-    """稳定器对外入口(线程安全,推进一个快照周期)。
+    """稳定器对外入口(线程安全, 推进一个快照周期)。
 
     - `enable_stabilizer=False`:直接透传原始流水线结果(兼容历史回测);
-    - 否则:原始结果进 `raw`,稳定结果进 `stable`;
-    - 结果同时写入 `_LAST_OUTPUT`,供 `get_output()` 快速读取。
+    - 单飞: 后台轮询计算中, 并发 Web 访问直接复用最近输出(不重复抓取/不阻塞等待);
+    - 否则:原始结果进 `raw`,稳定结果进 `stable`;结果写入 `_LAST_OUTPUT`。
     """
     with _LOCK:
-        cfg = _mainline_cfg()
-        if not cfg.get("enable_stabilizer", True):
-            raw = _en.mainline_select()
-            out = {"raw": raw, "stable": raw, "stabilizer_enabled": False,
-                   "stats": _sw_stats()}
-        else:
-            with _cycle_flow_cache():
+        if _COMPUTING.is_set() and _LAST_OUTPUT["data"] is not None:
+            return _LAST_OUTPUT["data"]        # 另一线程正在计算, 复用最近输出(单飞)
+        _COMPUTING.set()
+        try:
+            cfg = _mainline_cfg()
+            if not cfg.get("enable_stabilizer", True):
                 raw = _en.mainline_select()
-                stable = _build_stable(cfg)
-            _update_switches(raw, stable)
-            out = {"raw": raw, "stable": stable, "stabilizer_enabled": True,
-                   "stats": _sw_stats()}
-        _LAST_OUTPUT["t"] = time.time()
-        _LAST_OUTPUT["data"] = out
-        return out
+                out = {"raw": raw, "stable": raw, "stabilizer_enabled": False,
+                       "stats": _sw_stats()}
+            else:
+                with _cycle_flow_cache():
+                    raw = _en.mainline_select()
+                    stable = _build_stable(cfg)
+                _update_switches(raw, stable)
+                out = {"raw": raw, "stable": stable, "stabilizer_enabled": True,
+                       "stats": _sw_stats()}
+            _LAST_OUTPUT["t"] = time.time()
+            _LAST_OUTPUT["data"] = out
+            return out
+        finally:
+            _COMPUTING.clear()
 
 
 def get_output(max_age: float = 30.0) -> dict:

@@ -547,8 +547,15 @@ def _grade(score, zt, adv_ratio, rules) -> tuple:
     return grade, change_reason
 
 
+_PERMIT_CACHE = {"t": 0.0, "data": None}
+_PERMIT_TTL = 60
+
+
 def market_permit() -> dict:
-    """第一层:市场可操作度评级 + 总仓位上限。"""
+    """第一层:市场可操作度评级 + 总仓位上限(60s 记忆, 避免 decision_brief 内重复重算)。"""
+    now = time.time()
+    if _PERMIT_CACHE["data"] is not None and now - _PERMIT_CACHE["t"] < _PERMIT_TTL:
+        return _PERMIT_CACHE["data"]
     dcfg = _cfg()
     rules = dcfg["market"]
     snap = market_snapshot()
@@ -618,7 +625,7 @@ def market_permit() -> dict:
     reasons.append(f"大盘综合评分 {score},达 {grade} 级标准,当前市场阶段「{pcfg['label']}」总仓位上限 {cap:.0%}")
     if grade_change:
         reasons.append(grade_change)
-    return {
+    out = {
         "grade": grade,
         "grade_label": {"A": "A级·积极配置", "B": "B级·谨慎配置",
                         "C": "C级·持有兑现", "D": "D级·观望为主"}[grade],
@@ -636,6 +643,9 @@ def market_permit() -> dict:
         "operation_keynote": pcfg["keynote"],
         "date": str(snap.get("market_date") or _today()),
     }
+    _PERMIT_CACHE["t"] = time.time()
+    _PERMIT_CACHE["data"] = out
+    return out
 
 
 # ---------------------------------------------------------------- 第二层 主线概念自动遴选
@@ -1425,21 +1435,30 @@ def match_level_targets(sector_name: str, sector_level: str = "watch") -> dict:
     except Exception:  # noqa: BLE001
         market = None
 
-    for role, cands in (("aggressive", emo), ("steady", mid)):
-        for rank, c in enumerate(cands[:2], 1):
-            item = _base(c)
-            item["rank"] = rank
-            item["role"] = {"aggressive": "情绪龙头", "steady": "中军龙头"}[role]
-            item.update(_predict_one(c["code"], predictor, quotes, market))
-            if item.get("error"):
-                result[role]["items"].append(item)
-                continue
-            _adjust_signal(item, sector_level)
-            lv = item.get("levels") or {}
-            item["trigger"] = _TRIGGER_TPL[role].format(
-                support=lv.get("support", "-"), resistance=lv.get("resistance", "-"),
-                entry_low=lv.get("entry_low", "-"))
+    # 6.x 并行化 _predict_one(多标的并发预测, 加速板块成分多场景)
+    from concurrent.futures import ThreadPoolExecutor
+    _pairs = [(role, c, rank) for role, cands in (("aggressive", emo), ("steady", mid))
+              for rank, c in enumerate(cands[:2], 1)]
+    if _pairs:
+        with ThreadPoolExecutor(max_workers=min(4, len(_pairs))) as _ex:
+            _preds = list(_ex.map(lambda pc: _predict_one(pc[1]["code"], predictor, quotes, market),
+                                  _pairs))
+    else:
+        _preds = []
+    for (role, c, rank), pred in zip(_pairs, _preds):
+        item = _base(c)
+        item["rank"] = rank
+        item["role"] = {"aggressive": "情绪龙头", "steady": "中军龙头"}[role]
+        item.update(pred)
+        if item.get("error"):
             result[role]["items"].append(item)
+            continue
+        _adjust_signal(item, sector_level)
+        lv = item.get("levels") or {}
+        item["trigger"] = _TRIGGER_TPL[role].format(
+            support=lv.get("support", "-"), resistance=lv.get("resistance", "-"),
+            entry_low=lv.get("entry_low", "-"))
+        result[role]["items"].append(item)
 
     etfs = _ml._etf_map()
     matched = []
@@ -2014,6 +2033,44 @@ def _risk_postpass(plans: dict, total_asset: float, grade: str, phase: str) -> t
     return plans, check
 
 
+# ---------------------------------------------------------------- 6.x 术语表与通俗解读
+_GLOSSARY = {
+    "rr_left": "左侧低吸盈亏比门槛(预期涨幅/止损幅度,不达标不买)",
+    "rr_right": "右侧突破盈亏比门槛(None=当前阶段禁止右侧突破)",
+    "stab_cycle_adj": "主线稳定器驻留周期系数(越大越谨慎,主线切换越慢)",
+    "admission": "主线准入线(板块综合评分须达到才可入选)",
+    "cap": "当前市场阶段总仓位上限(占总资金)",
+    "single_cap": "单只标的仓位上限(占总资金)",
+    "add_cap": "单次新增/加仓上限(0=禁止新增)",
+    "tiers": "当前阶段允许的标的三档(中军/情绪/补涨)",
+    "trade_mode": "交易模式: 左侧低吸(回踩支撑分批买) / 右侧突破(放量突破后跟进)",
+    "stop_adj": "止损幅度阶段化系数(×止损)",
+    "lead_margin": "同池替换需超越前任主线的分数幅度",
+    "confidence": "主线稳定器置信度(0-1, 越高主线越稳定)",
+    "p_up": "模型预测上涨概率",
+    "p_down": "模型预测下跌概率",
+    "position_coef": "标的三档仓位系数(中军×1.5 / 情绪×0.5 / 补涨×0.6)",
+    "stop_loss_pct": "止损幅度(相对买入价)",
+    "target_profit_pct": "目标盈利幅度(相对买入价)",
+}
+
+
+def plain_plan(p: dict) -> str:
+    """把执行计划的专业字段转成通俗解读(页面展示/复盘用)。"""
+    if not p or not p.get("ok"):
+        return (p or {}).get("reason") or "无执行计划"
+    b = p.get("batch") or {}
+    f, s, t3 = b.get("first") or {}, b.get("second") or {}, b.get("third")
+    batch_txt = f"分{('2' if not t3 else '3')}批买入: 首批{f.get('ratio', 0):.0%}@{f.get('price')}"
+    batch_txt += f"、二批{s.get('ratio', 0):.0%}@{s.get('price')}"
+    if t3:
+        batch_txt += f"、三批{t3.get('ratio', 0):.0%}@{t3.get('price')}"
+    return (f"买入 {p.get('name')}({p.get('code')}),现价 {p.get('price')}。{batch_txt}。"
+            f"止损 {p.get('stop')},目标 {p.get('target1')}/{p.get('target2')}/{p.get('target3')}。"
+            f"模式: {p.get('trade_mode') or '-'}。"
+            + ("".join(f"[{x}]" for x in (p.get("risk_check") or [])) if p.get("risk_check") else ""))
+
+
 # ---------------------------------------------------------------- 聚合
 def _match_targets(sector_name: str, sector_level: str = "watch",
                    sector_status: str = "core") -> dict:
@@ -2115,6 +2172,17 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
 
     # 5.4 跨标的约束后处理: 板块集中度(前二≤50%/产业链) + 相关性 + 总风险预算
     plans, risk_check = _risk_postpass(plans, total_asset, p1["grade"], p1["market_phase"])
+    # 6.x 通俗解读: 每个计划附 explain(供页面/复盘直接展示)
+    for _seg in (plans or {}).values():
+        for _p in (_seg or {}).values():
+            if _p and _p.get("ok") and "explain" not in _p:
+                _p["explain"] = plain_plan(_p)
+    # 6.x 历史决策效果追踪: 记录当日决策快照(自动复盘统计, 不阻塞)
+    try:
+        from app.support import decision_tracker as _dt
+        _dt.record({"date": p1["date"], "layers": layers, "plans": plans})
+    except Exception:  # noqa: BLE001
+        pass
     _flt.info("decision", "决策链路完成", trace_id=trace_id,
               context={"plans_ok": {s: [r for r, p in (seg or {}).items() if p and p.get("ok")]
                                     for s, seg in plans.items()},
@@ -2155,6 +2223,7 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
         "targets": targets,
         "plans": plans,
         "risk_check": risk_check,
+        "glossary": _GLOSSARY,
         "trace_id": trace_id,
         "trace": {
             "trace_id": trace_id,

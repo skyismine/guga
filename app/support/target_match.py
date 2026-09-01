@@ -18,6 +18,15 @@ import time
 from app.support import settings as _st
 
 
+def _fault(e: BaseException, note: str = ""):
+    """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("target_match", note or "处理降级(按缺省继续)", exc=e)
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
+
+
 # ------------------------------------------------------------------ 配置读取
 def _cfg() -> dict:
     """读取 target_match 配置组(settings 默认 + json 覆盖)。"""
@@ -44,11 +53,8 @@ def _reset_state(sector: str, role: str) -> None:
 def _list_days(code: str) -> int | None:
     """上市交易天数(用历史行数近似)。数据不可用返回 None(不参与过滤)。"""
     try:
-        from app.data import fetcher as _f
-        df = _f._load_cache(code)
-        if df is None or df.empty:
-            return None
-        return int(len(df))
+        from app.support.stock_utils import list_days as _sd
+        return _sd(code)
     except Exception:  # noqa: BLE001
         return None
 
@@ -56,14 +62,8 @@ def _list_days(code: str) -> int | None:
 def _avg_amount20(code: str) -> float | None:
     """20日日均成交额(元),基于本地日线缓存。不可用返回 None。"""
     try:
-        from app.data import fetcher as _f
-        df = _f._load_cache(code)
-        if df is None or df.empty or "amount" not in df.columns:
-            return None
-        amt = df["amount"].tail(20).astype(float)
-        if amt.empty:
-            return None
-        return float(amt.mean())
+        from app.support.stock_utils import avg_amount20 as _sa
+        return _sa(code)
     except Exception:  # noqa: BLE001
         return None
 
@@ -103,8 +103,8 @@ def _tradable_filter(stocks: list, role: str, cfg: dict) -> list:
                 hi, lo = float(q.get("high") or 0), float(q.get("low") or 0)
                 if hi and lo and abs(hi - lo) < 1e-9:
                     continue
-        except Exception:  # noqa: BLE001
-            pass  # 快照不可用则跳过该维度
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)  # 快照不可用则跳过该维度
         # 次新股
         days = _list_days(code)
         if days is not None and days < min_days:
@@ -177,8 +177,8 @@ def _stabilize_rank(sector: str, role: str, ranked: list, cfg: dict) -> list:
 def _cached_hist(code: str):
     """读取本地日线缓存(不触发网络抓取)。"""
     try:
-        from app.data import fetcher as _f
-        return _f._load_cache(code)
+        from app.support.stock_utils import cached_hist as _sc
+        return _sc(code)
     except Exception:  # noqa: BLE001
         return None
 
@@ -218,8 +218,8 @@ def _excess_adjust(item: dict, sector_name: str, cfg: dict) -> None:
             item["action"] = item["signal"]
             item["adj_notes"] = (item.get("adj_notes") or []) + \
                 [f"持续跑输板块(3日{ex3:+.1%}/5日{ex5:+.1%}),动作优先级-1"]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
 
 
 def _boost_level(sector_level: str, sector_status: str, cfg: dict) -> str:
@@ -322,14 +322,14 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
     try:
         from app.support import mainline as _ml
         spot = _ml._a_spot_map()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     stocks = []
     try:
         from app.support import mainline as _ml
         stocks = _ml._match_stocks(sector_name, spot)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
 
     # P0.2 可交易性前置过滤(可选,默认关)
     if cfg.get("enable_tradable_filter") and stocks:
@@ -347,20 +347,20 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
                  for it in tiers[role]]
         if codes:
             quotes = _ml.get_spot_quotes(codes)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     predictor = None
     try:
         from app.support import mainline as _ml
         predictor = _ml.Predictor()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     market = None
     try:
         from app.features.market_features import market_snapshot
         market = market_snapshot()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
 
     stable = {"aggressive": [], "steady": [], "repair": [], "etf": [],
               "candidate": [], "fallback": [], "error": ""}
@@ -380,13 +380,21 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
     _pcfg = phase_cfg(_phase)
     _allowed = _pcfg.get("tiers") or ["steady", "aggressive", "repair"]
     rendered = {role: [] for role in ("steady", "aggressive", "repair")}
+    # 并行化 _render_item(内部 _predict_one 串行慢): 线程池并发预测
+    from concurrent.futures import ThreadPoolExecutor
+    _jobs = []
     for role in ("steady", "aggressive", "repair"):
         for it in formal[role]:
             it["is_stable"] = True
             it["continue_rank_cycle"] = 1
             it.setdefault("match_source", "normal")
-            item = _render_item(it, role, sector_name, sector_level, sector_status,
-                                quotes, predictor, market, cfg)
+            _jobs.append((role, it))
+    if _jobs:
+        with ThreadPoolExecutor(max_workers=min(4, len(_jobs))) as _ex:
+            _items = list(_ex.map(
+                lambda j: _render_item(j[1], j[0], sector_name, sector_level, sector_status,
+                                       quotes, predictor, market, cfg), _jobs))
+        for (role, it), item in zip(_jobs, _items):
             for k in ("type", "position_coef", "stop_loss_pct", "target_profit_pct",
                       "is_pulse_watch", "pos_adjusted", "style"):
                 if k in it:
@@ -410,8 +418,8 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
                 item["trade_rr_5d"] = round(rr5, 2) if rr5 else None
                 item["trade_rr_20d"] = round(rr20, 2) if rr20 else None
                 item["trade_rr_note"] = note
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _e:  # noqa: BLE001
+                _fault(_e)
             if not _rr_pass(_phase, mode, rr, _pcfg):
                 continue
             kept.append(item)
@@ -600,6 +608,6 @@ def _fallback(stable: dict, sector_name, sector_level, sector_status,
                         item["is_stable"] = True
                         stable[role] = [item]
                         break
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
     return stable

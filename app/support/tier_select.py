@@ -20,6 +20,15 @@ import time
 from app.support import settings as _st
 
 
+def _fault(e: BaseException, note: str = ""):
+    """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("tier_select", note or "处理降级(按缺省继续)", exc=e)
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
+
+
 # ------------------------------------------------------------------ 固化交易参数
 _TIER_PARAMS = {
     "steady":     {"type": "steady",     "position_coef": 1.5, "stop_loss_pct": -0.05,
@@ -37,19 +46,19 @@ _PERSIST = {}
 _PERSIST_LOCK = threading.Lock()
 
 
-# ------------------------------------------------------------------ 基础工具(复用现有)
+# ------------------------------------------------------------------ 基础工具(复用现有, 解耦自 stock_utils)
 def _hist(code):
     try:
-        from app.support.target_match import _cached_hist
-        return _cached_hist(str(code).zfill(6))
+        from app.support.stock_utils import cached_hist
+        return cached_hist(str(code).zfill(6))
     except Exception:  # noqa: BLE001
         return None
 
 
 def _avg_amount20(code):
     try:
-        from app.support.target_match import _avg_amount20
-        return _avg_amount20(str(code).zfill(6))
+        from app.support.stock_utils import avg_amount20
+        return avg_amount20(str(code).zfill(6))
     except Exception:  # noqa: BLE001
         return None
 
@@ -224,8 +233,8 @@ def _score_aggressive(pool, sector_name):
         from app.support import mainline as _ml
         for z in _ml._zt_pool():
             zt_map[str(z.get("code"))] = int(z.get("boards", 1) or 1)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     corr = {}
     for r in pool:
         c = _corr_sector(sector_name, r["code"])
@@ -386,10 +395,20 @@ def _cap_candidates(pool: list, role: str, n: int) -> list:
 
 
 # ------------------------------------------------------------------ 位置修正
+def _pos_cutoff() -> dict:
+    """高位回落位置修正阈值(settings.decision.exec_param.pos_cutoff, 缺省回退内置)。"""
+    try:
+        from app.support import settings as _st
+        return (_st.load().get("decision", {}).get("exec_param", {})
+                .get("pos_cutoff", {}) or {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _position_adjust(it: dict, role: str) -> None:
     """近3日累计涨幅超阈值 → 下修评级与仓位系数, 高位防回落优先。"""
     ret3 = it.get("_ret3")
-    cutoff = _POS_CUTOFF[role]
+    cutoff = _pos_cutoff().get(role, _POS_CUTOFF[role])
     if ret3 is not None and ret3 >= cutoff:
         params = _TIER_PARAMS[role]
         it["position_coef"] = round(params["position_coef"] * 0.5, 2)

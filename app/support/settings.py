@@ -199,6 +199,14 @@ DEFAULTS = {
     "etf_min_amount": 5000.0,        # ETF 日均成交额下限(万元)
     # ---- 6.2 告警(webhook, 可用 GUGA_ALERT_WEBHOOK 环境变量覆盖, 不落盘密钥)
     "alert": {"webhook": ""},
+    # ---- 6.1 熔断/日志参数(替代 fault.py 硬编码魔法数字)
+    "system": {
+        "cb_fail_threshold": 5,      # 模块连续失败次数触发熔断
+        "cb_open_minutes": 10,       # 熔断时长(分钟)
+        "global_error_rate": 0.30,   # 全局错误率阈值(触发全局熔断)
+        "global_window": 30,         # 全局错误率滚动窗口
+        "log_keep_days": 30,         # 日志保留天数
+    },
     # ---- 模块2 持仓诊断
     "portfolio_path": os.path.join(config.DATA_DIR, "portfolio.csv"),
     "band_diff_pct": 0.06,       # 深度套牢做差价:高抛/回补区间幅度
@@ -447,6 +455,9 @@ DEFAULTS = {
             },
             "risk_budget": {           # 5.4 风险预算
                 "enabled": True, "total_pct": 0.05, "single_pct": 0.015,
+            },
+            "pos_cutoff": {            # 高位回落位置修正阈值(近3日涨幅超此值下修)
+                "steady": 0.18, "aggressive": 0.12, "repair": 0.10,
             },
         },
         # 第三层 板块性价比维度(避免无脑追高)
