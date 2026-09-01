@@ -1993,37 +1993,26 @@ def _report_page_content(err: str = None) -> str:
     placeholder = ('<div class="card"><h3>尚未生成报告</h3><div class="line">点击「生成/刷新」'
                    '将把当日盘面核心数据交给大模型 API(未启用则展示结构化规则复盘),'
                    '生成深度复盘文案并直接显示在本页。</div></div>')
-    script = (
-        '<script>'
-        'function rhGo(){var d=document.getElementById("rh").value;if(d)'
-        'fetch("/api/report?date="+d).then(r=>r.json()).then(j=>{'
-        'if(j.error){alert(j.error);return;}'
-        'document.getElementById("rbody").innerHTML=j.html;'
-        'document.getElementById("rdt").innerText="历史复盘 · "+j.date;})}'
-        'function genReport(){'
-        'var s=document.getElementById("rst"),btn=document.getElementById("genbtn");'
-        'if(btn)btn.disabled=true;'
-        'var t0=Date.now(),tm=null,deadline=240;'
-        's.innerText="⏳ 开始生成…";'
-        'fetch("/api/report/generate",{method:"POST"}).then(r=>r.json()).catch(e=>{'
-        's.innerText="❌ 请求失败:"+e;if(btn)btn.disabled=false;return;});'
-        'var t=setInterval(function(){'
-        'var el=Math.floor((Date.now()-t0)/1000);'
-        'if(el>deadline){clearInterval(t);clearInterval(tm);s.innerText="⏱ 超时,请重试";if(btn)btn.disabled=false;return;}'
-        'fetch("/api/report/status").then(r=>r.json()).then(j=>{'
-        'if(j.state==="running"){s.innerText="⏳ "+j.stage+" … "+el+"s";}'
-        'else{clearInterval(t);clearInterval(tm);'
-        's.innerText=j.err?("❌ "+j.err):"✅ 完成 "+el+"s";'
-        'if(btn)btn.disabled=false;if(!j.err)setTimeout(function(){location.reload();},600);}})'
-        '.catch(function(){s.innerText="⏳ 生成中 "+el+"s…";});'
-        '},1200)}'
-        'function copySummary(){fetch("/api/report/summary").then(r=>r.json()).then(j=>{'
-        'if(j.summary){navigator.clipboard.writeText(j.summary).then(()=>alert("摘要已复制"));'
-        'else alert("尚无摘要");}})}'
-        'function autoTrack(){fetch("/api/report/status").then(r=>r.json()).then(function(j){'
-        'if(j.state==="running")genReport();});}'
-        'autoTrack();'
-        '</script>')
+    script = '''<script>
+function rhGo(){var d=document.getElementById("rh").value;if(d){fetch("/api/report?date="+d).then(r=>r.json()).then(j=>{if(j.error){alert(j.error);return;}document.getElementById("rbody").innerHTML=j.html;document.getElementById("rdt").innerText="历史复盘 · "+j.date;})}}
+function genReport(){
+var s=document.getElementById("rst"),btn=document.getElementById("genbtn");
+if(btn)btn.disabled=true;
+var t0=Date.now(),deadline=240;
+s.innerText="⏳ 开始生成…";
+fetch("/api/report/generate",{method:"POST"}).then(function(){});
+var t=setInterval(function(){
+  var el=Math.floor((Date.now()-t0)/1000);
+  if(el>deadline){clearInterval(t);s.innerText="⏱ 超时,请重试";if(btn)btn.disabled=false;return;}
+  fetch("/api/report/status").then(r=>r.json()).then(function(j){
+    if(j.state==="running"){s.innerText="⏳ "+j.stage+" … "+el+"s";}
+    else{clearInterval(t);s.innerText=j.err?("❌ "+j.err):("✅ 完成 "+el+"s");if(btn)btn.disabled=false;if(!j.err){setTimeout(function(){location.reload();},600);}}
+  }).catch(function(){s.innerText="⏳ 生成中 "+el+"s…";});
+},1200)}
+function copySummary(){fetch("/api/report/summary").then(r=>r.json()).then(function(j){if(j.summary){navigator.clipboard.writeText(j.summary).then(function(){alert("摘要已复制");});}else{alert("尚无摘要");}})}
+function autoTrack(){fetch("/api/report/status").then(r=>r.json()).then(function(j){if(j.state==="running"){genReport();}});}
+autoTrack();
+</script>'''
     return (
         f'<header><h1>📄 每日深度复盘报告</h1>'
         f'<span class="mut" id="rdt">AI 深度复盘文案 · 生成时间 {_h(date)}</span>{toolbar}</header>'
