@@ -850,11 +850,13 @@ def _plan_table_html(plans: dict, sector: str) -> str:
         rows.append(
             f"<tr><th>{lab}</th><td>{stock}{mode_tag}</td>"
             f"<td>{_h(p.get('price'))}</td>"
-            f"<td>{_h(p.get('stop'))}</td>"
-            f"<td>{_h(p.get('target1'))} / {_h(p.get('target2'))}</td>"
+            f"<td>{_h(p.get('stop'))}<br><span class='mut' style='font-size:11px'>{_h(p.get('stop_type'))}</span></td>"
+            f"<td>{_h(p.get('target1'))} / {_h(p.get('target2'))}"
+            f"<br><span class='mut' style='font-size:11px'>T3: {_h(p.get('target3'))}</span></td>"
             f"<td>{p.get('position_pct', 0) * 100:.1f}%<br><span class='mut'>{p.get('shares')} 股 · {_fmt(p.get('position_value'))} 元</span></td>"
             f"<td>{b.get('first', {}).get('ratio', 0) * 100:.0f}% @ {_h(b.get('first', {}).get('price'))}<br>"
-            f"{b.get('second', {}).get('ratio', 0) * 100:.0f}% @ {_h(b.get('second', {}).get('price'))}</td>"
+            f"{b.get('second', {}).get('ratio', 0) * 100:.0f}% @ {_h(b.get('second', {}).get('price'))}"
+            f"{('<br>' + format(b.get('third', {}).get('ratio', 0) * 100, '.0f') + '% @ ' + _h(b.get('third', {}).get('price'))) if b.get('third') else ''}</td>"
             f"<td class='mut'>{trig}</td>"
             f"<td>{ts_html}</td>"
             f"<td class='mut'>{_h(p.get('note'))}</td></tr>")

@@ -1559,22 +1559,77 @@ def execution_plan(target: dict, total_asset: float, taste: str,
     atr = float(atr) if atr else None
     ma5 = target.get("ma5")
     ma10 = target.get("ma10")
+    eparam = dcfg.get("exec_param", {})
+    # 标的类型归一(供止损/分批/目标分类型参数)
+    _atype = asset_type or ("mood" if target.get("type") == "aggressive" else
+                            "repair" if target.get("type") == "repair" else
+                            "etf" if target.get("type") == "etf" else "mid")
+    if _atype in ("etf", "def_etf"):
+        _atype = "etf"
 
-    # ---- 止损:VectorBT 止损位优先,缺失回退 ATR 或现价比例
-    stop = float(lv.get("stop_loss") or 0) or (price - (1.5 * atr if atr else price * 0.04))
-    # 现价跌破止损视为止损无效(止损应低于买入价),修正为 ATR/比例回退
+    # ---- 5.1 止损:VectorBT 止损位优先,缺失回退「分标的类型」ATR/现价比例
+    scfg = eparam.get("stop", {}).get(_atype, {"atr": 1.5, "pct": 0.05})
+    stop = float(lv.get("stop_loss") or 0) or \
+        (price - (float(scfg.get("atr", 1.5)) * atr if atr else price * float(scfg.get("pct", 0.05))))
     if stop >= price:
-        stop = price - (1.5 * atr if atr else price * 0.04)
+        stop = price - (float(scfg.get("atr", 1.5)) * atr if atr else price * float(scfg.get("pct", 0.05)))
+    # 5.1 止损位验证: 必须低于关键支撑位, 否则调整至支撑位下方
+    support0 = float(lv.get("support") or 0) or price * 0.95
+    if support0 and stop >= support0:
+        stop = support0 * 0.98
 
-    # ---- 目标价
+    # ---- 5.3 目标价: 分类型 目标1/2/3 + 评级动态调整 + 递增校验
+    tcfg = eparam.get("target", {}).get(_atype, {"atr1": 0.5, "t2": "res20", "t3": "hist_high"})
+    gd = eparam.get("target_dynamic", {})
+    gmult = 1.0
+    if grade in ("A",):
+        gmult = float(gd.get("grade_up", 1.05))
+    elif grade in ("C", "D"):
+        gmult = float(gd.get("grade_down", 0.95))
+    try:
+        from app.data.fetcher import _load_cache as _flc
+        _df = _flc(str(target.get("code") or "").zfill(6))
+    except Exception:  # noqa: BLE001
+        _df = None
+    def _hist_high(days):
+        if _df is not None and len(_df) and "high" in _df.columns:
+            h = _df["high"].astype(float).tail(days)
+            if len(h):
+                return float(h.max())
+        return None
     resistance = float(lv.get("resistance") or 0) or price * 1.08
-    target1 = price * (1 + (0.5 * (atr / price if atr else 0.04)))
+    target1 = price * (1 + float(tcfg.get("atr1", 0.5)) * (atr / price if atr else 0.04))
     target1 = max(target1, price * (1 + plancfg.get("target1_min_gain", 0.03)))  # 至少+3%
-    target1 = max(target1, price * 1.001)  # 确保高于现价
-    target2 = resistance  # 近20日平台压力位
-    # 目标价强制递增:第二目标不得低于第一目标
-    if target2 < target1:
-        target2 = target1
+    target1 = max(target1, price * 1.001) * gmult   # 评级动态调整
+    _t_src = {"prev_high": _hist_high(20), "hist_high": _hist_high(60),
+              "year_high": _hist_high(250), "res20": resistance}
+    target2 = _t_src.get(tcfg.get("t2", "res20")) or resistance
+    target3 = (_t_src.get(tcfg.get("t3", "hist_high")) if tcfg.get("t3") else None) or target2
+    target2 = (target2 * gmult) if target2 else None
+    target3 = (target3 * gmult) if target3 else None
+    # 递增校验: 目标1<目标2<目标3 且均高于现价(达标后目标2上移 ×run_mult 让利润奔跑)
+    _run = float(gd.get("run_mult", 1.05))
+    if target2 is None or target2 <= target1:
+        target2 = target1 * _run
+    if target3 is None or target3 <= target2:
+        target3 = target2 * _run
+    _td_note = (f"目标价按评级{'上' if gmult > 1 else ('下' if gmult < 1 else '平')}调"
+                f"{'×' + format(gmult, '.2f') if gmult != 1.0 else ''};达标后目标2上移×{format(_run, '.2f')}")
+
+    # ---- 5.2 分批比例: 分标的类型(可三批) × 分阶段首批系数
+    bcfg = eparam.get("batch_type", {})
+    ratios = list(bcfg.get(_atype, [0.50, 0.50]) or [0.50, 0.50])
+    if len(ratios) < 2:
+        ratios = [0.5, 0.5]
+    pfirst = float(eparam.get("batch_phase_first", {}).get(pcfg["phase"], 1.0) or 1.0)
+    if pfirst > 0:
+        ratios[0] = ratios[0] * pfirst
+        _s = sum(ratios)
+        ratios = [r / _s for r in ratios]
+    _BT_NAME = {"mood": "情绪龙头", "mid": "中军龙头", "etf": "ETF", "repair": "补涨优选"}
+    _btrig = ["首批:满足基础买入条件(信号触发/回踩企稳)",
+              "二批:首批浮盈>0 或 回踩支撑位企稳",
+              "三批:二批浮盈>0 或 突破关键压力位"]
 
     # ---- 分批模式(与触发条件强绑定)
     mode = plancfg.get("mode", "auto")
@@ -1583,19 +1638,19 @@ def execution_plan(target: dict, total_asset: float, taste: str,
         ret3d = target.get("ret3d") or 0
         mode = "breakout" if (sig in ("突破跟进", "关注低吸") and ret3d >= 0.05) else "pullback"
     if mode == "breakout":
-        # 突破跟进:首批=压力位突破价,二批=突破后回踩确认价(略低于突破价)
+        # 突破跟进:首批=压力位突破价,二批=回踩确认价,三批=突破确认加仓(三批类型)
         first_price = resistance
         second_price = first_price * (1 - 0.01)
+        third_price = first_price * (1 + 0.02) if len(ratios) >= 3 else None
         deep_support = float(lv.get("support") or 0) or price * 0.92
-        mode_note = "突破跟进:首批放量突破压力位,二批回踩确认"
+        mode_note = "突破跟进:首批放量突破压力位,二批回踩确认" \
+            + ("+三批突破确认加仓" if third_price else "")
         trigger = f"放量突破压力位 {first_price:.2f} 确认,回踩 {second_price:.2f} 不破再关注"
-        first_note = "首批:突破压力位(60%)"
-        second_note = "二批:回踩确认(40%)"
-        avg_cost = first_price * batch.get("first", 0.60) + second_price * batch.get("second", 0.40)
-        if stop >= avg_cost:
-            stop = avg_cost * 0.98  # 止损必须低于加权买入成本
+        first_note = f"首批:突破压力位({ratios[0]:.0%})"
+        second_note = f"二批:回踩确认({ratios[1]:.0%})"
+        third_note = f"三批:突破确认({ratios[2]:.0%})" if third_price else ""
     else:
-        # 回踩低吸:支撑上沿(5日线附近) -> 支撑下沿(10日线附近)
+        # 回踩低吸:支撑上沿(5日线附近) -> 支撑下沿(10日线附近) -> 中期强支撑(三批类型)
         hi = (ma5 or price * 0.97)
         lo = (ma10 or price * 0.94)
         # 回踩区间跨度限制(不超过 8%),超限则压缩
@@ -1610,21 +1665,21 @@ def execution_plan(target: dict, total_asset: float, taste: str,
         second_price = min(second_price, first_price)
         # 极端加仓位(中期强支撑,不混入短线回踩区间)
         deep_support = float(lv.get("support") or 0) or price * 0.92
-        # 止损 = min(原止损, 二批下方缓冲),必须低于加权买入成本
-        avg_cost = first_price * batch.get("first", 0.60) + second_price * batch.get("second", 0.40)
-        stop = min(stop, second_price * 0.97)
-        if stop >= avg_cost:
-            stop = second_price * 0.97
-        mode_note = "回踩低吸:首批5日线附近(支撑上沿),二批10日线附近(支撑下沿)"
+        third_price = min(deep_support, second_price) if len(ratios) >= 3 else None
+        mode_note = "回踩低吸:首批5日线附近,二批10日线附近" \
+            + ("+三批中期强支撑" if third_price else "")
         trigger = f"回踩支撑区间 {second_price:.2f}~{first_price:.2f} 缩量企稳"
-        first_note = "首批:回踩支撑上沿(60%)"
-        second_note = "二批:回踩支撑下沿(40%)"
+        first_note = f"首批:回踩支撑上沿({ratios[0]:.0%})"
+        second_note = f"二批:回踩支撑下沿({ratios[1]:.0%})"
+        third_note = f"三批:中期强支撑({ratios[2]:.0%})" if third_price else ""
     # 逐级方向强制校验:回踩二批低于一批,突破二批低于一批但整体在压力位上方
     if first_price <= 0 or second_price <= 0:
         first_price, second_price = price, price * 0.97
+        third_price = min(deep_support, second_price) if len(ratios) >= 3 else None
 
-    # ---- 仓位股数(风险公式,三者自洽;以加权买入成本为基准)
-    avg_cost = first_price * batch.get("first", 0.60) + second_price * batch.get("second", 0.40)
+    # ---- 仓位股数(风险公式,三者自洽;以加权买入成本为基准, 支持三批)
+    prices = [first_price, second_price] + ([third_price] if third_price else [])
+    avg_cost = sum(r * p for r, p in zip(ratios, prices))
     risk_money = total_asset * risk_rate
     loss_per_share = max(avg_cost - stop, price * 0.01)  # 每股最大亏损(基于加权成本)
     risk_shares = risk_money / loss_per_share          # 风险公式推股数
@@ -1645,16 +1700,21 @@ def execution_plan(target: dict, total_asset: float, taste: str,
         single_cap = single_cap if single_cap is not None else _st.load().get("risk", {}).get("single_pct", 0.10)
     max_mv = total_asset * min(market_cap or 1.0, single_cap, pcfg["single_cap"])  # 阶段单票上限并入
 
-    # ---- 单板块总仓位上限(超出则压缩 + 预警)
+    # ---- 5.4 板块集中度: 单板块总仓位上限(主升放宽40%), 超出则压缩 + 预警
     pm_block = pm if use_matrix else {}
+    conc = eparam.get("concentration", {}) or {}
     if pm_block and sector_cap_pct is None:
         sector_cap_pct = pm.get("sector_cap", {}).get(grade or "B", 0.20)
+    if conc.get("enabled"):
+        _s_cap = float(conc.get("single_sector_main", 0.40)) if pcfg["phase"] == "main" \
+            else float(conc.get("single_sector", 0.30))
+        sector_cap_pct = min(sector_cap_pct or _s_cap, _s_cap)
     block_note = ""
-    if pm_block and sector_cap_pct and pm.get("enforce", True):
+    if sector_cap_pct and pm.get("enforce", True):
         remaining = max(0.0, sector_cap_pct - (sector_used_pct or 0.0))
         max_blk = total_asset * remaining
         max_mv = min(max_mv, max_blk)
-        block_note = f";板块已用 {sector_used_pct or 0:.1%},上限 {sector_cap_pct:.0%},本票最多 {remaining:.1%}"
+        block_note = f";板块集中度已用 {sector_used_pct or 0:.1%},上限 {sector_cap_pct:.0%},本票最多 {remaining:.1%}"
 
     pos_value = min(risk_shares * avg_cost, max_mv)    # 同时受全部风控上限约束
     shares = int(pos_value / avg_cost // 100) * 100
@@ -1670,8 +1730,9 @@ def execution_plan(target: dict, total_asset: float, taste: str,
             shares = int(pos_value / avg_cost // 100) * 100
             shares = max(shares, 100)
             pos_value = shares * avg_cost
-    first = int(shares * batch.get("first", 0.60) // 100) * 100
-    second = shares - first
+    first = int(shares * ratios[0] // 100) * 100
+    second = int(shares * ratios[1] // 100) * 100
+    third = max(0, shares - first - second)
     max_loss = shares * loss_per_share
 
     # ---- 分阶段单次新增/加仓上限(硬约束, 开仓前拦截)
@@ -1682,12 +1743,46 @@ def execution_plan(target: dict, total_asset: float, taste: str,
             shares = int(pos_value / avg_cost // 100) * 100
             shares = max(shares, 100)
             pos_value = shares * avg_cost
-            first = int(shares * batch.get("first", 0.60) // 100) * 100
-            second = shares - first
+            first = int(shares * ratios[0] // 100) * 100
+            second = int(shares * ratios[1] // 100) * 100
+            third = max(0, shares - first - second)
             max_loss = shares * loss_per_share
 
     # ---- 止损阶段化(退潮收紧20% / 主升放宽20% / 高潮收紧), 且不得高于现价
     stop = min(stop * pcfg["stop_adj"], price * 0.98)
+
+    # ---- 5.1 动态止损阶梯(基于浮盈阈值): 保本 → 锁定浮盈 → 跟踪回撤
+    ds = eparam.get("dynamic_stop", {})
+    dynamic_stop = None
+    if ds.get("enabled"):
+        dynamic_stop = {
+            "breakeven": {"threshold_pct": float(ds.get("breakeven_pct", 0.05)),
+                          "stop": round(avg_cost, 2)},
+            "lock": {"threshold_pct": float(ds.get("lock_pct", 0.10)),
+                     "stop": round(avg_cost * (1 + float(ds.get("breakeven_pct", 0.05))), 2)},
+            "trailing": {"threshold_pct": float(ds.get("trail_pct", 0.20)),
+                         "trail_drawdown": float(ds.get("trail_drawdown", 0.08))},
+        }
+
+    # ---- 5.4 风险预算: 单只标的风险(仓位×止损幅度) ≤ 总资金 single_pct
+    rb = eparam.get("risk_budget", {})
+    rb_note = ""
+    if rb.get("enabled"):
+        stop_pct = loss_per_share / avg_cost if avg_cost > 0 else 0.0
+        max_single_risk = total_asset * float(rb.get("single_pct", 0.015))
+        if stop_pct > 0:
+            risk_cap_mv = max_single_risk / stop_pct
+            if pos_value > risk_cap_mv:
+                pos_value = risk_cap_mv
+                shares = int(pos_value / avg_cost // 100) * 100
+                shares = max(shares, 100)
+                pos_value = shares * avg_cost
+                first = int(shares * ratios[0] // 100) * 100
+                second = int(shares * ratios[1] // 100) * 100
+                third = max(0, shares - first - second)
+                max_loss = shares * loss_per_share
+                rb_note = (f";单票风险预算(止损幅度 {stop_pct:.1%}×仓位≤{max_single_risk:,.0f}元)"
+                           f"压缩至 {pos_value:,.0f} 元")
 
     # ---- 触发条件量化(升级4):盘中按分钟K线判定当前触发状态
     tcfg = dcfg.get("trigger", {})
@@ -1720,22 +1815,152 @@ def execution_plan(target: dict, total_asset: float, taste: str,
         "resistance": round(resistance, 2),
         "target1": round(target1, 2),
         "target2": round(target2, 2),
+        "target3": round(target3, 2),
+        "target_note": _td_note,
+        "stop_type": _BT_NAME.get(_atype, _atype),
+        "dynamic_stop": dynamic_stop,
         "position_value": round(pos_value, 2),
         "shares": shares,
         "position_pct": round(pos_value / total_asset, 4) if total_asset else 0,
         "max_loss": round(max_loss, 2),
         "batch": {
-            "first": {"ratio": batch.get("first", 0.60), "shares": first,
+            "first": {"ratio": ratios[0], "shares": first,
                       "price": round(first_price, 2), "note": first_note},
-            "second": {"ratio": batch.get("second", 0.40), "shares": second,
+            "second": {"ratio": ratios[1], "shares": second,
                        "price": round(second_price, 2), "note": second_note},
+            "third": {"ratio": ratios[2], "shares": third,
+                      "price": round(third_price, 2), "note": third_note}
+            if third_price and len(ratios) >= 3 else None,
             "deep_support": round(deep_support, 2),
+            "trigger": _btrig[:len(ratios)],
         },
         "note": (f"单笔风险 {risk_money:,.0f} 元(总资金 {risk_rate:.1%}),预计最大亏损 {max_loss:,.0f} 元"
                  f"({max_loss / total_asset:.2%} 占总资金),止损 {stop:.2f}(亏 {loss_per_share:.2f}/股),"
                  f"建议仓位 {shares} 股 / {pos_value:,.0f} 元({pos_value / total_asset:.1%})。{mode_note}"
-                 f"{matrix_note}{block_note}"),
+                 f"{matrix_note}{block_note}{rb_note}。{_td_note}"),
     }
+
+
+# ---------------------------------------------------------------- 5.4 跨标的约束后处理
+def _halve_plan(x: dict) -> None:
+    """对某计划执行减半压缩并注记。"""
+    p = x.get("ref")
+    if not p or not p.get("ok"):
+        return
+    old = p.get("position_pct") or 0
+    p["position_pct"] = round(old * 0.5, 4)
+    if p.get("position_value"):
+        p["position_value"] = round(p["position_value"] * 0.5, 2)
+    p.setdefault("risk_check", []).append(f"超限压缩: 仓位减半({old:.1%}→{p['position_pct']:.1%})")
+    x["pos_pct"] = p["position_pct"]
+
+
+def _corr_matrix(codes: list, window: int = 30) -> dict:
+    """持仓标的两两收益相关系数(近 window 日, 本地日线缓存)。返回 {(codeA,codeB): corr}。"""
+    import pandas as pd
+    rets = {}
+    for c in set(codes):
+        try:
+            from app.data.fetcher import _load_cache as _flc
+            df = _flc(str(c).zfill(6))
+            if df is not None and len(df) > window and "close" in df.columns:
+                r = df["close"].astype(float).pct_change().dropna().tail(window)
+                if len(r) >= 5:
+                    rets[str(c).zfill(6)] = r
+        except Exception:  # noqa: BLE001
+            continue
+    out = {}
+    keys = list(rets.keys())
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            a, b = keys[i], keys[j]
+            al = pd.concat([rets[a], rets[b]], axis=1, join="inner").dropna()
+            if len(al) >= 5:
+                c = float(al.iloc[:, 0].corr(al.iloc[:, 1]))
+                if c == c:
+                    out[(a, b)] = c
+    return out
+
+
+def _risk_postpass(plans: dict, total_asset: float, grade: str, phase: str) -> tuple:
+    """5.4 跨标的约束后处理(校验+注记, 超限对最高风险标的温和压缩)。
+
+    - 板块集中度: 前两大板块合计仓位≤50%; 产业链(chain_sectors 配置)合计≤40%;
+    - 相关性: 持仓间收益相关>corr_high 的两只合计仓位≤单票上限×sum_mult;
+    - 风险预算: Σ(仓位×止损幅度)≤总资金 total_pct, 超限优先压缩风险最高标的。
+    返回 (plans, check)。数据不足维度跳过, 不抛错。
+    """
+    dcfg = _cfg()
+    ep = dcfg.get("exec_param", {})
+    conc = ep.get("concentration", {}) or {}
+    corr_cfg = ep.get("correlation", {}) or {}
+    rb = ep.get("risk_budget", {}) or {}
+    notes = []
+    items = []
+    for sector, seg in (plans or {}).items():
+        for role, p in (seg or {}).items():
+            if not (p and p.get("ok")):
+                continue
+            avg = p.get("price") or 0
+            stop = p.get("stop") or 0
+            stop_pct = max(0.0, (avg - stop) / avg) if avg and avg > stop else 0.0
+            items.append({"sector": sector, "role": role,
+                          "code": str(p.get("code") or "").zfill(6),
+                          "name": p.get("name"), "pos_pct": p.get("position_pct") or 0,
+                          "stop_pct": stop_pct, "ref": p})
+    if not items:
+        return plans, {"notes": notes, "total_pos": 0.0, "total_risk": 0.0}
+    check = {"notes": notes, "total_pos": round(sum(x["pos_pct"] for x in items), 4),
+             "total_risk": round(sum(x["pos_pct"] * x["stop_pct"] for x in items), 4)}
+    # 1) 板块集中度: 前两大板块合计 / 产业链合计
+    if conc.get("enabled"):
+        by_sector = {}
+        for x in items:
+            by_sector[x["sector"]] = by_sector.get(x["sector"], 0.0) + x["pos_pct"]
+        top2 = sum(sorted(by_sector.values(), reverse=True)[:2])
+        t2 = float(conc.get("top2_total", 0.50))
+        if top2 > t2:
+            notes.append(f"前两大板块合计仓位 {top2:.1%} 超集中度上限 {t2:.0%},压缩最高仓位标的")
+            _halve_plan(max(items, key=lambda x: x["pos_pct"]))
+        chains = [s for s in (conc.get("chain_sectors") or []) if s in by_sector]
+        if chains:
+            ct = sum(by_sector[s] for s in chains)
+            cl = float(conc.get("chain_total", 0.40))
+            if ct > cl:
+                notes.append(f"产业链板块 {chains} 合计 {ct:.1%} 超上限 {cl:.0%},建议减仓")
+    # 2) 相关性
+    if corr_cfg.get("enabled") and len(items) >= 2:
+        high = float(corr_cfg.get("corr_high", 0.8))
+        mult = float(corr_cfg.get("sum_mult", 1.5))
+        corr = _corr_matrix([x["code"] for x in items],
+                            int(corr_cfg.get("window_days", 30) or 30))
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                r = corr.get((items[i]["code"], items[j]["code"]))
+                if r is None or r <= high:
+                    continue
+                ssum = items[i]["pos_pct"] + items[j]["pos_pct"]
+                if ssum > mult * max(items[i]["pos_pct"], items[j]["pos_pct"]):
+                    notes.append(f"「{items[i]['name']}」与「{items[j]['name']}」相关性 {r:.2f}> {high:.1f},"
+                                 "合计仓位超限,压缩较小者")
+                    _halve_plan(min((items[i], items[j]), key=lambda x: x["pos_pct"]))
+    # 3) 风险预算: Σ(仓位×止损幅度) ≤ 总资金 total_pct
+    if rb.get("enabled"):
+        total = float(rb.get("total_pct", 0.05))
+        rsum = sum(x["pos_pct"] * x["stop_pct"] for x in items)
+        if rsum > total:
+            notes.append(f"总风险 {rsum:.2%} 超预算 {total:.0%},优先压缩风险最高标的")
+            for _ in range(10):     # 最多迭代10轮, 防死循环
+                rsum = sum(x["pos_pct"] * x["stop_pct"] for x in items)
+                if rsum <= total:
+                    break
+                _mx = max(items, key=lambda x: x["pos_pct"] * x["stop_pct"])
+                if _mx["pos_pct"] * _mx["stop_pct"] <= 1e-9:
+                    break
+                _halve_plan(_mx)
+    check["notes"] = notes
+    check["total_risk"] = round(sum(x["pos_pct"] * x["stop_pct"] for x in items), 4)
+    return plans, check
 
 
 # ---------------------------------------------------------------- 聚合
@@ -1828,6 +2053,9 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
                     sector_used_pct=0.0)
                 plans.setdefault(defensive["name"], {})["etf"] = p
 
+    # 5.4 跨标的约束后处理: 板块集中度(前二≤50%/产业链) + 相关性 + 总风险预算
+    plans, risk_check = _risk_postpass(plans, total_asset, p1["grade"], p1["market_phase"])
+
     # 极简结论
     core_stock = ""
     if core and targets.get(core["name"], {}).get("steady", {}).get("items"):
@@ -1861,6 +2089,7 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
         "layers": layers,
         "targets": targets,
         "plans": plans,
+        "risk_check": risk_check,
     }
 
 

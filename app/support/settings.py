@@ -222,6 +222,55 @@ DEFAULTS = {
             },
             "enforce": True,           # 超过单板块上限时自动压缩并给出预警
         },
+        # ---- 第四层 执行参数优化(5.1-5.4) ----
+        "exec_param": {
+            "stop": {                  # 5.1 分标的类型止损(ATR 倍数 / 现价比例回退)
+                "mood": {"atr": 2.0, "pct": 0.08},
+                "mid": {"atr": 1.5, "pct": 0.05},
+                "etf": {"atr": 1.0, "pct": 0.03},
+                "def_etf": {"atr": 1.0, "pct": 0.03},
+                "repair": {"atr": 1.2, "pct": 0.04},
+            },
+            "dynamic_stop": {          # 5.1 动态止损阶梯(浮盈阈值)
+                "enabled": True,
+                "breakeven_pct": 0.05,  # 浮盈5% → 保本止损
+                "lock_pct": 0.10,       # 浮盈10% → 止损上移至浮盈5%
+                "trail_pct": 0.20,      # 浮盈20% → 跟踪止损(最高价回撤8%)
+                "trail_drawdown": 0.08,
+            },
+            "batch_type": {            # 5.2 分类型分批比例(可三批)
+                "mood": [0.40, 0.30, 0.30],
+                "mid": [0.50, 0.50],
+                "etf": [0.70, 0.30],
+                "def_etf": [0.70, 0.30],
+                "repair": [0.30, 0.30, 0.40],
+            },
+            "batch_phase_first": {     # 5.2 分阶段首批比例系数(退潮降/主升提/高潮禁)
+                "retreat": 0.5, "startup": 1.0, "main": 1.2, "climax": 0.0,
+            },
+            "target": {                # 5.3 分类型目标价(ATR1倍数 / t2 / t3 来源)
+                "mood": {"atr1": 1.0, "t2": "prev_high", "t3": "hist_high"},
+                "mid": {"atr1": 0.5, "t2": "res20", "t3": "hist_high"},
+                "etf": {"atr1": 0.3, "t2": "prev_high", "t3": "year_high"},
+                "def_etf": {"atr1": 0.3, "t2": "prev_high", "t3": "year_high"},
+                "repair": {"atr1": 0.8, "t2": "prev_high", "t3": None},
+            },
+            "target_dynamic": {        # 5.3 动态目标:评级上/下调±5%, 达标后目标2上移×1.05
+                "grade_up": 1.05, "grade_down": 0.95, "run_mult": 1.05,
+            },
+            "concentration": {         # 5.4 板块集中度
+                "enabled": True,
+                "single_sector": 0.30, "single_sector_main": 0.40,
+                "top2_total": 0.50, "chain_total": 0.40, "chain_sectors": [],
+            },
+            "correlation": {           # 5.4 相关性限制
+                "enabled": True, "corr_high": 0.8, "sum_mult": 1.5,
+                "corr_new": 0.9, "new_halve": True, "window_days": 30,
+            },
+            "risk_budget": {           # 5.4 风险预算
+                "enabled": True, "total_pct": 0.05, "single_pct": 0.015,
+            },
+        },
         # 第三层 板块性价比维度(避免无脑追高)
         "value": {
             "enabled": True,           # 总开关
