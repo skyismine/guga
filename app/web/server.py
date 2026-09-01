@@ -1987,7 +1987,7 @@ def _report_page_content(err: str = None) -> str:
         f'<select id="rh" style="padding:8px 12px;border-radius:8px;border:1px solid #2a3350;'
         f'background:#0b1018;color:var(--txt);font-size:14px" onchange="rhGo()">'
         f'<option value="">历史复盘(按日期查看)</option>{hist_ops}</select>'
-        f'<button class="btn" onclick="genReport()">🔄 生成/刷新</button>'
+        f'<button class="btn" id="genbtn" onclick="genReport()">🔄 生成/刷新</button>'
         f'<button class="btn gray" onclick="copySummary()">📋 复制摘要</button>'
         f'<span id="rst" class="mut"></span>')
     placeholder = ('<div class="card"><h3>尚未生成报告</h3><div class="line">点击「生成/刷新」'
@@ -2000,14 +2000,29 @@ def _report_page_content(err: str = None) -> str:
         'if(j.error){alert(j.error);return;}'
         'document.getElementById("rbody").innerHTML=j.html;'
         'document.getElementById("rdt").innerText="历史复盘 · "+j.date;})}'
-        'function genReport(){var s=document.getElementById("rst");s.innerText="⏳ 开始生成…";'
-        'fetch("/api/report/generate",{method:"POST"}).then(r=>r.json());'
-        'var t=setInterval(function(){fetch("/api/report/status").then(r=>r.json()).then(j=>{'
-        'if(j.state==="running"){s.innerText="⏳ "+j.stage+" …";}else{clearInterval(t);'
-        's.innerText=j.err?("❌ "+j.err):"✅ 完成";if(!j.err)location.reload();}})},1200)}'
+        'function genReport(){'
+        'var s=document.getElementById("rst"),btn=document.getElementById("genbtn");'
+        'if(btn)btn.disabled=true;'
+        'var t0=Date.now(),tm=null,deadline=240;'
+        's.innerText="⏳ 开始生成…";'
+        'fetch("/api/report/generate",{method:"POST"}).then(r=>r.json()).catch(e=>{'
+        's.innerText="❌ 请求失败:"+e;if(btn)btn.disabled=false;return;});'
+        'var t=setInterval(function(){'
+        'var el=Math.floor((Date.now()-t0)/1000);'
+        'if(el>deadline){clearInterval(t);clearInterval(tm);s.innerText="⏱ 超时,请重试";if(btn)btn.disabled=false;return;}'
+        'fetch("/api/report/status").then(r=>r.json()).then(j=>{'
+        'if(j.state==="running"){s.innerText="⏳ "+j.stage+" … "+el+"s";}'
+        'else{clearInterval(t);clearInterval(tm);'
+        's.innerText=j.err?("❌ "+j.err):"✅ 完成 "+el+"s";'
+        'if(btn)btn.disabled=false;if(!j.err)setTimeout(function(){location.reload();},600);}})'
+        '.catch(function(){s.innerText="⏳ 生成中 "+el+"s…";});'
+        '},1200)}'
         'function copySummary(){fetch("/api/report/summary").then(r=>r.json()).then(j=>{'
         'if(j.summary){navigator.clipboard.writeText(j.summary).then(()=>alert("摘要已复制"));'
         'else alert("尚无摘要");}})}'
+        'function autoTrack(){fetch("/api/report/status").then(r=>r.json()).then(function(j){'
+        'if(j.state==="running")genReport();});}'
+        'autoTrack();'
         '</script>')
     return (
         f'<header><h1>📄 每日深度复盘报告</h1>'
@@ -2018,37 +2033,13 @@ def _report_page_content(err: str = None) -> str:
         + '<div class="footer">报告内容仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>')
 
 
-@app.route("/report")
-def page_report():
-    err = request.args.get("err")
-    # 首访:优先渲染当日已落盘的 md 文件;不存在则生成并落盘(save 按 need_save_report)后渲染。
-    if not _REPORT_HTML["html"] and not err:
-        try:
-            from app.review.data import review_date
-            from app.support import settings as _st
-            rdate = review_date()
-            fname = rdate.strftime("%Y%m%d") if hasattr(rdate, "strftime") \
-                else str(rdate).replace("-", "")
-            md_text = _load_report_file(fname)
-            if md_text:
-                _set_report({"date": str(rdate), "markdown": md_text, "summary": ""})
-            else:
-                from app.support import daily_report as _rep
-                _set_report(_rep.generate(use_cache=True,
-                                          save=bool(_st.load().get("need_save_report", False))))
-        except Exception as e:  # noqa: BLE001
-            err = str(e)
-    return _shell("report", "复盘报告", _report_page_content(err=err))
-
-
-@app.route("/api/report/generate", methods=["POST"])
-def api_report_generate():
-    """异步生成复盘:后台线程执行,页面轮询 /api/report/status 获取进度。落盘按 need_save_report。"""
+def _start_report_generation() -> str:
+    """启动异步报告生成(线程), 返回当前 state。供按钮与首访共用, 不阻塞请求线程。"""
     import threading as _th
     from app.support import daily_report as rep
     from app.support import settings as _st
     if _REPORT_STAGE["state"] == "running":
-        return jsonify({"state": "running"})
+        return "running"
 
     def _stage(msg):
         _REPORT_STAGE["stage"] = msg
@@ -2065,8 +2056,35 @@ def api_report_generate():
         finally:
             _REPORT_STAGE["state"] = "done"
 
-    _th.Thread(target=_run, daemon=True).start()
-    return jsonify({"state": "running"})
+    _th.Thread(target=_run, daemon=True, name="report-gen").start()
+    return "running"
+
+
+@app.route("/report")
+def page_report():
+    err = request.args.get("err")
+    # 首访:优先渲染当日已落盘的 md 文件;不存在则异步生成(不阻塞页面),渲染占位+进度。
+    if not _REPORT_HTML["html"] and not err:
+        from app.review.data import review_date
+        from app.support import settings as _st
+        try:
+            rdate = review_date()
+            fname = rdate.strftime("%Y%m%d") if hasattr(rdate, "strftime") \
+                else str(rdate).replace("-", "")
+            md_text = _load_report_file(fname)
+            if md_text:
+                _set_report({"date": str(rdate), "markdown": md_text, "summary": ""})
+            else:
+                _start_report_generation()   # 异步生成, 页面即时渲染占位+进度轮询
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+    return _shell("report", "复盘报告", _report_page_content(err=err))
+
+
+@app.route("/api/report/generate", methods=["POST"])
+def api_report_generate():
+    """异步生成复盘:后台线程执行,页面轮询 /api/report/status 获取进度。落盘按 need_save_report。"""
+    return jsonify({"state": _start_report_generation()})
 
 
 @app.route("/api/report/status")
