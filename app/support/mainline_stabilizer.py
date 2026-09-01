@@ -298,13 +298,14 @@ def _mk_rejected(r, stats, reasons) -> dict:
 
 
 # ------------------------------------------------------------------ 核心稳定逻辑
-def _pick_leader(pool_rows, prev_name, label, N, now):
+def _pick_leader(pool_rows, prev_name, label, N, now, margin: float = 0.0):
     """池内 leader 选任(同池替换防抖)。
 
     返回 (leader_item 或 None, challenger_item 或 None)。
     - 无前任(初始建仓)或前任已出池:池内 resident 第 1 名直接接任
       (它已通过驻留 valid_cycles>=N 的确认,无需再等);
-    - 前任仍在池且达标:保持,除非新人连续 lead_cycles>=N 周期领先且分数更高才替换;
+    - 前任仍在池且达标:保持,除非新人连续 lead_cycles>=N 周期领先且
+      分数超过前任至少 margin 分(3.3 阶段化超越幅度,退潮更高/主升更低)才替换;
     - 新人驻留不足或未满领先周期 → 返回 None 及该挑战者(进入 candidate)。
     """
     if not pool_rows:
@@ -319,12 +320,25 @@ def _pick_leader(pool_rows, prev_name, label, N, now):
         if prev is not None:
             if prev["name"] == top["name"]:
                 return prev, None
-            # 换人防抖:新人必须连续 N 周期领先(lead_cycles>=N)且分数更高才替换
-            if st["lead_cycles"] >= N and top["score"] > prev["score"]:
+            # 换人防抖:新人须连续 N 周期领先且分数超前任 margin 分才替换
+            if st["lead_cycles"] >= N and top["score"] > prev["score"] + margin:
                 return top, prev
             return prev, top
     # 无前任或前任已出池:resident 第 1 名直接接任(驻留已提供 N 周期确认)
     return top, None
+
+
+def _confidence(st: dict, score: float, up: float, down: float, N: int, ccfg: dict) -> float:
+    """稳定器置信度(0-1, 3.3): 驻留周期进度 + 相对保级线的安全边际。
+
+    置信度 = base + cycle_w×min(1, valid_cycles/N) + margin_w×min(1, (score-down)/(up-down))。
+    """
+    cycles = st.get("valid_cycles", 0)
+    c = float(ccfg.get("base", 0.3))
+    c += float(ccfg.get("cycle_w", 0.4)) * min(1.0, cycles / max(1, N))
+    span = max(up - down, 0.1)
+    c += float(ccfg.get("margin_w", 0.3)) * min(1.0, max(0.0, (score - down) / span))
+    return round(max(0.0, min(1.0, c)), 2)
 
 
 def _build_stable(cfg: dict) -> dict:
@@ -335,17 +349,21 @@ def _build_stable(cfg: dict) -> dict:
     down = float(cfg.get("PASS_HYSTERESIS_DOWN", 58.0))
     pass_score = float(cfg.get("pass_score", 60.0))
     watch_n = int(cfg.get("watch_n", 3))
-    # 阶段联动: 退潮加长驻留周期/提高准入, 主升适度放宽灵敏度
+    # 阶段联动: 退潮加长驻留周期/提高准入, 主升适度放宽灵敏度; 3.3 超越幅度阶段化
+    margin = 5.0
     try:
         from app.decision.engine import phase_cfg
         _p = phase_cfg()
         N = max(1, int(N * _p.get("stab_cycle_adj", 1.0)))
         pass_score = float(_p["admission"])
+        margin = float(_p.get("lead_margin", 5.0))
     except Exception:  # noqa: BLE001
         pass
     now = time.time()
-    # 第五轮:全局风格偏转标签(复盘展示,不参与打分)
-    style_tag = _ml.market_style_bias().get("tag", "") if cfg.get("enable_extend_factor") else ""
+    # 第五轮:全局风格偏转标签(复盘展示)+ 3.4 风格分数微调输入
+    ext_on = bool(cfg.get("enable_extend_factor"))
+    style = _ml.market_style_bias() if ext_on else None
+    style_tag = (style or {}).get("tag", "") if ext_on else ""
 
     # 平滑单日资金 + 5日表原样(稳定器不参与 5 日平滑)
     flows = _smoothed_flows()
@@ -373,79 +391,96 @@ def _build_stable(cfg: dict) -> dict:
             rejected.append(_mk_rejected(r, stats_map.get(name), [r.get("reject_reason", "")]))
             continue
         stats = stats_map.get(name) or {}
-        banned, reasons = _en._veto(name, r, dcfg, stats, zt_available=zt_available)
-        # 否决分类:过热/利空 = 中长期条件,瞬时生效;其余 = 瞬时条件,连续 N 周期确认
-        perm = [x for x in reasons if ("过热" in x or "利空" in x)]
-        trans = [x for x in reasons if x not in perm]
-        if perm:
+        # 3.1 真否决(利空关键词/数据严重缺失)瞬时生效
+        banned, hard = _en._veto(name, r, dcfg, stats, zt_available=zt_available)
+        if banned:
             _mark_removed(st, now, cool_min)
-            rejected.append(_mk_rejected(r, stats, perm))
+            rejected.append(_mk_rejected(r, stats, hard))
             continue
-        if trans:
-            st["veto_hits"] = st.get("veto_hits", 0) + 1
-            if st["veto_hits"] >= N:
-                _mark_removed(st, now, cool_min)
-                st["valid_cycles"] = 0
-                rejected.append(_mk_rejected(
-                    r, stats, trans + [f"连续 {N} 个快照周期命中瞬时否决,防抖确认淘汰"]))
-                continue
-            candidate.append(_mk_item(
-                r, stats, "candidate", trans + [f"瞬时否决防抖确认中({st['veto_hits']}/{N})"],
-                pool=pool, extra=_log_fields(st, now, "veto")))
-            continue
-        st["veto_hits"] = 0
-
+        # 3.1 分级扣分(软性): 净流出/涨停不足/过热 → 扣分,不否决(替代瞬时否决防抖)
+        penalty, pen_reasons = _en._veto_penalty(r, dcfg, stats, zt_available=zt_available)
+        # 3.4 风格偏转分数微调(与当前大小盘风格对齐/背离)
+        s_adj = _en._style_score_adj(style, r.get("size_bias", 0)) if ext_on else 0.0
+        # 3.2 准入线动态调整(板块历史分位+波动率)
+        adj = _en._sector_admission_adj(name, r["score"])
         # 第五轮:梯队变差确认(盘中炸板不立即生效,连续 N 周期才反映到分数)
         r = _ladder_hold(r, st, cfg, dcfg)
-        score = r["score"]
+        score = round(r["score"] - penalty + s_adj, 2)
+        up_eff = round(up + adj, 1)
+        down_eff = round(down + adj, 1)
+        _extra = {}
+        if penalty:
+            _extra["veto_penalty"] = penalty
+        if s_adj:
+            _extra["style_adj"] = s_adj
+        if adj:
+            _extra["admission_adj"] = adj
         if st.get("in_passed"):
-            # 已在正式池:滞回保级
-            if score < down:
+            # 已在正式池:滞回保级(保级线随板块动态准入调整)
+            if score < down_eff:
                 _mark_removed(st, now, cool_min)
                 st["in_passed"] = False
                 st["valid_cycles"] = 0
-                candidate.append(_mk_item(
-                    r, stats, "candidate",
-                    [f"分数 {score:.2f} 低于保级线 {down:.0f},移出正式池,冷却 {cool_min} 分钟"],
-                    pool=pool, extra=_log_fields(st, now, "hysteresis_down")))
+                it = _mk_item(r, stats, "candidate",
+                              [f"分数 {score:.2f} 低于保级线 {down_eff:.0f}"
+                               + (f"(板块动态{adj:+.1f})" if adj else "")
+                               + f",移出正式池,冷却 {cool_min} 分钟"] + pen_reasons,
+                              pool=pool, extra=_log_fields(st, now, "hysteresis_down"))
+                it["score"] = score
+                it.update(_extra)
+                candidate.append(it)
                 continue
             st["valid_cycles"] = st.get("valid_cycles", 0) + 1
-            passed.append(_mk_item(r, stats, "passed", _en._pass_reasons(r, stats), pool=pool))
+            it = _mk_item(r, stats, "passed", _en._pass_reasons(r, stats) + pen_reasons, pool=pool)
+            it["score"] = score
+            it.update(_extra)
+            passed.append(it)
         else:
-            # 新板块:进入正式池需过晋升线 + 驻留
-            if score >= up:
+            # 新板块:进入正式池需过晋升线(动态) + 驻留
+            if score >= up_eff:
                 st["valid_cycles"] = st.get("valid_cycles", 0) + 1
                 if st["valid_cycles"] >= N:
                     if _cooling(st, now):
-                        candidate.append(_mk_item(
-                            r, stats, "candidate",
-                            [f"冷却中,剩余 {_cool_remain(st, now)} 分钟,仅作候选"],
-                            pool=pool, extra=_log_fields(st, now, "cool_down")))
+                        it = _mk_item(r, stats, "candidate",
+                                      [f"冷却中,剩余 {_cool_remain(st, now)} 分钟,仅作候选"],
+                                      pool=pool, extra=_log_fields(st, now, "cool_down"))
+                        it["score"] = score
+                        it.update(_extra)
+                        candidate.append(it)
                     else:
                         st["in_passed"] = True
                         # 第五轮:入池即初始化梯队跟踪基准(后续周期梯队变差需连续N周期确认)
                         if r.get("ladder_score") is not None:
                             st["ladder_score"] = float(r["ladder_score"])
-                        passed.append(_mk_item(r, stats, "passed", _en._pass_reasons(r, stats), pool=pool))
+                        it = _mk_item(r, stats, "passed", _en._pass_reasons(r, stats) + pen_reasons, pool=pool)
+                        it["score"] = score
+                        it.update(_extra)
+                        passed.append(it)
                 else:
-                    candidate.append(_mk_item(
-                        r, stats, "candidate",
-                        [f"驻留确认中({st['valid_cycles']}/{N} 个快照周期)"],
-                        pool=pool, extra=_log_fields(st, now, "residency")))
+                    it = _mk_item(r, stats, "candidate",
+                                  [f"驻留确认中({st['valid_cycles']}/{N} 个快照周期)"],
+                                  pool=pool, extra=_log_fields(st, now, "residency"))
+                    it["score"] = score
+                    it.update(_extra)
+                    candidate.append(it)
             else:
                 st["valid_cycles"] = 0
-                if score >= down:
-                    low.append(_mk_item(r, stats, "watch",
-                                        [f"综合评分 {score:.2f} 分,低于晋升线 {up:.0f},仅跟踪"],
-                                        pool=pool))
+                if score >= down_eff:
+                    it = _mk_item(r, stats, "watch",
+                                  [f"综合评分 {score:.2f} 分,低于晋升线 {up_eff:.0f}"
+                                   + (f"(板块动态{adj:+.1f})" if adj else "") + ",仅跟踪"],
+                                  pool=pool)
+                    it["score"] = score
+                    it.update(_extra)
+                    low.append(it)
 
-    # ---- 池内分级(禁止跨池对比) + 同池替换防抖
+    # ---- 池内分级(禁止跨池对比) + 同池替换防抖(3.3 阶段化超越幅度)
     aggressive = sorted([p for p in passed if p.get("pool") == "aggressive"],
                         key=lambda x: -x["score"])
     defensive_pool = sorted([p for p in passed if p.get("pool") == "defensive"],
                             key=lambda x: -x["score"])
-    core, core_chal = _pick_leader(aggressive, _LAST_OUT.get("stable_core"), "core", N, now)
-    defen, def_chal = _pick_leader(defensive_pool, _LAST_OUT.get("stable_def"), "defensive", N, now)
+    core, core_chal = _pick_leader(aggressive, _LAST_OUT.get("stable_core"), "core", N, now, margin)
+    defen, def_chal = _pick_leader(defensive_pool, _LAST_OUT.get("stable_def"), "defensive", N, now, margin)
     if core:
         core["level"] = "core"
         core["reasons"] = (core.get("reasons") or []) + ["进攻属性池第 1 名(核心主攻)"]
@@ -486,6 +521,13 @@ def _build_stable(cfg: dict) -> dict:
     for w in watch:
         w["level"] = "watch"
     watch += low[:max(0, watch_n - len(watch))]
+
+    # ---- 3.3 稳定器置信度(0-1): 驻留周期进度 + 相对保级线安全边际
+    ccfg = cfg.get("confidence", {})
+    for it in ([core] if core else []) + ([defen] if defen else []) + watch:
+        _stt = _SECTOR_STATE.get(it["name"], _new_state())
+        _adj = it.get("admission_adj", 0.0)
+        it["confidence"] = _confidence(_stt, it["score"], up + _adj, down + _adj, N, ccfg)
 
     # ---- 挑战者(同池替换未遂)并入 candidate
     for ch in (core_chal, def_chal):

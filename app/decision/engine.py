@@ -159,19 +159,19 @@ _PHASE_CFG = {
     "retreat": {"label": "退潮冰点/缩量磨底", "cap": 0.30, "single_cap": 0.01, "add_cap": 0.02,
                 "admission": 65, "core_max": 2, "branch_max": 0,
                 "rr_left": 2.0, "rr_right": None, "tiers": ["steady", "repair"],
-                "stop_adj": 0.8, "stab_cycle_adj": 1.5, "keynote": "只减不加,极轻仓试错"},
+                "stop_adj": 0.8, "stab_cycle_adj": 1.5, "lead_margin": 10.0, "keynote": "只减不加,极轻仓试错"},
     "startup": {"label": "启动确认期", "cap": 0.50, "single_cap": 0.02, "add_cap": 0.05,
                 "admission": 60, "core_max": 3, "branch_max": 2,
                 "rr_left": 2.0, "rr_right": 1.5, "tiers": ["steady", "aggressive", "repair"],
-                "stop_adj": 1.0, "stab_cycle_adj": 1.0, "keynote": "回踩低吸+突破试加"},
+                "stop_adj": 1.0, "stab_cycle_adj": 1.0, "lead_margin": 6.0, "keynote": "回踩低吸+突破试加"},
     "main":    {"label": "主升发酵期", "cap": 0.70, "single_cap": 0.05, "add_cap": 0.10,
                 "admission": 58, "core_max": 4, "branch_max": 3,
                 "rr_left": 1.5, "rr_right": 1.2, "tiers": ["steady", "aggressive", "repair"],
-                "stop_adj": 1.2, "stab_cycle_adj": 0.8, "keynote": "顺势加仓,持有为主"},
+                "stop_adj": 1.2, "stab_cycle_adj": 0.8, "lead_margin": 5.0, "keynote": "顺势加仓,持有为主"},
     "climax":  {"label": "高潮加速期", "cap": 0.50, "single_cap": 0.03, "add_cap": 0.0,
                 "admission": 62, "core_max": 3, "branch_max": 0,
                 "rr_left": 99.0, "rr_right": None, "tiers": ["steady"],
-                "stop_adj": 0.9, "stab_cycle_adj": 1.2, "keynote": "分批兑现,逐步降仓"},
+                "stop_adj": 0.9, "stab_cycle_adj": 1.2, "lead_margin": 8.0, "keynote": "分批兑现,逐步降仓"},
 }
 
 
@@ -640,19 +640,59 @@ def market_permit() -> dict:
 
 # ---------------------------------------------------------------- 第二层 主线概念自动遴选
 def _veto(name, r, dcfg, stats, zt_available=True) -> tuple:
-    """返回 (是否淘汰, 理由列表)。zt_available=False 表示涨停池数据缺失,跳过该否决项。"""
+    """一票否决(3.1 保留真否决): 仅 利空关键词命中 与 板块统计严重缺失。
+
+    原「主力净流出 / 涨停不足 / 近3日过热」改为 _veto_penalty 分级扣分(不再直接否决)。
+    返回 (是否否决, 理由列表)。"""
     veto = dcfg.get("veto", {})
     reasons = []
-    if r["net_yi"] < 0:
-        reasons.append(f"当日主力净流出 {r['net_yi']:.1f} 亿(一票否决)")
-    if stats and stats.get("gain3") is not None and stats["gain3"] >= veto.get("max_gain_3d", 0.15):
-        reasons.append(f"近3日累计涨幅 {stats['gain3'] * 100:+.1f}%,已超 {veto.get('max_gain_3d', 0.15) * 100:.0f}% 过热上限(一票否决)")
-    if zt_available and r["zt_count"] < veto.get("min_zt_in_sector", 2):
-        reasons.append(f"板块内涨停 {r['zt_count']} 家,不足 {veto.get('min_zt_in_sector', 2)} 家(一票否决)")
+    if stats is None and veto.get("data_missing", True):
+        reasons.append("板块统计数据严重缺失(概念指数不可得),一票否决")
     for kw in veto.get("bad_news_kw", []):
         if kw in (name + (r.get("leader") or "")):
             reasons.append(f"名称/领涨股命中利空关键词「{kw}」(一票否决)")
     return bool(reasons), reasons
+
+
+def _veto_penalty(r, dcfg, stats, zt_available=True) -> tuple:
+    """一票否决改分级扣分(3.1): 软性项按程度扣分而非直接否决。
+
+    - 主力净流出: 按净流出占板块成交额比例扣 0-10 分;
+    - 涨停不足 min_zt: 每缺 1 家扣 per_missing(默认5)分;
+    - 近3日涨幅过热: 按超出阈值幅度扣 0-10 分。
+    返回 (penalty, reasons)。
+    """
+    vp = dcfg.get("veto_penalty", {})
+    reasons = []
+    penalty = 0.0
+    # 主力净流出(0-10)
+    ncfg = vp.get("net_out", {})
+    if ncfg.get("enabled", True) and (r.get("net_yi") or 0) < 0:
+        amt = float((r.get("inflow_yi") or 0) + (r.get("outflow_yi") or 0))
+        net = float(-r["net_yi"])
+        ratio = min(1.0, net / amt) if amt > 0 else min(1.0, net / 50.0)
+        pts = float(ncfg.get("max_pts", 10.0)) * ratio
+        penalty += pts
+        reasons.append(f"主力净流出 {r['net_yi']:.1f} 亿(占成交额 {ratio * 100:.0f}%),扣 {pts:.1f} 分")
+    # 涨停不足(每缺1家扣 per_missing)
+    zcfg = vp.get("zt_short", {})
+    min_zt = int(dcfg.get("veto", {}).get("min_zt_in_sector", 2))
+    if zcfg.get("enabled", True) and zt_available:
+        missing = max(0, min_zt - int(r.get("zt_count", 0)))
+        if missing > 0:
+            pts = missing * float(zcfg.get("per_missing", 5.0))
+            penalty += pts
+            reasons.append(f"涨停 {r.get('zt_count', 0)} 家,不足 {min_zt} 家,扣 {pts:.1f} 分")
+    # 近3日过热(0-10)
+    ocfg = vp.get("overheat", {})
+    thr = float(ocfg.get("threshold", dcfg.get("veto", {}).get("max_gain_3d", 0.15)))
+    gain3 = (stats or {}).get("gain3")
+    if ocfg.get("enabled", True) and gain3 is not None and gain3 >= thr:
+        pts = min(float(ocfg.get("max_pts", 10.0)),
+                  (gain3 - thr) / max(thr, 1e-6) * float(ocfg.get("max_pts", 10.0)))
+        penalty += pts
+        reasons.append(f"近3日涨幅 {gain3 * 100:+.1f}%,超 {thr * 100:.0f}% 过热,扣 {pts:.1f} 分")
+    return round(penalty, 1), reasons
 
 
 def _pass_reasons(r, stats, score=None) -> list:
@@ -687,11 +727,10 @@ def _sector_pool(name: str) -> str:
 
 
 def _style_order(items: list, style: dict, thresh: float) -> list:
-    """同池板块按风格偏转微调排序(第五轮扩展因子)。
+    """同池板块按风格偏转微调排序(第五轮扩展因子,排序层面兜底)。
 
-    仅当:风格明确(style_bias≠0)、同池相邻板块分数差<=thresh 时,
-    将与本轮风格(大盘/小盘)对齐的板块提前;分数差距大时保持原始 score 排序。
-    不修改任何板块 score,仅调整池内先后顺序(影响 leader 选任)。
+    分数层面已由 _style_score_adj 微调(3.4);此处仅在同池相邻分差<=thresh 时
+    将与本轮风格对齐的板块提前,作同分/近分时的先后参考。
     """
     if not items or not style or thresh <= 0:
         return items
@@ -714,6 +753,97 @@ def _style_order(items: list, style: dict, thresh: float) -> list:
                 out[i], out[i + 1] = out[i + 1], out[i]
                 changed = True
     return out
+
+
+# ---------------------------------------------------------------- 3.2 准入线动态调整
+_SECTOR_SCORE_FILE = os.path.join(config.DATA_DIR, "sector_score_history.json")
+_SECTOR_SCORE_CACHE = {"t": 0.0, "data": None}   # 60s 缓存,避免每板块每周期读文件
+
+
+def _record_sector_scores(rows: list) -> None:
+    """当日板块评分存档(每日覆盖最新值),供准入线历史分位调整(3.2)。"""
+    try:
+        arch = _load_sector_score_arch()
+        arch[_today()] = {r["industry"]: float(r["score"]) for r in rows
+                          if r.get("score") is not None}
+        keep = sorted(arch.keys())[-90:]
+        arch = {k: arch[k] for k in keep}
+        dal.locked_write(_SECTOR_SCORE_FILE, json.dumps(arch, ensure_ascii=False))
+        _SECTOR_SCORE_CACHE["data"] = arch
+        _SECTOR_SCORE_CACHE["t"] = time.time()
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("sector_score_hist", False, f"板块评分存档失败: {e}")
+
+
+def _load_sector_score_arch() -> dict:
+    if _SECTOR_SCORE_CACHE["data"] is not None and time.time() - _SECTOR_SCORE_CACHE["t"] < 60:
+        return _SECTOR_SCORE_CACHE["data"]
+    try:
+        with open(_SECTOR_SCORE_FILE, encoding="utf-8") as f:
+            arch = json.load(f)
+    except Exception:  # noqa: BLE001
+        arch = {}
+    _SECTOR_SCORE_CACHE["data"] = arch
+    _SECTOR_SCORE_CACHE["t"] = time.time()
+    return arch
+
+
+def _sector_admission_adj(name: str, score: float) -> float:
+    """准入线动态调整(3.2): 板块近60日评分分位数(80%分位以上下调5/20%以下上调5)
+    + 波动率(标准差>10 上调3 / <5 下调3), 总浮动不超过 ±10。返回调整值(可为0)。"""
+    aacfg = _cfg().get("mainline", {}).get("admission_adj", {})
+    if not aacfg.get("enabled", True):
+        return 0.0
+    today = _today()
+    hist = []
+    try:
+        arch = _load_sector_score_arch()
+        for d, vals in arch.items():
+            if d == today or vals.get(name) is None:
+                continue
+            hist.append(float(vals[name]))
+        hist = hist[-60:]
+    except Exception:  # noqa: BLE001
+        return 0.0
+    if len(hist) < int(aacfg.get("min_hist", 10)):
+        return 0.0
+    pct = sum(1 for v in hist if v < score) / len(hist)
+    m = sum(hist) / len(hist)
+    std = (sum((v - m) ** 2 for v in hist) / len(hist)) ** 0.5
+    adj = 0.0
+    if pct >= float(aacfg.get("pct_up", 0.80)):
+        adj -= float(aacfg.get("pct_pts", 5.0))          # 高历史分位 → 下调准入线(更易入选)
+    elif pct <= float(aacfg.get("pct_down", 0.20)):
+        adj += float(aacfg.get("pct_pts", 5.0))          # 低历史分位 → 上调准入线(更难入选)
+    if std > float(aacfg.get("vol_high", 10.0)):
+        adj += float(aacfg.get("vol_pts", 3.0))          # 高波动 → 上调(更谨慎)
+    elif std < float(aacfg.get("vol_low", 5.0)):
+        adj -= float(aacfg.get("vol_pts", 3.0))          # 低波动 → 下调
+    return round(max(-float(aacfg.get("max_adj", 10.0)),
+                     min(float(aacfg.get("max_adj", 10.0)), adj)), 1)
+
+
+# ---------------------------------------------------------------- 3.4 风格偏转分数微调
+def _style_score_adj(style: dict, size_bias) -> float:
+    """风格偏转分数微调(3.4): 与当前市场风格对齐 +1~3 分,背离 -1~3 分(强度定标),单板块上限±5。
+
+    强度: |大小盘动量差| 1%~3% → 1~3 分;style_confidence=low 缩放 0.5(连续一致性不足时降权)。
+    """
+    scfg = _cfg().get("mainline", {}).get("style_adj", {})
+    if not scfg.get("enabled", True) or not style:
+        return 0.0
+    bias = style.get("bias")
+    if bias not in (-1, 1) or size_bias not in (-1, 1):
+        return 0.0
+    diff = abs(float(style.get("style_diff_pct") or style.get("rel_score") or 0.0))
+    lo, hi = float(scfg.get("min_pts", 1.0)), float(scfg.get("max_pts", 3.0))
+    strength = lo + (hi - lo) * min(1.0, max(0.0, diff / 0.02))
+    if str(style.get("style_confidence")) == "low":
+        strength *= float(scfg.get("low_conf_scale", 0.5))
+    aligned = 1 if size_bias == bias else -1
+    delta = aligned * strength
+    return round(max(-float(scfg.get("max_total", 5.0)),
+                     min(float(scfg.get("max_total", 5.0)), delta)), 2)
 
 
 def _pos_rating(stats: dict, vcfg: dict) -> str:
@@ -808,7 +938,12 @@ def mainline_select() -> dict:
     admission = phase_cfg()["admission"]   # 分阶段准入线(退潮上调收紧, 主升下调放宽)
     rows = _ml.sector_scores(use_cache=True)
     zt_pool = _ml._zt_pool()
-    zt_available = len(zt_pool) > 0  # 涨停池为空视为数据缺失,跳过涨停家数否决项
+    zt_available = len(zt_pool) > 0  # 涨停池为空视为数据缺失,跳过涨停家数扣分项
+    # 3.2 板块评分历史存档(每日覆盖,供准入线历史分位调整)
+    try:
+        _record_sector_scores(rows)
+    except Exception:  # noqa: BLE001
+        pass
     # 大盘环境联动:量能修正幅度随大盘评级缩放(A/B/C-D -> 100%/80%/50%)
     try:
         mkt_grade = market_permit().get("grade")
@@ -831,6 +966,7 @@ def mainline_select() -> dict:
                              "breakdown": r.get("breakdown") or {}})
             continue
         stats = stats_map.get(r["industry"])
+        # 3.1 真否决(利空关键词/数据严重缺失)
         banned, why = _veto(r["industry"], r, dcfg, stats, zt_available=zt_available)
         if banned:
             rejected.append({"name": r["industry"], "score": r["score"],
@@ -862,13 +998,34 @@ def mainline_select() -> dict:
             item["volume_ratio"] = vr_smooth
             item["score"] = round(r["score"] + delta, 2)
             item["volume_adj"] = delta
-        if item["score"] >= admission:
+        # 3.1 分级扣分(净流出/涨停不足/过热)替代一票否决
+        penalty, pen_reasons = _veto_penalty(r, dcfg, stats, zt_available=zt_available)
+        if penalty:
+            item["score"] = round(item["score"] - penalty, 2)
+            item["veto_penalty"] = penalty
+            item["veto_penalty_reasons"] = pen_reasons
+        # 3.4 风格偏转分数微调(与当前大小盘风格对齐 +分/背离 -分)
+        if ext_cfg and style:
+            s_adj = _style_score_adj(style, r.get("size_bias", 0))
+            if s_adj:
+                item["score"] = round(item["score"] + s_adj, 2)
+                item["style_adj"] = s_adj
+        # 3.2 准入线动态调整(板块历史分位+波动率)
+        admission_adj = _sector_admission_adj(r["industry"], item["score"])
+        eff_admission = round(admission + admission_adj, 1)
+        if admission_adj:
+            item["admission_adj"] = admission_adj
+        if item["score"] >= eff_admission:
             item["reasons"] = _pass_reasons(r, stats, item["score"])
             if item.get("volume_adj"):
                 vr = item["volume_ratio"] or 0
                 vtag = ("放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")) \
                     + ("上涨" if (r.get("pct_chg") or 0) > 0 else "下跌")
                 item["reasons"].insert(0, f"板块量能比 {vr:.2f}({vtag}),评分{'上调' if item['volume_adj'] > 0 else '下调'} {abs(item['volume_adj']):.1f} 分")
+            for _p in pen_reasons:
+                item["reasons"].append(f"扣分: {_p}")
+            if item.get("style_adj"):
+                item["reasons"].append(f"风格偏转 {'对齐' if item['style_adj'] > 0 else '背离'} {item['style_adj']:+.1f} 分")
             item["pool"] = _sector_pool(r["industry"])
             passed.append(item)
         else:
@@ -879,7 +1036,11 @@ def mainline_select() -> dict:
                 vtag = ("放量" if vr >= 1.05 else ("缩量" if vr <= 0.95 else "平量")) \
                     + ("上涨" if (r.get("pct_chg") or 0) > 0 else "下跌")
                 vtxt = f"(量能比 {vr:.2f} {vtag},量能修正 {item.get('volume_adj') or 0:+.1f} 分)"
-            item["reasons"] = [f"综合评分 {item['score']} 分,低于阶段准入线 {admission} 分,仅跟踪{vtxt}"]
+            item["reasons"] = [f"综合评分 {item['score']} 分,低于阶段准入线 {eff_admission} 分"
+                               + (f"(板块动态{admission_adj:+.1f})" if admission_adj else "")
+                               + f",仅跟踪{vtxt}"]
+            for _p in pen_reasons:
+                item["reasons"].append(f"扣分: {_p}")
             low.append(item)
 
     # ---- 属性池内分级(禁止跨池对比);第五轮:风格偏转仅调整同池相邻且分差小的排序
