@@ -28,6 +28,40 @@ def _patched_send(self, request, *args, **kwargs):
     return _original_send(self, request, *args, **kwargs)
 
 
+def _patch_akshare_retry():
+    """akshare request_with_retry 指数退避重试会 sleep 3 次(≈7-11s)。
+
+    连接级失败(403/断连/限流)重试无意义,由上层多源回退/本地快照兜底;
+    这里将其降为单次尝试(零退避 sleep),避免行情源不可达时每次调用白等 ~10s。
+
+    注意: akshare.utils.func 在模块顶层 `from akshare.utils.request import
+    request_with_retry` 绑定了原函数,仅替换模块属性不够,需同步重绑定所有
+    已持有原函数引用的模块,否则仍走带退避的原实现。
+    """
+    try:
+        import akshare.utils.request as _akreq
+    except Exception:  # noqa: BLE001
+        return
+    _orig = _akreq.request_with_retry
+    if getattr(_orig, "_guga_patched", False):
+        return
+
+    def _patched(url, params=None, timeout=15, max_retries=3,
+                 base_delay=1.0, random_delay_range=(0.5, 1.5)):
+        return _orig(url, params=params, timeout=timeout,
+                     max_retries=min(max_retries, 1),
+                     base_delay=0.0, random_delay_range=(0.0, 0.0))
+
+    _patched.__name__ = "request_with_retry"
+    _patched._guga_patched = True
+    _akreq.request_with_retry = _patched
+    # 同步已 `from akshare.utils.request import request_with_retry` 绑定的模块
+    import sys
+    for _m in list(sys.modules.values()):
+        if _m is not None and getattr(_m, "request_with_retry", None) is _orig:
+            _m.request_with_retry = _patched
+
+
 def install():
     HTTPAdapter.send = _patched_send
     # 兼容部分模块直接使用 requests.utils.default_headers
@@ -37,6 +71,7 @@ def install():
         "Accept": "*/*",
         "Connection": "keep-alive",
     }
+    _patch_akshare_retry()
 
 
 install()

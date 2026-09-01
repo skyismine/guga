@@ -603,13 +603,24 @@ def api_backtest():
 
 
 # ============================================================ 决策执行引擎(今日决策)
+import threading as _threading
+
 _DECISION_CACHE = {"t": 0.0, "data": None, "err": None}
 _DECISION_TTL = 600
+_DECISION_LOCK = _threading.Lock()
+_DECISION_WORKER = {"running": False}
 
 
-def _get_decision(refresh=False):
-    if refresh or _DECISION_CACHE["data"] is None or _DECISION_CACHE["err"] or \
-            _time.time() - _DECISION_CACHE["t"] > _DECISION_TTL:
+def _decision_stale() -> bool:
+    return (_DECISION_CACHE["data"] is None or _DECISION_CACHE["err"]
+            or _time.time() - _DECISION_CACHE["t"] > _DECISION_TTL)
+
+
+def _compute_decision():
+    """单飞计算:并发请求/预热线程共用一次计算,避免重复重算拖慢。"""
+    with _DECISION_LOCK:
+        if not _decision_stale():
+            return _DECISION_CACHE
         from app.decision.engine import decision_brief
         try:
             _DECISION_CACHE["data"] = decision_brief()
@@ -619,6 +630,41 @@ def _get_decision(refresh=False):
             _DECISION_CACHE["err"] = str(e)
         _DECISION_CACHE["t"] = _time.time()
     return _DECISION_CACHE
+
+
+def _get_decision(refresh=False):
+    """refresh 强制同步重算;非 refresh 冷缓存直接返回(不阻塞),由后台 worker 计算。"""
+    if refresh:
+        return _compute_decision()
+    return _DECISION_CACHE
+
+
+def _ensure_decision_worker():
+    """冷缓存时后台线程计算,页面立即返回占位并自动刷新,避免首次访问被慢计算阻塞断连。"""
+    if _DECISION_WORKER["running"] or not _decision_stale():
+        return
+    _DECISION_WORKER["running"] = True
+
+    def _run():
+        try:
+            _compute_decision()
+        finally:
+            _DECISION_WORKER["running"] = False
+
+    _threading.Thread(target=_run, daemon=True, name="decision-worker").start()
+
+
+def _cold_decision_page():
+    """决策未生成时的占位页(毫秒级返回 + JS 自动刷新),防止首访阻塞超时。"""
+    return _shell("decision", "今日决策",
+                  '<header><h1>🎯 今日决策</h1>'
+                  '<span class="mut">正在生成今日决策,请稍候…</span>'
+                  '<a class="btn" href="/decision?refresh=1">🔄 手动刷新</a></header>'
+                  '<div class="card"><h3>⏳ 决策引擎计算中</h3>'
+                  '<div class="mut">首次计算需数秒(大盘评级 → 主线遴选 → 标的匹配 → 执行参数),'
+                  '页面将自动刷新。期间请保持浏览器窗口打开。</div></div>'
+                  '<div class="footer">仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>'
+                  '<script>setTimeout(function(){location.href="/decision"}, 5000);</script>')
 
 
 def _grade_badge(g):
@@ -1391,6 +1437,10 @@ def api_sector_detail():
 def page_decision():
     refresh = request.args.get("refresh") == "1"
     c = _get_decision(refresh=refresh)
+    if c["data"] is None and not c["err"]:
+        # 冷缓存:立即返回占位页,后台线程生成,5s 后自动刷新(避免慢计算阻塞断连)
+        _ensure_decision_worker()
+        return _cold_decision_page()
     if c["err"]:
         return _shell("decision", "今日决策",
                       '<header><h1>🎯 今日决策</h1><span class="mut">决策引擎</span></header>'
@@ -1562,11 +1612,20 @@ def api_review():
 # ============================================================ 模块2 持仓诊断
 _PF_CACHE = {"t": 0.0, "data": None, "err": None}
 _PF_TTL = 300
+_PF_LOCK = _threading.Lock()
+_PF_WORKER = {"running": False}
 
 
-def _get_portfolio(refresh=False):
-    if refresh or _PF_CACHE["data"] is None or _PF_CACHE["err"] or \
-            _time.time() - _PF_CACHE["t"] > _PF_TTL:
+def _pf_stale() -> bool:
+    return (_PF_CACHE["data"] is None or _PF_CACHE["err"]
+            or _time.time() - _PF_CACHE["t"] > _PF_TTL)
+
+
+def _compute_portfolio():
+    """单飞计算持仓诊断,并发请求/预热共用一次计算。"""
+    with _PF_LOCK:
+        if not _pf_stale():
+            return _PF_CACHE
         from app.support import portfolio as pf
         try:
             _PF_CACHE["data"] = pf.diagnose()
@@ -1576,6 +1635,27 @@ def _get_portfolio(refresh=False):
             _PF_CACHE["err"] = str(e)
         _PF_CACHE["t"] = _time.time()
     return _PF_CACHE
+
+
+def _get_portfolio(refresh=False):
+    if refresh:
+        return _compute_portfolio()
+    return _PF_CACHE
+
+
+def _ensure_portfolio_worker():
+    """冷缓存时后台线程计算,页面立即返回占位并自动刷新。"""
+    if _PF_WORKER["running"] or not _pf_stale():
+        return
+    _PF_WORKER["running"] = True
+
+    def _run():
+        try:
+            _compute_portfolio()
+        finally:
+            _PF_WORKER["running"] = False
+
+    _threading.Thread(target=_run, daemon=True, name="portfolio-worker").start()
 
 
 def _pos_row_html(p) -> str:
@@ -1608,6 +1688,18 @@ def page_portfolio():
     from app.support.risk import load_portfolio
     refresh = request.args.get("refresh") == "1"
     c = _get_portfolio(refresh=refresh)
+    if c["data"] is None and not c["err"]:
+        # 冷缓存:立即返回占位页,后台线程生成,5s 后自动刷新(避免慢计算阻塞断连)
+        _ensure_portfolio_worker()
+        return _shell("portfolio", "持仓诊断",
+                      '<header><h1>💼 个性化持仓诊断</h1>'
+                      '<span class="mut">正在生成持仓诊断,请稍候…</span>'
+                      '<a class="btn" href="/portfolio?refresh=1">🔄 手动刷新</a></header>'
+                      '<div class="card"><h3>⏳ 持仓诊断计算中</h3>'
+                      '<div class="mut">逐只预测 → 三类操作方案 → 组合风控,首次计算需数秒,'
+                      '页面将自动刷新。</div></div>'
+                      '<div class="footer">持仓诊断基于历史量价 + 模型预测 + 板块归属,仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>'
+                      '<script>setTimeout(function(){location.href="/portfolio"}, 5000);</script>')
     positions = load_portfolio()
     # 名称映射: 股票走全A快照, ETF 走 ETF 快照(均带缓存)
     try:
