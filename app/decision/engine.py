@@ -834,10 +834,12 @@ def _sector_admission_adj(name: str, score: float) -> float:
 
 
 # ---------------------------------------------------------------- 3.4 风格偏转分数微调
-def _style_score_adj(style: dict, size_bias) -> float:
+def _style_score_adj(style: dict, size_bias, scale: float = 1.0) -> float:
     """风格偏转分数微调(3.4): 与当前市场风格对齐 +1~3 分,背离 -1~3 分(强度定标),单板块上限±5。
 
     强度: |大小盘动量差| 1%~3% → 1~3 分;style_confidence=low 缩放 0.5(连续一致性不足时降权)。
+    scale: 弱市(无达标主线, 板块分聚集在观察线附近)时由调用方传入 0.5,
+    避免 3 分偏转在 52-59 聚集区主导观察池归属(对齐任务约束"避免风格因素主导")。
     """
     scfg = _cfg().get("mainline", {}).get("style_adj", {})
     if not scfg.get("enabled", True) or not style:
@@ -851,7 +853,7 @@ def _style_score_adj(style: dict, size_bias) -> float:
     if str(style.get("style_confidence")) == "low":
         strength *= float(scfg.get("low_conf_scale", 0.5))
     aligned = 1 if size_bias == bias else -1
-    delta = aligned * strength
+    delta = aligned * strength * scale
     return round(max(-float(scfg.get("max_total", 5.0)),
                      min(float(scfg.get("max_total", 5.0)), delta)), 2)
 
@@ -964,6 +966,9 @@ def mainline_select() -> dict:
     style = _ml.market_style_bias() if ext_cfg else None
     style_tag = (style or {}).get("tag", "") if ext_cfg else ""
     style_thresh = float((ext_cfg.get("style") or {}).get("sort_bias_thresh", 3.0)) if ext_cfg else 0.0
+    # 弱市判定: 最高非淘汰板块评分 < 准入线 → 风格偏转降权(避免3分在低分聚集区主导)
+    _top_score = max((r.get("score") or 0) for r in rows if r.get("level") != "rejected") if rows else 0
+    _style_scale = 0.5 if _top_score < admission else 1.0
     passed, rejected, low = [], [], []
     names = [r["industry"] for r in rows if r.get("level") != "rejected"]
     stats_map = {r["industry"]: _sector_stats(r["industry"]) for r in rows} if len(rows) <= 30 else _sector_stats_many(names)
@@ -1014,9 +1019,9 @@ def mainline_select() -> dict:
             item["score"] = round(item["score"] - penalty, 2)
             item["veto_penalty"] = penalty
             item["veto_penalty_reasons"] = pen_reasons
-        # 3.4 风格偏转分数微调(与当前大小盘风格对齐 +分/背离 -分)
+        # 3.4 风格偏转分数微调(与当前大小盘风格对齐 +分/背离 -分, 弱市降权)
         if ext_cfg and style:
-            s_adj = _style_score_adj(style, r.get("size_bias", 0))
+            s_adj = _style_score_adj(style, r.get("size_bias", 0), scale=_style_scale)
             if s_adj:
                 item["score"] = round(item["score"] + s_adj, 2)
                 item["style_adj"] = s_adj

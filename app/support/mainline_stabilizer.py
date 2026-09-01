@@ -94,6 +94,7 @@ _COMPUTING = threading.Event()   # 单飞标志: 后台轮询计算中, 并发�
 _LAST_OUTPUT = {"t": 0.0, "data": None}
 _poll_thread = None
 _poll_stop = threading.Event()
+_NEAR_MARGIN = 5.0               # 观察池空态时, 距保级线多少分以内视为"边缘参考"展示
 
 
 def _mainline_cfg() -> dict:
@@ -396,12 +397,16 @@ def _build_stable(cfg: dict) -> dict:
         return {"core": None, "defensive": None, "watch": [], "rejected": [],
                 "candidate": [], "pass_score": pass_score, "degraded": True}
 
+    # 弱市判定: 最高非淘汰评分 < 准入线 → 风格偏转降权(避免3分在低分聚集区主导观察池)
+    _top_score = max((r.get("score") or 0) for r in rows if r.get("level") != "rejected") if rows else 0
+    _style_scale = 0.5 if _top_score < pass_score else 1.0
+
     zt_pool = _ml._zt_pool()
     zt_available = len(zt_pool) > 0
     names = [r["industry"] for r in rows if r.get("level") != "rejected"]
     stats_map = _en._sector_stats_many(names) if names else {}
 
-    passed, rejected, candidate, low = [], [], [], []
+    passed, rejected, candidate, low, near = [], [], [], [], []
     for r in rows:
         name = r["industry"]
         st = _SECTOR_STATE.setdefault(name, _new_state())
@@ -419,8 +424,8 @@ def _build_stable(cfg: dict) -> dict:
             continue
         # 3.1 分级扣分(软性): 净流出/涨停不足/过热 → 扣分,不否决(替代瞬时否决防抖)
         penalty, pen_reasons = _en._veto_penalty(r, dcfg, stats, zt_available=zt_available)
-        # 3.4 风格偏转分数微调(与当前大小盘风格对齐/背离)
-        s_adj = _en._style_score_adj(style, r.get("size_bias", 0)) if ext_on else 0.0
+        # 3.4 风格偏转分数微调(与当前大小盘风格对齐/背离, 弱市降权)
+        s_adj = _en._style_score_adj(style, r.get("size_bias", 0), scale=_style_scale) if ext_on else 0.0
         # 3.2 准入线动态调整(板块历史分位+波动率)
         adj = _en._sector_admission_adj(name, r["score"])
         # 第五轮:梯队变差确认(盘中炸板不立即生效,连续 N 周期才反映到分数)
@@ -493,6 +498,15 @@ def _build_stable(cfg: dict) -> dict:
                     it["score"] = score
                     it.update(_extra)
                     low.append(it)
+                elif score >= down_eff - _NEAR_MARGIN:
+                    # 边缘参考: 距观察线较近的板块, 观察池空时展示(避免页面误读为无数据)
+                    it = _mk_item(r, stats, "watch",
+                                  [f"边缘参考: 评分 {score:.2f} 距观察线 {down_eff:.0f} 以内,未达准入"],
+                                  pool=pool)
+                    it["score"] = score
+                    it["is_reference"] = True
+                    it.update(_extra)
+                    near.append(it)
 
     # ---- 池内分级(禁止跨池对比) + 同池替换防抖(3.3 阶段化超越幅度)
     aggressive = sorted([p for p in passed if p.get("pool") == "aggressive"],
@@ -541,6 +555,9 @@ def _build_stable(cfg: dict) -> dict:
     for w in watch:
         w["level"] = "watch"
     watch += low[:max(0, watch_n - len(watch))]
+    if not watch:
+        # 观察池空态: 展示接近观察线的板块作为「边缘参考」(is_reference=True), 避免页面误读为无数据
+        watch = sorted(near, key=lambda x: -x["score"])[:watch_n]
 
     # ---- 3.3 稳定器置信度(0-1): 驻留周期进度 + 相对保级线安全边际
     ccfg = cfg.get("confidence", {})
