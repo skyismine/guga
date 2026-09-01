@@ -16,6 +16,7 @@ import requests
 
 from app import config
 from app.data import patch_requests  # noqa: F401  先注入 UA 补丁
+from app.data import dal
 
 patch_requests.install()
 
@@ -180,13 +181,22 @@ def _fetch_etf_em(code: str, start: str, end: str, adjust: str) -> pd.DataFrame:
 
 
 def get_daily_history(code: str, days: int = None, adjust: str = "qfq", use_cache: bool = True) -> pd.DataFrame:
-    """获取个股日线,自动多源回退并本地缓存。返回 index=date 的 DataFrame。"""
+    """获取个股日线,自动多源回退并本地缓存。返回 index=date 的 DataFrame。
+
+    复权口径统一: 默认前复权(qfq),与全系统一致(dal.ADJUST_UNIFIED)。
+    缓存: 内存(60s,DAL 标准化 key hist:{code}:daily) → 本地文件(HIST_DIR,24h)。
+    """
     days = days or config.HIST_DAYS
     code = str(code).zfill(6)
+    _hist_key = dal.cache_key("hist", code, period="daily")
+    _need_cols = {"open", "high", "low", "close", "volume"}
     if use_cache:
+        mem = dal.mem_get(_hist_key)
+        if mem is not None and len(mem) >= days and _need_cols.issubset(mem.columns):
+            return mem
         cached = _load_cache(code, ttl=_HIST_TTL_SECONDS)
-        if (cached is not None and len(cached) >= days and
-                {"open", "high", "low", "close", "volume"}.issubset(cached.columns)):
+        if (cached is not None and len(cached) >= days and _need_cols.issubset(cached.columns)):
+            dal.mem_set(_hist_key, cached, 60)
             return cached
 
     end = dt.datetime.now().strftime("%Y%m%d")
@@ -235,16 +245,23 @@ def get_daily_history(code: str, days: int = None, adjust: str = "qfq", use_cach
 
     df = df.tail(days)
     _save_cache(code, df)
+    dal.mem_set(_hist_key, df, 60)
     return df
 
 
 # ---------------------------------------------------------------- 股票列表
 def get_stock_list() -> pd.DataFrame:
-    """全市场股票列表,优先新浪接口(稳定),东财回退。"""
+    """全市场股票列表,优先新浪接口(稳定),东财回退。缓存:内存(60s)→文件(按交易日)。"""
+    _key = dal.cache_key("stock_list", date=dal.trade_date_str())
+    hit = dal.mem_get(_key)
+    if hit is not None:
+        return hit
     cache_path = os.path.join(config.DATA_DIR, "stock_list.pkl")
     if os.path.exists(cache_path) and time.time() - os.path.getmtime(cache_path) < config.CACHE_TTL_SECONDS:
         with open(cache_path, "rb") as f:
-            return pickle.load(f)
+            df = pickle.load(f)
+        dal.mem_set(_key, df, 60)
+        return df
 
     import akshare as ak
     df = pd.DataFrame()
@@ -265,6 +282,7 @@ def get_stock_list() -> pd.DataFrame:
     df = df[df["code"].apply(is_stock)]
     with open(cache_path, "wb") as f:
         pickle.dump(df, f)
+    dal.mem_set(_key, df, 60)
     return df
 
 
@@ -296,8 +314,12 @@ _QUOTE_FIELDS = ("name", "open", "prev_close", "price", "high", "low",
 
 
 def get_spot_quote(code: str) -> Dict:
-    """实时快照(新浪行情接口,轻量快速)。"""
+    """实时快照(新浪行情接口,轻量快速)。内存缓存 30s;附 data_quality 标注。"""
     code = str(code).zfill(6)
+    _key = dal.cache_key("spot", code, date=dal.today_str())
+    hit = dal.mem_get(_key)
+    if hit is not None:
+        return hit
     symbol = code_to_symbol(code)
     resp = requests.get(_SINA_HQ.format(symbols=symbol),
                         headers={"Referer": _SINA_REFERER}, timeout=10)
@@ -314,33 +336,48 @@ def get_spot_quote(code: str) -> Dict:
             quote[k] = 0.0
     quote["pct_chg"] = (quote["price"] - quote["prev_close"]) / quote["prev_close"] if quote["prev_close"] else 0.0
     quote["datetime"] = f"{quote.get('date')} {quote.get('time')}"
+    dal.attach_quality(quote, 1.0, "sina_hq", "实时快照")
+    dal.mem_set(_key, quote, 30)
     return quote
 
 
 def get_spot_quotes(codes: List[str]) -> Dict[str, Dict]:
-    """批量实时快照。"""
-    symbols = ",".join(code_to_symbol(c) for c in codes)
-    resp = requests.get(_SINA_HQ.format(symbols=symbols),
-                        headers={"Referer": _SINA_REFERER}, timeout=10)
-    resp.encoding = "gbk"
-    result = {}
-    for line in resp.text.strip().splitlines():
-        m = re.match(r'var hq_str_(\w+)="(.*)";?', line)
-        if not m:
-            continue
-        symbol, payload = m.group(1), m.group(2)
-        if not payload:
-            continue
-        parts = payload.split(",")
-        q = dict(zip(_QUOTE_FIELDS, parts))
-        for k in ("open", "prev_close", "price", "high", "low", "volume", "amount"):
-            try:
-                q[k] = float(q[k])
-            except (TypeError, ValueError):
-                q[k] = 0.0
-        q["pct_chg"] = (q["price"] - q["prev_close"]) / q["prev_close"] if q["prev_close"] else 0.0
-        result[symbol_to_code(symbol)] = q
-    return result
+    """批量实时快照。内存缓存 30s;每条附 data_quality 标注。"""
+    codes = [str(c).zfill(6) for c in codes]
+    _today = dal.today_str()
+    out = {}
+    fresh_codes = []
+    for c in codes:
+        hit = dal.mem_get(dal.cache_key("spot", c, date=_today))
+        if hit is not None:
+            out[c] = hit
+        else:
+            fresh_codes.append(c)
+    if fresh_codes:
+        symbols = ",".join(code_to_symbol(c) for c in fresh_codes)
+        resp = requests.get(_SINA_HQ.format(symbols=symbols),
+                            headers={"Referer": _SINA_REFERER}, timeout=10)
+        resp.encoding = "gbk"
+        for line in resp.text.strip().splitlines():
+            m = re.match(r'var hq_str_(\w+)="(.*)";?', line)
+            if not m:
+                continue
+            symbol, payload = m.group(1), m.group(2)
+            if not payload:
+                continue
+            parts = payload.split(",")
+            q = dict(zip(_QUOTE_FIELDS, parts))
+            for k in ("open", "prev_close", "price", "high", "low", "volume", "amount"):
+                try:
+                    q[k] = float(q[k])
+                except (TypeError, ValueError):
+                    q[k] = 0.0
+            q["pct_chg"] = (q["price"] - q["prev_close"]) / q["prev_close"] if q["prev_close"] else 0.0
+            dal.attach_quality(q, 1.0, "sina_hq", "实时快照")
+            c = symbol_to_code(symbol)
+            out[c] = q
+            dal.mem_set(dal.cache_key("spot", c, date=_today), q, 30)
+    return out
 
 
 # ---------------------------------------------------------------- 分钟K线(触发量化)

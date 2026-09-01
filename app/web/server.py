@@ -2296,6 +2296,14 @@ def _warm_startup_cache():
         print("[预热] 今日决策缓存已就绪")
     except Exception as e:  # noqa: BLE001
         print(f"[预热] 今日决策预热失败: {e}")
+    # DAL 数据预热: 指数/市场日度/板块资金/涨跌家数(开盘前预加载当日基础数据)
+    try:
+        from app.data.dal import warmup_basic
+        _res = warmup_basic()
+        _ok = sum(1 for v in (_res.get("results") or {}).values() if v.get("ok"))
+        print(f"[预热] DAL 基础数据预热完成({_ok}/{len(_res.get('results') or {})} 模块)")
+    except Exception as e:  # noqa: BLE001
+        print(f"[预热] DAL 基础数据预热失败: {e}")
 
 
 def main():

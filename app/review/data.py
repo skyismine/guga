@@ -24,9 +24,17 @@ import pandas as pd
 import requests
 
 from app import config
+from app.data import dal
 
 # 强制直连补丁已集中到 app/__init__.py(包装 Session.__init__ 关闭 trust_env);
 # 此处不再重复设置——类属性方式会被 Session.__init__ 的实例属性覆盖而失效。
+
+# 各模块数据质量汇总: data_type -> (score, src, note);由 collect_review 汇入 data["_quality"]
+_SECT_QUALITY: dict = {}
+
+
+def _q(data_type: str, score: float, src: str, note: str = "") -> None:
+    _SECT_QUALITY[data_type] = (round(max(0.0, min(1.0, score)), 3), src, note)
 
 _REVIEW_DIR = os.path.join(config.DATA_DIR, "review")
 os.makedirs(_REVIEW_DIR, exist_ok=True)
@@ -135,38 +143,43 @@ def _sina_spot_batch(symbols) -> Dict[str, Dict]:
 
 def collect_indices(date: dt.date = None) -> list:
     """各大盘指数收盘点数/涨跌幅。优先 fuyao 官方指数快照(权威收盘口径,解决新浪滞后/抖动),
-    失败回退新浪实时(收盘后=当日收盘),再回退日线。"""
+    失败回退新浪实时(收盘后=当日收盘),再回退日线。附带 data_quality 质量汇总。"""
     # fuyao 官方指数快照优先: 上证/深成/创业板/沪深300/上证50/中证500/中证1000/科创50
     _INDEX_THS = [("000001.SH", "上证指数"), ("399001.SZ", "深证成指"), ("399006.SZ", "创业板指"),
                   ("000300.SH", "沪深300"), ("000016.SH", "上证50"), ("000905.SH", "中证500"),
                   ("000852.SH", "中证1000"), ("000688.SH", "科创50")]
+    rows = []
     try:
         from app.data.fuyao import enabled as _fy_enabled, get_index_snapshot
         if _fy_enabled():
             items = get_index_snapshot(",".join(t for t, _ in _INDEX_THS))
-            rows = []
             by_ths = {it.get("thscode"): it for it in items}   # 按 thscode 匹配(上证 ticker 是 1A0001)
             for ths, name in _INDEX_THS:
                 it = by_ths.get(ths)
                 if it and it.get("last_price") is not None:
-                    rows.append({"symbol": ths, "name": name,
-                                 "close": float(it["last_price"]),
-                                 "pct_chg": float(it.get("price_change_ratio_pct") or 0) / 100.0})
+                    rows.append(dal.with_quality(
+                        {"symbol": ths, "name": name,
+                         "close": float(it["last_price"]),
+                         "pct_chg": float(it.get("price_change_ratio_pct") or 0) / 100.0},
+                        1.0, "fuyao", "官方收盘快照"))
             if rows:
+                _q("index", 1.0, "fuyao", "官方指数快照(收盘口径)")
                 return rows
-    except Exception:  # noqa: BLE001
-        pass
+            dal.record_missing("index", False, "fuyao 指数快照为空")
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("index", False, f"fuyao 指数快照失败: {e}")
     symbols = [s for s, _ in MAJOR_INDICES]
     try:
         spots = _retry(lambda: _sina_spot_batch(symbols), n=2)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("index", False, f"新浪指数实时失败: {e}")
         spots = {}
-    rows = []
     for sym, name in MAJOR_INDICES:
         item = {"symbol": sym, "name": name}
         sp = spots.get(sym)
         if sp:
             item.update({"close": sp["price"], "pct_chg": sp["pct_chg"]})
+            item = dal.with_quality(item, 1.0, "sina_hq", "实时快照(收盘后=收盘)")
         else:
             try:
                 df = _retry(lambda: _index_daily(sym))
@@ -174,10 +187,28 @@ def collect_indices(date: dt.date = None) -> list:
                     c0 = float(df["close"].iloc[-2])
                     c1 = float(df["close"].iloc[-1])
                     item.update({"close": c1, "pct_chg": (c1 / c0 - 1)})
-            except Exception:
-                pass
+                    item = dal.with_quality(item, 0.9, "sina_daily", "日线收盘(无当日实时)")
+            except Exception as e:  # noqa: BLE001
+                dal.record_missing("index", False, f"指数日线 {sym} 失败: {e}")
         if "close" in item:
             rows.append(item)
+    if rows:
+        _q("index", 1.0, "sina", "新浪实时/日线")
+        return rows
+    # 关键数据缺失: 回退最近有效值(上证指数日线缓存)并标注降级
+    try:
+        cache = _load_cache("idx_sh000001", ttl=None)
+        if cache is not None and len(cache):
+            c1 = float(cache["close"].iloc[-1])
+            c0 = float(cache["close"].iloc[-2]) if len(cache) >= 2 else c1
+            rows = [dal.with_quality({"symbol": "sh000001", "name": "上证指数",
+                                      "close": c1, "pct_chg": (c1 / c0 - 1)},
+                                     0.4, "stale_cache", "实时/日线均失败,回退最近有效值")]
+            _q("index", 0.4, "stale_cache", "关键数据降级: 使用最近有效值,待校准")
+            dal.record_missing("index", False, "指数全景全失败,回退最近有效值(上证)")
+            return rows
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("index", False, f"指数降级回退失败: {e}")
     return rows
 
 
@@ -195,12 +226,26 @@ def _index_daily(symbol: str) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- 涨跌停 + 市场宽度
 def collect_activity() -> Dict:
-    """涨跌家数/涨停跌停家数(乐咕)。失败返回空 dict,由上层降级。"""
+    """涨跌家数/涨停跌停家数(乐咕+fuyao 实时/收盘)。失败回退最近有效值并标注降级。"""
     try:
         from app.data.market import get_market_activity
-        return _retry(lambda: get_market_activity(use_cache=True))
-    except Exception:
-        return {}
+        v = _retry(lambda: get_market_activity(use_cache=True))
+        _q("activity", 1.0, "market", "乐咕/fuyao 涨跌家数")
+        return v
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("activity", False, f"涨跌家数获取失败: {e}")
+    # 关键数据降级: 回退 market 模块最近成功快照(data_cache/market_activity.pkl)
+    try:
+        p = os.path.join(config.DATA_DIR, "market_activity.pkl")
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                stale = pickle.load(f)
+            _q("activity", 0.4, "stale_cache", "关键数据降级: 使用最近有效值,待校准")
+            dal.record_missing("activity", False, "涨跌家数降级回退最近快照")
+            return stale
+    except Exception as e2:  # noqa: BLE001
+        dal.record_missing("activity", False, f"涨跌家数降级回退失败: {e2}")
+    return {}
 
 
 # ---------------------------------------------------------------- 涨停池明细
@@ -215,9 +260,10 @@ def collect_limit_up(date: dt.date) -> Dict:
             if df is not None and len(df):
                 result.update(_summarize_zt(df))
                 result["date"] = str(d)
+                _q("limit_up", 1.0, "eastmoney", f"东财涨停池({d})")
                 return result
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            dal.record_missing("limit_up", False, f"东财涨停池 {d} 失败: {e}")
         d -= dt.timedelta(days=1)
     # P1a 兜底: 东财涨停池失败走 fuyao 官方 API(字段近似映射,炸板数缺失标注)
     try:
@@ -243,9 +289,11 @@ def collect_limit_up(date: dt.date) -> Dict:
                                 for it in sorted(items, key=lambda x: -(float(x.get("seal_money") or 0)))[:5]],
                 })
                 result["date"] = str(date)
+                _q("limit_up", 0.9, "fuyao", "东财涨停池失败,fuyao 兜底(炸板数缺失)")
                 return result
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("limit_up", False, f"fuyao 涨停池兜底失败: {e}")
+    _q("limit_up", 0.0, "-", "涨停池获取失败(近5日重试)")
     return result
 
 
@@ -339,16 +387,21 @@ def collect_sector_flow(use_cache: bool = True) -> list:
     if use_cache:
         hit = _sf_load("sector_flow", _SF_FLOW_TTL)
         if hit is not None:
+            _q("sector_flow", 1.0, "cache", "命中当日快照缓存")
             return hit
         if _sf_in_backoff("sector_flow"):  # 刚失败过,退避期内直接复用快照
             stale = _load_cache("sector_flow", ttl=None)
             if stale is not None:
+                _q("sector_flow", 0.5, "stale_cache", "退避期内复用最近快照")
                 return stale
     import akshare as ak
     try:
         df = _retry(lambda: ak.stock_fund_flow_concept(symbol="即时"), n=2, slp=0.8)
     except Exception as e:  # noqa: BLE001
-        return _sf_fallback("sector_flow", "同花顺概念资金流", e)
+        rows = _sf_fallback("sector_flow", "同花顺概念资金流", e)
+        _q("sector_flow", 0.5, "stale_cache", "实时抓取失败,回退最近快照")
+        dal.record_missing("sector_flow", False, "同花顺概念资金流失败,回退快照")
+        return rows
     df = df.rename(columns={df.columns[i]: c for i, c in enumerate(
         ["no", "industry", "index_name", "pct", "inflow", "outflow",
          "net", "num", "leader", "leader_pct", "leader_price"])})
@@ -376,6 +429,7 @@ def collect_sector_flow(use_cache: bool = True) -> list:
     rows = uniq
     rows.sort(key=lambda x: x["net_yi"], reverse=True)
     _sf_save("sector_flow", rows)
+    _q("sector_flow", 1.0, "ths", "同花顺概念资金流(即时)")
     return rows
 
 
@@ -384,16 +438,21 @@ def collect_sector_flow_5d(use_cache: bool = True) -> list:
     if use_cache:
         hit = _sf_load("sector_flow_5d", _SF_FLOW5_TTL)
         if hit is not None:
+            _q("sector_flow_5d", 1.0, "cache", "命中5日快照缓存")
             return hit
         if _sf_in_backoff("sector_flow_5d"):  # 刚失败过,退避期内直接复用快照
             stale = _load_cache("sector_flow_5d", ttl=None)
             if stale is not None:
+                _q("sector_flow_5d", 0.5, "stale_cache", "退避期内复用最近快照")
                 return stale
     import akshare as ak
     try:
         df = _retry(lambda: ak.stock_fund_flow_concept(symbol="5日排行"), n=2, slp=0.8)
     except Exception as e:  # noqa: BLE001
-        return _sf_fallback("sector_flow_5d", "同花顺5日概念资金流", e)
+        rows = _sf_fallback("sector_flow_5d", "同花顺5日概念资金流", e)
+        _q("sector_flow_5d", 0.5, "stale_cache", "实时抓取失败,回退最近快照")
+        dal.record_missing("sector_flow_5d", False, "同花顺5日概念资金流失败,回退快照")
+        return rows
     df = df.rename(columns={df.columns[i]: c for i, c in enumerate(
         ["no", "industry", "num", "index_name", "pct", "inflow", "outflow", "net"])})
     net = pd.to_numeric(df["net"], errors="coerce")
@@ -411,6 +470,7 @@ def collect_sector_flow_5d(use_cache: bool = True) -> list:
         })
     rows.sort(key=lambda x: x["net_5d_yi"], reverse=True)
     _sf_save("sector_flow_5d", rows)
+    _q("sector_flow_5d", 1.0, "ths", "同花顺5日概念资金流")
     return rows
 
 
@@ -418,26 +478,33 @@ def collect_sector_flow_5d(use_cache: bool = True) -> list:
 def collect_north(date: dt.date = None) -> Dict:
     """沪深港通北向/南向资金。注:2024 年起交易所停止披露北向单日实时净买入,
     东财该字段为 0,故以北向是否可得作标记,并保留南向作参考。单位:亿元。"""
-    import akshare as ak
-    df = _retry(lambda: ak.stock_hsgt_fund_flow_summary_em())
-    north, south = [], []
-    for _, r in df.iterrows():
-        direction = str(r.get("资金方向", ""))
-        block = str(r.get("板块", ""))
-        try:
-            net = float(r.get("成交净买额", r.get("资金净流入", 0)) or 0)
-        except (TypeError, ValueError):
-            net = 0.0
-        target = north if direction == "北向" else south if direction == "南向" else None
-        if target is not None and block:
-            target.append({"block": block, "net_yi": round(net, 2)})
-    return {
-        "north_total_yi": round(sum(b["net_yi"] for b in north), 2),
-        "north_available": any(b["net_yi"] != 0 for b in north),
-        "north_blocks": north,
-        "south_total_yi": round(sum(b["net_yi"] for b in south), 2),
-        "south_blocks": south,
-    }
+    try:
+        import akshare as ak
+        df = _retry(lambda: ak.stock_hsgt_fund_flow_summary_em())
+        north, south = [], []
+        for _, r in df.iterrows():
+            direction = str(r.get("资金方向", ""))
+            block = str(r.get("板块", ""))
+            try:
+                net = float(r.get("成交净买额", r.get("资金净流入", 0)) or 0)
+            except (TypeError, ValueError):
+                net = 0.0
+            target = north if direction == "北向" else south if direction == "南向" else None
+            if target is not None and block:
+                target.append({"block": block, "net_yi": round(net, 2)})
+        _q("north", 1.0, "eastmoney", "沪深港通资金流")
+        return {
+            "north_total_yi": round(sum(b["net_yi"] for b in north), 2),
+            "north_available": any(b["net_yi"] != 0 for b in north),
+            "north_blocks": north,
+            "south_total_yi": round(sum(b["net_yi"] for b in south), 2),
+            "south_blocks": south,
+        }
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("north", False, f"沪深港通资金流失败: {e}")
+        _q("north", 0.0, "-", "沪深港通数据缺失")
+        return {"north_total_yi": 0, "north_available": False, "north_blocks": [],
+                "south_total_yi": 0, "south_blocks": []}
 
 
 # ---------------------------------------------------------------- 大盘资金(可选)
@@ -454,8 +521,11 @@ def collect_market_fund() -> Dict:
                              "net_pct": float(pct or 0)})
             except (TypeError, ValueError):
                 continue
+        _q("market_fund", 1.0, "eastmoney", "大盘资金流")
         return {"ok": True, "rows": rows}
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("market_fund", False, f"大盘资金流失败: {e}")
+        _q("market_fund", 0.0, "-", "大盘资金流缺失")
         return {"ok": False, "rows": []}
 
 
@@ -697,6 +767,7 @@ def collect_market_daily(days: int = 10) -> List[Dict]:
                     today_row[k] = cur[k]
 
     # fuyao 官方指数快照覆盖最新一日: 两市成交额(上证+深成指成交额)与上证收盘/涨跌幅(权威口径)
+    _calibrated = False
     try:
         from app.data.fuyao import enabled as _fy_enabled, get_index_snapshot
         if _fy_enabled() and rows:
@@ -711,8 +782,19 @@ def collect_market_daily(days: int = 10) -> List[Dict]:
                     rows[-1]["pct_chg"] = float(sh.get("price_change_ratio_pct") or 0) / 100.0
             if sh and sz and sh.get("turnover") and sz.get("turnover"):
                 rows[-1]["amount_yi"] = round((float(sh["turnover"]) + float(sz["turnover"])) / 1e8, 1)
-    except Exception:  # noqa: BLE001
-        pass
+            if sh:
+                dal.mark_calibrated(rows[-1], "fuyao 收盘快照")   # 1.3 实时/历史一致性: 收盘后校准标记
+                _calibrated = True
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("market_daily", False, f"fuyao 收盘校准失败: {e}")
+
+    # 1.3 一致性: 成交额统一用 amount(元)折算亿元;量能口径仅用成交额,不用成交量
+    for _r in rows:
+        if _r.get("amount_yi") is None:
+            _r["amount_yi"] = 0
+        _r["amount_traded"] = True          # 明确字段语义: 均以成交额(元)折算
+    _q("market_daily", 1.0 if _calibrated else 0.8, "eastmoney+fuyao" if _calibrated else "eastmoney",
+       "收盘校准完成" if _calibrated else "未覆盖最新一日收盘口径")
 
     _MD_CACHE["data"] = rows
     _MD_CACHE["t"] = time.time()
@@ -731,16 +813,16 @@ def collect_events(date: dt.date = None) -> Dict:
                 "summary": str(r.get("摘要", "")),
                 "time": str(r.get("发布时间", ""))[:16],
             })
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("events_news", False, f"东财要闻失败: {e}")
     cctv = []
     try:
         dfc = _retry(lambda: ak.news_cctv(), n=2)
         for _, r in dfc.iterrows():
             cctv.append({"title": str(r.get("title", "")),
                          "date": str(r.get("date", ""))})
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("events_cctv", False, f"央视联播失败: {e}")
     # 筛选当日相关 + 关键词
     if date is not None:
         ds = str(date)
@@ -751,6 +833,8 @@ def collect_events(date: dt.date = None) -> Dict:
         hits = [k for k in _KEYWORDS if k in text]
         if hits:
             hot.append({**n, "keywords": hits})
+    _q("events", 1.0 if news or cctv else 0.0, "eastmoney+cctv",
+       "要闻/联播" if news or cctv else "事件数据缺失")
     return {"news_total": len(news), "news": news[:15], "hot": hot[:10],
             "cctv": cctv[:6]}
 
@@ -775,6 +859,9 @@ def collect_review(date: dt.date = None, use_cache: bool = True) -> Dict:
         "market_daily": collect_market_daily(20),     # 20日: 量能/情绪近20日分位(P1)
         "events": collect_events(date),
     }
+    # 1.2 数据质量: 各模块质量评分/来源/说明汇总(供页面展示与决策降级判断)
+    data["_quality"] = dal.quality_summary(_SECT_QUALITY)
+    data["_missing"] = dal.missing_stats()
     _save_cache(f"review_{date}", data)
     return data
 
