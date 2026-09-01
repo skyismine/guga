@@ -87,10 +87,7 @@ def cache_key(data_type: str, code: str = None, date: str = None, period: str = 
 
 def _file_path(key: str) -> str:
     safe = key.replace(":", "_").replace("/", "_").replace("\\", "_")
-    return os.path.join(_DAL_DIR, f"{safe}.pkl")
-
-
-# ---------------------------------------------------------------- 内存层
+    return os.path.join(_DAL_DIR, f"{safe}.pkl")# ---------------------------------------------------------------- 内存层
 def mem_get(key: str):
     with _MEM_LOCK:
         item = _MEM.get(key)
@@ -150,6 +147,116 @@ def file_set(key: str, value) -> None:
             pickle.dump(value, f)
     except OSError as e:  # noqa: BLE001
         logger.warning("文件缓存写入失败 %s: %s", key, e)
+
+
+# ---------------------------------------------------------------- 跨平台文件锁
+def file_lock(path: str):
+    """对文件加独占锁(用于并发写 JSON 存档),返回释放函数;平台无锁支持时返回 None。
+
+    优先 fcntl(Unix/Linux 服务器),回退 msvcrt(Windows),避免并发写冲突损坏存档。
+    """
+    f = None
+    try:  # Unix
+        import fcntl  # noqa: PLC0415
+        f = open(path, "a+")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        def _unlock():
+            try:
+                fcntl.flock(f, fcntl.LOCK_UN)
+            finally:
+                f.close()
+        return _unlock
+    except (ImportError, OSError):  # noqa: BLE001
+        if f is not None:
+            try:
+                f.close()
+            except OSError:  # noqa: BLE001
+                pass
+    try:  # Windows
+        import msvcrt  # noqa: PLC0415
+        f = open(path, "a+")
+        if f.tell() == 0:
+            f.write("\x00")
+            f.flush()
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        def _unlock():
+            try:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                f.close()
+        return _unlock
+    except (ImportError, OSError):  # noqa: BLE001
+        if f is not None:
+            try:
+                f.close()
+            except OSError:  # noqa: BLE001
+                pass
+    logger.warning("平台无文件锁支持,并发写存档存在冲突风险: %s", path)
+    return None
+
+
+def locked_write(path: str, text: str, encoding: str = "utf-8") -> None:
+    """加独占文件锁后原子写文本(读写同一句柄)。
+
+    注意: Windows 下 msvcrt 字节锁会阻断「另开句柄 truncate 写」,因此必须
+    在锁定句柄上直接 seek+truncate+write(否则 PermissionError 被上层吞掉,
+    留下 0 字节文件)。无锁支持平台直接写。
+    """
+    release = fh = None
+    try:  # Unix
+        import fcntl  # noqa: PLC0415
+        fh = open(path, "a+", encoding=encoding)
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        def _rel():
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            finally:
+                fh.close()
+        release = _rel
+    except (ImportError, OSError):  # noqa: BLE001
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:  # noqa: BLE001
+                pass
+            fh = None
+    if fh is None:
+        try:  # Windows
+            import msvcrt  # noqa: PLC0415
+            fh = open(path, "a+", encoding=encoding)
+            if fh.tell() == 0:
+                fh.write("\x00")
+                fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            def _rel():
+                try:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                finally:
+                    fh.close()
+            release = _rel
+        except (ImportError, OSError):  # noqa: BLE001
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:  # noqa: BLE001
+                    pass
+                fh = None
+    if fh is not None:
+        try:
+            fh.seek(0)
+            fh.truncate(0)
+            fh.write(text)
+            fh.flush()
+        finally:
+            if release:
+                release()
+    else:
+        with open(path, "w", encoding=encoding) as f:
+            f.write(text)
 
 
 # ---------------------------------------------------------------- 缺失记录/告警

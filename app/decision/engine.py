@@ -19,6 +19,7 @@ from app import config
 from app.support import settings as _st
 from app.support import mainline as _ml
 from app.support.portfolio import _one
+from app.data import dal
 from app.features.market_features import market_snapshot, fear_greed_label
 
 # ---------------------------------------------------------------- 工具
@@ -34,9 +35,21 @@ _sector_stats_cache = {}  # name -> (date, result)
 
 # 盘中量能采样存档:{date: {"HH:MM": 两市累计成交额(亿)}} —— 「相同时段」量能比的数据基础
 _VOL_ARCH_FILE = os.path.join(config.DATA_DIR, "intraday_amount.json")
-_VR_SMOOTH = []      # 大盘量能比5分钟滚动窗口 [(ts, vr)]
+_VR_SMOOTH = []      # 大盘量能比平滑窗口 [(ts, vr)](EWMA 加权,近期权重更高)
 _SEC_VR_SMOOTH = {}  # 板块量能比5分钟滚动窗口 {name: [(ts, vr)]}
 _SEC_ADJ_LAST = {}   # 板块量能修正滞回记忆 {name: (vr_used, delta)}
+_VR_TREND = {"dir": None, "count": 0}      # 大盘量能趋势(连续放量/缩量)
+
+# 2.1 环境自适应权重: 近5组权重均值平滑(5日均值口径)
+_WEIGHT_HIST = []    # [{mood,breadth,zt,vp,trend}...]
+_FG_ARCH_FILE = os.path.join(config.DATA_DIR, "fg_history.json")    # {date: 恐贪} 情绪波动判定
+
+# 2.4 评级滞回: 升级/降级阈值偏置、切换确认、单日限幅、历史存档
+_GRADE_ARCH_FILE = os.path.join(config.DATA_DIR, "grade_history.json")  # {date: grade}
+_GRADE_UP_BIAS, _GRADE_DOWN_BIAS = 5.0, 5.0   # 升级需更严(score+5)/降级需更松(score-5)
+_GRADE_CONFIRM, _GRADE_MAX_STEP = 2, 1        # 切换确认次数(盘中5分钟窗口) / 单日最多变1级
+_GRADE_ORDER = {"A": 3, "B": 2, "C": 1, "D": 0}
+_GRADE_PENDING = {"grade": None, "count": 0, "ts": 0.0}
 
 
 def _sector_stats(name: str) -> dict | None:
@@ -207,22 +220,42 @@ def phase_cfg(phase: str = None) -> dict:
 
 
 # ---------------------------------------------------------------- 第一层 大盘开仓许可评级
+def _in_trading_time(now: dt.datetime = None) -> bool:
+    """交易时段(周一~周五 9:30-15:00, 含午休; 与 fetcher.is_trading_time 口径一致)。"""
+    now = now or dt.datetime.now()
+    if now.weekday() >= 5:
+        return False
+    m = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= m <= 15 * 60
+
+
+def _session_elapsed_fraction(now: dt.datetime) -> float:
+    """当日交易进度(0~1): 上午 9:30-11:30 + 下午 13:00-15:00, 共240分钟。"""
+    m = now.hour * 60 + now.minute
+    if m <= 11 * 60 + 30:                      # 上午
+        return max(0.0, (m - (9 * 60 + 30))) / 240.0
+    return min(1.0, (120 + max(0, m - 13 * 60)) / 240.0)
+
+
 def _market_vol_ratio(rows: list, amount_yi):
     """大盘量能比 = 截至当前时段累计成交额 / 近5日相同时段平均成交额。
 
-    盘中每次计算把「时刻->累计成交额」写入本地存档,滚动积累相同时段历史,
-    取消按交易进度折算全天成交额的预测逻辑;收盘后/非交易时段直接对比
-    近5日全天均额。输出前做5分钟滚动窗口均值平滑——原始瞬时值仅用于
-    前端展示,不参与打分(抑制盘中评分高频抖动)。
+    2.3 优化:
+    - 存档写入加文件锁(dal.file_lock,跨平台),避免并发写冲突损坏存档;
+    - 平滑改用 EWMA(alpha=0.5)替代简单移动平均,近期样本权重更高;
+    - 增加量能趋势判定(连续放量/缩量),供前端与评分参考;
+    - 冷启动: 相同时段存档不足5日时,用近5日全天均额按当日交易进度折算,
+      而非直接对比全天均额(避免开盘初期被误判为大幅缩量)。
     """
     _ARCH_KEEP_DAYS = 7   # 存档保留天数(只需覆盖近5个交易日)
     _SMOOTH_SEC = 300     # 滚动平滑窗口=5分钟
+    _EWMA_ALPHA = 0.5     # EWMA 权重(近期权重更高)
     if not amount_yi:
         return None, None
     now = dt.datetime.now()
     hm = now.strftime("%H:%M")
     # 交易时段含午休(9:30-15:00):午休期间累计成交额静止,仍属「盘中口径」
-    in_session = now.weekday() < 5 and 9 * 60 + 30 <= now.hour * 60 + now.minute <= 15 * 60
+    in_session = _in_trading_time(now)
     try:
         with open(_VOL_ARCH_FILE, encoding="utf-8") as f:
             arch = json.load(f)
@@ -231,13 +264,8 @@ def _market_vol_ratio(rows: list, amount_yi):
     arch = {d: v for d, v in arch.items() if d >= (dt.date.today() - dt.timedelta(days=_ARCH_KEEP_DAYS)).isoformat()}
     if in_session:
         arch.setdefault(_today(), {})[hm] = round(float(amount_yi), 1)
-        try:
-            with open(_VOL_ARCH_FILE, "w", encoding="utf-8") as f:
-                json.dump(arch, f, ensure_ascii=False)
-        except OSError:
-            pass
-    # 分母:过去5个交易日相同时段的累计成交额(取当日存档中<=当前时刻的最近一条);
-    # 冷启动/收盘后无同时段存档时,统一回退近5日全天均额(随存档积累自动收敛)
+        dal.locked_write(_VOL_ARCH_FILE, json.dumps(arch, ensure_ascii=False))
+    # 分母:过去5个交易日相同时段的累计成交额(取当日存档中<=当前时刻的最近一条)
     samples = []
     if in_session:
         for d in sorted(k for k in arch if k < _today())[-5:]:
@@ -245,14 +273,34 @@ def _market_vol_ratio(rows: list, amount_yi):
             if earlier:
                 samples.append(earlier[-1])
     if not samples:
-        samples = [float(r["amount_yi"]) for r in rows[:-1] if r.get("amount_yi")][-5:]
-    if not samples or sum(samples) <= 0:
+        # 冷启动: 相同时段存档不足 → 近5日全天均额按当日交易进度折算
+        full = [float(r["amount_yi"]) for r in rows[:-1] if r.get("amount_yi")][-5:]
+        if not full or sum(full) <= 0:
+            return None, None
+        frac = _session_elapsed_fraction(now)
+        expected = (sum(full) / len(full)) * max(0.05, frac)
+        vr_raw = float(amount_yi) / expected if expected > 0 else None
+    else:
+        if sum(samples) <= 0:
+            return None, None
+        vr_raw = float(amount_yi) / (sum(samples) / len(samples))
+    if vr_raw is None:
         return None, None
-    vr_raw = float(amount_yi) / (sum(samples) / len(samples))
     t = time.time()
     _VR_SMOOTH[:] = [(x, v) for x, v in _VR_SMOOTH if t - x <= _SMOOTH_SEC]
     _VR_SMOOTH.append((t, vr_raw))
-    return sum(v for _, v in _VR_SMOOTH) / len(_VR_SMOOTH), vr_raw
+    # EWMA 平滑(近期权重更高),替代简单移动平均
+    ewma = None
+    for _, v in sorted(_VR_SMOOTH):
+        ewma = v if ewma is None else _EWMA_ALPHA * v + (1 - _EWMA_ALPHA) * ewma
+    vr = ewma if ewma is not None else vr_raw
+    # 量能趋势: 连续放量/缩量(供前端展示与复盘)
+    d_ = "up" if vr >= 1.05 else ("down" if vr <= 0.95 else "flat")
+    if _VR_TREND["dir"] == d_:
+        _VR_TREND["count"] += 1
+    else:
+        _VR_TREND["dir"], _VR_TREND["count"] = d_, 1
+    return round(vr, 3), round(vr_raw, 3)
 
 
 def _volume_price_score(vr, pct_chg):
@@ -271,58 +319,232 @@ def _volume_price_score(vr, pct_chg):
     return round(_FULL * (_DN_HEAVY if vr >= 1.0 else _DN_MILD), 2)
 
 
-def _trend_score(closes):
-    """趋势强度分(0~20分)=中性基准10 + 20日涨跌幅(±6) + 均线多空排列(±4)。
+def _trend_score(closes, amounts=None):
+    """趋势强度分(0~20), 0 基准完全由趋势强度驱动(2.2)。
 
-    用20日慢趋势对冲恐贪情绪的高频波动:趋势向上高分、震荡中性、破位低分,
-    稳定大盘评级,避免单日情绪脉冲导致 A/D 级反复切换。返回 (得分, 说明)。
+    维度(合计权重): 20日涨跌幅(±6) + 均线排列强度(±5, MA5/10/20/60 对级)
+      + 20日均线斜率(±3) + 量能配合(±2, 上涨放量确认/下跌放量确认) 
+      + 持续性(±2, 连续站上/跌破20日均线) + 过度偏离惩罚(0~-3, 回归风险)。
+    映射: signed∈[-20,20] → [0,20], 中性≈10(无固定基准)。
     """
-    _BASE, _RET_PTS, _ALIGN_PTS = 10.0, 6.0, 4.0
-    _RET_SPAN = 0.08  # 20日涨跌幅 ±8% 打满 ±6 分
     vals = [float(x) for x in (closes or []) if x]
     if len(vals) < 21:
-        return _BASE, "数据不足,按中性计"
+        return 10.0, "数据不足,按中性计"
     ret20 = vals[-1] / vals[-21] - 1
-    ma5, ma20 = sum(vals[-5:]) / 5.0, sum(vals[-20:]) / 20.0
-    if vals[-1] > ma5 > ma20:
-        align, tag = _ALIGN_PTS, "多头排列"
-    elif vals[-1] < ma5 < ma20:
-        align, tag = -_ALIGN_PTS, "空头排列"
-    else:
-        align, tag = 0.0, "均线纠缠"
-    pts = _BASE + _RET_PTS * max(-1.0, min(1.0, ret20 / _RET_SPAN)) + align
-    return round(max(0.0, min(20.0, pts)), 1), f"20日{ret20:+.1%},{tag}"
+    ma5 = sum(vals[-5:]) / 5.0
+    ma10 = sum(vals[-10:]) / 10.0
+    ma20 = sum(vals[-20:]) / 20.0
+    ma60 = sum(vals[-60:]) / 60.0 if len(vals) >= 60 else ma20
+    # 均线多头/空头排列强度(0~3 对)
+    bull = (ma5 > ma10) + (ma10 > ma20) + (ma20 > ma60)
+    bear = (ma5 < ma10) + (ma10 < ma20) + (ma20 < ma60)
+    align = 5.0 * (bull - bear) / 3.0
+    # 20日均线斜率(近5日 ma20 变化, 归一 ±3)
+    slope_raw = (ma20 - sum(vals[-25:-20]) / 5.0) / ma20 if len(vals) >= 25 else 0.0
+    slope = 3.0 * max(-1.0, min(1.0, slope_raw * 20))
+    # 量能配合(用成交额近似,口径同 1.3: 只看成交额不看成交量)
+    vp = 0.0
+    amts = [float(x) for x in (amounts or []) if x]
+    if len(amts) >= 6:
+        base = sum(amts[-6:-1]) / 5.0
+        if base > 0:
+            amt_ratio = amts[-1] / base
+            if amt_ratio >= 1.05:
+                vp = 2.0 if ret20 > 0 else -2.0      # 放量确认当前趋势方向
+            elif amt_ratio <= 0.9:
+                vp = -1.0 if ret20 > 0 else 1.0      # 缩量: 涨缩量弱/跌缩量抛压衰竭
+            else:
+                vp = 0.5
+    # 持续性: 连续站上/跌破20日均线天数
+    above = [1 if v > ma20 else 0 for v in vals]
+    streak = 0
+    for v in reversed(above):
+        if v == above[-1]:
+            streak += 1
+        else:
+            break
+    persist = 2.0 * min(1.0, streak / 10.0) * (1 if above[-1] else -1)
+    # 过度偏离惩罚(远离20日均线→均值回归风险)
+    dev = vals[-1] / ma20 - 1
+    dev_pen = -3.0 * min(1.0, max(0.0, abs(dev) - 0.10) / 0.10) if abs(dev) > 0.10 else 0.0
+    signed = (6.0 * max(-1.0, min(1.0, ret20 / 0.08)) + align + slope + vp + persist + dev_pen)
+    score = round(max(0.0, min(20.0, (signed + 20) / 2)), 1)
+    note = (f"20日{ret20:+.1%},{'多头' if above[-1] else '空头'}持续{streak}日,"
+            f"斜率{slope:+.1f},偏离{dev:+.1%}")
+    return score, note
 
 
-def _market_score(fg, adv_ratio, zt, vp, trend) -> float:
-    """大盘评分(总分固定100)=恐贪30+宽度25+涨停20+量价配合5+趋势强度20。
+def _fg_series(fg) -> list:
+    """恐贪历史(近10个自然日), 每日存最新值; 用于情绪波动判定(2.1 情绪市)。"""
+    try:
+        with open(_FG_ARCH_FILE, encoding="utf-8") as f:
+            arch = json.load(f)
+    except Exception:  # noqa: BLE001
+        arch = {}
+    if fg is not None:
+        arch[_today()] = round(float(fg), 1)
+        dal.locked_write(_FG_ARCH_FILE, json.dumps(arch, ensure_ascii=False))
+    return [float(v) for _, v in sorted(arch.items())][-10:]
 
-    权重直接固化,不读外部配置;恐贪从40降至30并新增趋势20分,
-    以慢变量稳定评级。vp/trend 缺失时按中性值计入,不中断打分。
+
+def _adaptive_weights(fg_hist: list, closes: list) -> dict:
+    """环境自适应评分权重(2.1)。
+
+    - 趋势市(20日涨跌幅| |>5%): trend 30 / mood 20
+    - 震荡市(20日涨跌幅| |<2%): breadth 35 / trend 10
+    - 情绪市(恐贪波动率>20):   mood 35 / vp 0(显式清零)
+    近5组权重均值平滑 + 单维度±50%限幅(显式清零维度除外) + 归一化总分100。
     """
-    _W_MOOD, _W_BREADTH, _W_ZT, _W_VP, _W_TREND = 30.0, 25.0, 20.0, 5.0, 20.0
+    _BASE = {"mood": 30.0, "breadth": 25.0, "zt": 20.0, "vp": 5.0, "trend": 20.0}
+    _SMOOTH_N, _LIMIT = 5, 0.5
+    w = dict(_BASE)
+    mode = "neutral"
+    if closes and len(closes) >= 21:
+        ret20 = float(closes[-1]) / float(closes[-21]) - 1
+        if abs(ret20) > 0.05:
+            mode = "trend"
+        elif abs(ret20) < 0.02:
+            mode = "range"
+    mood_vol = 0.0
+    if fg_hist and len(fg_hist) >= 5:
+        m = sum(fg_hist) / len(fg_hist)
+        mood_vol = (sum((v - m) ** 2 for v in fg_hist) / len(fg_hist)) ** 0.5
+    if mode == "trend":
+        w["trend"], w["mood"] = 30.0, 20.0
+    elif mode == "range":
+        w["breadth"], w["trend"] = 35.0, 10.0
+    zero_keys = set()
+    if mood_vol > 20:                       # 情绪市: 恐贪权重提升、量价归零(显式规则)
+        w["mood"], w["vp"] = 35.0, 0.0
+        zero_keys.add("vp")
+    w["mode"] = mode
+    # 5组权重均值平滑(当日重复调用稳定,避免单次环境抖动引发权重跳变)
+    _WEIGHT_HIST.append(dict(w))
+    if len(_WEIGHT_HIST) > _SMOOTH_N:
+        _WEIGHT_HIST.pop(0)
+    keys = ("mood", "breadth", "zt", "vp", "trend")
+    if len(_WEIGHT_HIST) > 1:
+        avg = {k: sum(h[k] for h in _WEIGHT_HIST) / len(_WEIGHT_HIST) for k in keys}
+        w.update(avg)
+    # 单维度 ±50% 限幅(显式清零的维度保持 0)
+    for k in keys:
+        if k in zero_keys:
+            w[k] = 0.0
+            continue
+        w[k] = max(_BASE[k] * (1 - _LIMIT), min(_BASE[k] * (1 + _LIMIT), w[k]))
+    tot = sum(w[k] for k in keys) or 100.0
+    for k in keys:
+        w[k] = round(w[k] / tot * 100, 1)
+    w["mode"] = mode
+    return w
+
+
+def _market_score(fg, adv_ratio, zt, vp, trend, weights: dict = None) -> float:
+    """大盘评分(总分固定100)=恐贪+宽度+涨停+量价配合+趋势强度。
+
+    权重默认 30/25/20/5/20,由 _adaptive_weights 按市场环境动态调整(2.1);
+    vp/trend 缺失时按中性值计入,不中断打分。
+    """
+    w = weights or {"mood": 30.0, "breadth": 25.0, "zt": 20.0, "vp": 5.0, "trend": 20.0}
     s = 0.0
     if fg is not None:
-        s += max(0.0, min(float(fg), 100.0)) / 100.0 * _W_MOOD
+        s += max(0.0, min(float(fg), 100.0)) / 100.0 * w["mood"]
     if adv_ratio is not None:
-        s += min(max(float(adv_ratio), 0.0), 2.0) / 2.0 * _W_BREADTH
+        s += min(max(float(adv_ratio), 0.0), 2.0) / 2.0 * w["breadth"]
     if zt is not None:
-        s += min(max(int(zt), 0), 80) / 80.0 * _W_ZT
-    s += vp if vp is not None else _W_VP * 0.6          # 量价分缺失按中性60%计
-    s += trend if trend is not None else _W_TREND / 2.0  # 趋势分缺失按中性50%计
+        s += min(max(int(zt), 0), 80) / 80.0 * w["zt"]
+    s += vp if vp is not None else w["vp"] * 0.6          # 量价分缺失按中性60%计
+    s += trend if trend is not None else w["trend"] / 2.0  # 趋势分缺失按中性50%计
     return round(min(s, 100.0), 1)
 
 
-def _grade(score, zt, adv_ratio, rules) -> str:
+def _grade_raw(score, zt, adv_ratio, rules, bias: float = 0.0) -> str:
+    """评级原始判定(A/B/C/D)。bias>0 更严(升级用), bias<0 更松(降级用)。"""
     if zt is None:
         zt = 0
-    if score >= rules["score_full"] and zt >= rules["zt_full"] and adv_ratio >= rules["adv_ratio_full"]:
+    ar = adv_ratio if adv_ratio is not None else -1.0     # 缺失按最差计(防 None 比较异常)
+    if score >= rules["score_full"] + bias and zt >= rules["zt_full"] and ar >= rules["adv_ratio_full"]:
         return "A"
-    if score >= rules["score_ok"] and zt >= rules["zt_ok"] and adv_ratio >= rules["adv_ratio_ok"]:
+    if score >= rules["score_ok"] + bias and zt >= rules["zt_ok"] and ar >= rules["adv_ratio_ok"]:
         return "B"
     if score >= rules["score_hold"] or zt >= rules["zt_hold"]:
         return "C"
     return "D"
+
+
+def _load_last_grade() -> tuple:
+    """读取最近一次评级存档(优先当日,否则最近一天)。返回 (grade, arch)。"""
+    try:
+        with open(_GRADE_ARCH_FILE, encoding="utf-8") as f:
+            arch = json.load(f)
+    except Exception:  # noqa: BLE001
+        return None, {}
+    if _today() in arch:
+        return arch[_today()], arch
+    return (arch[sorted(arch.keys())[-1]] if arch else None), arch
+
+
+def _grade(score, zt, adv_ratio, rules) -> tuple:
+    """评级滞回(2.4): 抑制 A→B→A 式频繁切换。
+
+    - 滞回: 升级用更严阈值(bias=+5), 降级用更松阈值(bias=-5);
+    - 切换确认: 盘中需连续 _GRADE_CONFIRM 次(5分钟窗口)满足, 收盘后单次即定;
+    - 单日最多变化1级(限幅);
+    - 切换/维持输出明确原因, 供复盘; 当日评级持久化到 grade_history.json。
+    """
+    raw = _grade_raw(score, zt, adv_ratio, rules, bias=0.0)
+    last, arch = _load_last_grade()
+    change_reason = None
+    today = _today()
+
+    if last is None or last == raw:
+        grade = raw
+        _GRADE_PENDING.update({"grade": None, "count": 0, "ts": 0.0})
+    else:
+        order = _GRADE_ORDER
+        lv, rv = order.get(last, 1), order.get(raw, 1)
+        # 单日限幅: 向 raw 方向最多变化1级
+        if abs(rv - lv) > _GRADE_MAX_STEP:
+            direction = 1 if rv > lv else -1
+            raw = [g for g, o in order.items() if o == lv + direction][0]
+            rv = order[raw]
+        if raw == last:
+            grade = last
+        else:
+            # 滞回判定: 升级需更严(bias>0)/降级需更松(bias<0)
+            if rv > lv:
+                cand = _grade_raw(score, zt, adv_ratio, rules, bias=_GRADE_UP_BIAS)
+                justified = order[cand] > lv
+            else:
+                cand = _grade_raw(score, zt, adv_ratio, rules, bias=-_GRADE_DOWN_BIAS)
+                justified = order[cand] < lv
+            if not justified:
+                grade = last
+                change_reason = (f"滞回: 未满足「{'升级' if rv > lv else '降级'}」确认阈值"
+                                 f"(需更{'严' if rv > lv else '松'}边界),维持 {last}")
+                _GRADE_PENDING.update({"grade": None, "count": 0, "ts": 0.0})
+            elif not _in_trading_time():
+                grade = raw
+                change_reason = f"评级切换 {last}→{raw}(收盘口径确认)"
+            else:
+                # 盘中 5 分钟滚动窗口确认
+                now = time.time()
+                if _GRADE_PENDING["grade"] == raw and now - _GRADE_PENDING["ts"] <= 300:
+                    _GRADE_PENDING["count"] += 1
+                else:
+                    _GRADE_PENDING.update({"grade": raw, "count": 1, "ts": now})
+                if _GRADE_PENDING["count"] >= _GRADE_CONFIRM:
+                    grade = raw
+                    change_reason = f"评级切换 {last}→{raw}(5分钟窗口连续确认)"
+                    _GRADE_PENDING.update({"grade": None, "count": 0, "ts": 0.0})
+                else:
+                    grade = last
+                    change_reason = f"评级切换待确认 {last}→{raw}({_GRADE_PENDING['count']}/{_GRADE_CONFIRM})"
+
+    # 持久化当日评级
+    arch[today] = grade
+    dal.locked_write(_GRADE_ARCH_FILE, json.dumps(arch, ensure_ascii=False))
+    return grade, change_reason
 
 
 def market_permit() -> dict:
@@ -339,20 +561,26 @@ def market_permit() -> dict:
         adv_ratio = adv / dec if dec else None
     amount_yi = None
     vol_ratio = vol_raw = vp = trend = trend_note = None
+    closes = amounts = None
     try:
         from app.review.data import collect_market_daily
         rows = collect_market_daily(30)  # 30行:趋势分需21日收盘序列
         if rows:
             amount_yi = rows[-1].get("amount_yi")
-            # 量能比:相同时段对比 + 5分钟滚动平滑;量价配合分绑定大盘涨跌方向
+            # 量能比:相同时段对比 + EWMA 平滑;量价配合分绑定大盘涨跌方向
             vol_ratio, vol_raw = _market_vol_ratio(rows, amount_yi)
             vp = _volume_price_score(vol_ratio, rows[-1].get("pct_chg"))
-            trend, trend_note = _trend_score([r.get("close") for r in rows])
+            closes = [r.get("close") for r in rows]
+            amounts = [r.get("amount_yi") for r in rows]
+            trend, trend_note = _trend_score(closes, amounts)
     except Exception:  # noqa: BLE001
         pass
 
-    score = _market_score(fg, adv_ratio, zt, vp, trend)
-    grade = _grade(score, zt, adv_ratio, rules)
+    # 2.1 环境自适应权重(趋势市/震荡市/情绪市 → 动态权重, 5日均值平滑)
+    weights = _adaptive_weights(_fg_series(fg), closes)
+    score = _market_score(fg, adv_ratio, zt, vp, trend, weights)
+    # 2.4 评级滞回(升级更严/降级更松 + 切换确认 + 单日限幅)
+    grade, grade_change = _grade(score, zt, adv_ratio, rules)
     # 阶段全局判定(评级+情绪+量能+连板), 总仓位上限动态化为分阶段上限(全系统天花板)
     phase = _phase_from_permit({"grade": grade, "fear_greed": fg,
                                 "vol_ratio": vol_ratio, "limit_up": zt})
@@ -366,9 +594,10 @@ def market_permit() -> dict:
                        "ok": adv_ratio is not None and adv_ratio >= rules["adv_ratio_full"],
                        "ok_min": adv_ratio is not None and adv_ratio >= rules["adv_ratio_ok"]},
     }
+    _W_MODE_TAG = {"trend": "趋势市", "range": "震荡市", "neutral": "中性市"}
     reasons = []
     if fg is not None:
-        reasons.append(f"恐贪指数 {fg:.0f} 分({fear_greed_label(fg)}),贡献评分 {fg / 100 * 30:.0f}/30")
+        reasons.append(f"恐贪指数 {fg:.0f} 分({fear_greed_label(fg)}),贡献评分 {fg / 100 * weights['mood']:.0f}/{weights['mood']:.0f}")
     else:
         reasons.append("恐贪指数数据缺失,暂按中性计入")
     if adv_ratio is not None:
@@ -379,11 +608,16 @@ def market_permit() -> dict:
         reasons.append(f"两市成交额 {amount_yi:,.0f} 亿")
     if vol_ratio is not None:
         tag = "放量" if vol_ratio >= 1.05 else ("缩量" if vol_ratio <= 0.95 else "平量")
+        tag += f",连续{_VR_TREND['count']}次{'放量' if _VR_TREND['dir']=='up' else ('缩量' if _VR_TREND['dir']=='down' else '平量')}" if _VR_TREND["dir"] else ""
         reasons.append(f"量能比 {vol_ratio:.2f}({tag},对比近5日)"
                        + (f",量价配合分 {vp}/5" if vp is not None else ""))
     if trend is not None:
         reasons.append(f"趋势强度 {trend}/20({trend_note})")
+    reasons.append(f"权重模式: {_W_MODE_TAG.get(weights['mode'], weights['mode'])}(恐贪{weights['mood']:.0f}/宽度{weights['breadth']:.0f}/"
+                   f"涨停{weights['zt']:.0f}/量价{weights['vp']:.0f}/趋势{weights['trend']:.0f})")
     reasons.append(f"大盘综合评分 {score},达 {grade} 级标准,当前市场阶段「{pcfg['label']}」总仓位上限 {cap:.0%}")
+    if grade_change:
+        reasons.append(grade_change)
     return {
         "grade": grade,
         "grade_label": {"A": "A级·积极配置", "B": "B级·谨慎配置",
@@ -393,6 +627,10 @@ def market_permit() -> dict:
         "limit_up": zt, "advance": adv, "decline": dec, "adv_ratio": adv_ratio,
         "amount_yi": amount_yi, "vol_ratio": vol_ratio, "vol_ratio_raw": vol_raw,
         "vp_score": vp, "trend_score": trend, "checks": checks, "reasons": reasons,
+        "weights": {k: weights[k] for k in ("mood", "breadth", "zt", "vp", "trend")},
+        "weight_mode": weights.get("mode"),
+        "vol_trend": {"dir": _VR_TREND["dir"], "count": _VR_TREND["count"]},
+        "grade_change": grade_change,
         "market_phase": phase,
         "phase_label": pcfg["label"],
         "operation_keynote": pcfg["keynote"],
