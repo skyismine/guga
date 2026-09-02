@@ -37,6 +37,15 @@ _ZT_MIN_COUNT_AGE = 2 * 60        # 半截缓存超 2 分钟即强制重抓
 _SPOT_TTL_SECONDS = 5 * 60        # 盘中缓存 5 分钟
 
 
+def _fault(e: BaseException, note: str = ""):
+    """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默; 保持原降级语义)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("mainline", note or "处理降级(按缺省继续)", exc=e)
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
+
+
 def _is_trading_now(now=None) -> bool:
     """当前是否处于交易时段(工作日 9:30-11:30 / 13:00-15:00)。"""
     import datetime as _dt
@@ -375,8 +384,8 @@ def _ths_heat_mentions() -> dict:
             from app.data.fuyao import get_skyrocket_list
             sk = get_skyrocket_list("day")[:20]
             _bump([str(x.get("ticker", ""))[-6:] for x in sk if x.get("ticker")], [])
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
         an = get_anomaly_analysis_list()[:20]
         _bump([str(x.get("thscode", ""))[-6:] for x in an if x.get("thscode")],
               [k for x in an for k in (x.get("keyword_list") or [])])
@@ -823,8 +832,8 @@ def _market_grade() -> str:
     try:
         from app.decision.engine import market_permit
         grade = market_permit().get("grade", "B")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     _grade_cache["date"] = _today()
     _grade_cache["grade"] = grade
     return grade
@@ -969,8 +978,8 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
     fg = 50.0
     try:
         fg = float((market_snapshot() or {}).get("market", {}).get("market_fear_greed") or 50)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     zt = _zt_pool()
     zt_set = {z["code"] for z in zt}
     zt_cnt = {f["industry"]: len(set(_concept_cons(f["industry"], allow_net=False)) & zt_set)

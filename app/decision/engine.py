@@ -22,6 +22,15 @@ from app.support.portfolio import _one
 from app.data import dal
 from app.features.market_features import market_snapshot, fear_greed_label
 
+def _fault(e: BaseException, note: str = ""):
+    """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默; 保持原降级语义)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("engine", note or "处理降级(按缺省继续)", exc=e)
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
+
+
 # ---------------------------------------------------------------- 工具
 def _cfg():
     return _st.load().get("decision", {})
@@ -92,8 +101,8 @@ def _sector_stats_uncached(name: str) -> dict | None:
                         out["volume_ratio"] = 1.0
                         out["volume_ratio_filled"] = "history_mean"
             return out
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     return None
 
 
@@ -645,8 +654,8 @@ def market_permit() -> dict:
             closes = [r.get("close") for r in rows]
             amounts = [r.get("amount_yi") for r in rows]
             trend, trend_note = _trend_score(closes, amounts)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
 
     # 2.1 环境自适应权重(趋势市/震荡市/情绪市 → 动态权重, 5日均值平滑)
     weights = _adaptive_weights(_fg_series(fg), closes, amounts)
@@ -699,8 +708,8 @@ def market_permit() -> dict:
             _dq, _dq_note = 0.55, f"行情日期滞后(快照 {_mdate},今日 {_today_s})"
         elif fg is None or adv_ratio is None or amount_yi is None:
             _dq, _dq_note = 0.65, "关键维度缺失(恐贪/涨跌家数/成交额)"
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     if _dq < 0.8:
         reasons.append(f"数据质量 {_dq:.2f}:{_dq_note}")
     out = {
@@ -1077,8 +1086,8 @@ def mainline_select() -> dict:
     # 3.2 板块评分历史存档(每日覆盖,供准入线历史分位调整)
     try:
         _record_sector_scores(rows)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     # 大盘环境联动:量能修正幅度随大盘评级缩放(A/B/C-D -> 100%/80%/50%)
     try:
         mkt_grade = market_permit().get("grade")
@@ -1393,8 +1402,8 @@ def _adjust_signal(item: dict, sector_level: str) -> dict:
                     _adj(int(fund.get("up", 1)), "近3日资金连续流入(连续收涨)")
                 elif len(rets) == 3 and float(rets.max()) < 0:
                     _adj(int(fund.get("down", -1)), "近3日资金连续流出(连续收跌)")
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
 
     # 累计修正限幅 ±max_delta 档
     b_idx = _SIGNAL_RANK.get(base, 0)
@@ -1452,8 +1461,8 @@ def _tech_indicators(df) -> dict:
         if sd.notna().iloc[-1] and float(sd.iloc[-1]) > 0:
             out["bb_pos"] = round(float((c.iloc[-1] - (ma20.iloc[-1] - 2 * sd.iloc[-1]))
                                         / max(4 * float(sd.iloc[-1]), 1e-9)), 2)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     return out
 
 
@@ -1484,8 +1493,8 @@ def _ensemble_vote(tech: dict, pred: dict) -> dict:
     try:
         _g = market_permit().get("grade")
         env_dir = 1 if _g in ("A", "B") else (-1 if _g in ("C", "D") else 0)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     votes.append(("ENV", env_dir, 0.2))
     wsum = sum(w for _, d, w in votes if d != 0)
     ssum = sum(d * w for _, d, w in votes)
@@ -1533,8 +1542,8 @@ def _predict_one(code, predictor, quotes, market):
             if (tmc.get("model_monitor") or {}).get("enabled"):
                 from app.support import model_monitor as _mm
                 _mm.record(code, out)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
         from app.support import fault as _flt
         _flt.record_success("model.predict")
         return out
@@ -2372,8 +2381,8 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     try:
         from app.support import decision_tracker as _dt
         _dt.record({"date": p1["date"], "layers": layers, "plans": plans})
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     _flt.info("decision", "决策链路完成", trace_id=trace_id,
               context={"plans_ok": {s: [r for r, p in (seg or {}).items() if p and p.get("ok")]
                                     for s, seg in plans.items()},

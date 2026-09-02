@@ -23,6 +23,15 @@ _SINA_REFERER = "https://finance.sina.com.cn"
 _INTRADAY_TTL = 60
 
 
+def _fault(e: BaseException, note: str = ""):
+    """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默; 保持原降级语义)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("market", note or "处理降级(按缺省继续)", exc=e)
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
+
+
 def _is_trading_time(now=None) -> bool:
     """是否在交易日(周一~周五 9:30-15:00 连续,含午休)。
 
@@ -122,8 +131,8 @@ def get_two_market_amount() -> Optional[float]:
         sz = get_index_spot("sz399001")
         if sh.get("amount") and sz.get("amount"):
             return sh["amount"] + sz["amount"]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     return None
 
 

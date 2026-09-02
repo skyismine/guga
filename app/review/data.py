@@ -33,6 +33,15 @@ from app.data import dal
 _SECT_QUALITY: dict = {}
 
 
+def _fault(e: BaseException, note: str = ""):
+    """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默; 保持原降级语义)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("review.data", note or "处理降级(按缺省继续)", exc=e)
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
+
+
 def _q(data_type: str, score: float, src: str, note: str = "") -> None:
     _SECT_QUALITY[data_type] = (round(max(0.0, min(1.0, score)), 3), src, note)
 
@@ -364,8 +373,8 @@ def _sf_load(key: str, ttl: int) -> Optional[list]:
 def _sf_save(key: str, rows: list) -> None:
     try:
         _save_cache(key, rows)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
 
 
 def _sf_fallback(key: str, src: str, err) -> list:
@@ -693,8 +702,8 @@ def collect_market_daily(days: int = 10) -> List[Dict]:
                     for rr in rows_from_hist:
                         if rr["date"] == dt.date.today().isoformat():
                             rr["amount_yi"] = round(amt / 1e8, 1)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _e:  # noqa: BLE001
+                _fault(_e)
             _MD_CACHE["data"] = rows_from_hist
             _MD_CACHE["t"] = time.time()
             return rows_from_hist

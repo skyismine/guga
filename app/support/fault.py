@@ -32,6 +32,9 @@ _GLOBAL_TRIP = {"open": False, "until": 0.0}
 # 数据质量聚合: src -> {sum, n, recent(滚动窗口)}
 _QUALITY: dict = {}
 _QUALITY_WINDOW = 50
+# 模块异常统计: module -> {"error": n, "warning": n, "recent": [(ts, level, msg), ...]}
+_EXC_COUNT: dict = {}
+_EXC_WINDOW = 100
 _ALERT_HOOK = None      # 可注入告警回调(webhook/邮件), 默认仅日志
 
 _CB_FAIL_THRESHOLD = 5      # 连续失败次数(可由 settings.system 覆盖)
@@ -76,7 +79,7 @@ def _log_file(module: str) -> str:
 
 def log(module: str, level: str, message: str, trace_id: str = None,
         context: dict = None, exc: BaseException = None) -> None:
-    """写一条结构化 JSON 日志(线程安全, 追加写)。"""
+    """写一条结构化 JSON 日志(线程安全, 追加写); ERROR/WARNING 计入模块异常统计。"""
     entry = {
         "ts": _ts(),
         "module": module,
@@ -89,6 +92,15 @@ def log(module: str, level: str, message: str, trace_id: str = None,
         entry["error_type"] = type(exc).__name__
         entry["error"] = str(exc)
         entry["stack"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-4000:]
+    if level in ("ERROR", "WARNING"):
+        st = _EXC_COUNT.setdefault(str(module), {"error": 0, "warning": 0, "recent": []})
+        if level == "ERROR":
+            st["error"] += 1
+        else:
+            st["warning"] += 1
+        st["recent"].append((_ts(), level, str(message)[:120]))
+        if len(st["recent"]) > _EXC_WINDOW:
+            st["recent"].pop(0)
     try:
         with _LOCK:
             with open(_log_file(module), "a", encoding="utf-8") as f:
@@ -211,7 +223,8 @@ def global_health() -> dict:
                     "opens": st["opens"], "last_error": st["last_error"]}
                 for m, st in _CB.items()},
             "threshold": thr, "open_minutes": mins,
-            "quality": quality_health()}
+            "quality": quality_health(),
+            "exceptions": exceptions_health()}
 
 
 def guarded(module: str, fn, fallback=None, trace_id: str = None, context: dict = None):
@@ -261,6 +274,21 @@ def quality_health() -> dict:
             warning("quality", f"数据源 {src} 质量分趋势下降 {trend:+.3f},请关注",
                     context={"avg": round(avg, 3), "samples": st["n"]})
         out[src] = {"avg": round(avg, 3), "samples": st["n"], "trend": trend}
+    return out
+
+
+def exceptions_health() -> dict:
+    """各模块异常统计(ERROR/WARNING 计数 + 最近异常摘要), 供健康面板监控。"""
+    out = {}
+    for mod, st in _EXC_COUNT.items():
+        err, warn = st["error"], st["warning"]
+        total = err + warn
+        rate = round(err / total, 3) if total else 0.0
+        if err > 20 and rate > 0.5:
+            warning("fault", f"模块 {mod} 异常率偏高({err}/{total}),请检查",
+                    context={"errors": err, "warnings": warn})
+        out[mod] = {"errors": err, "warnings": warn, "total": total, "error_rate": rate,
+                    "recent": st["recent"][-5:]}
     return out
 
 

@@ -15,6 +15,15 @@ import requests
 from app.support import settings as _st
 
 
+def _fault(e: BaseException, note: str = ""):
+    """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默; 保持原降级语义)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("fuyao", note or "处理降级(按缺省继续)", exc=e)
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
+
+
 def _cfg() -> dict:
     return _st.load().get("fuyao") or {}
 
@@ -98,14 +107,14 @@ def _get(path: str, params: dict = None, ttl: int = 0):
                 _flt.record_failure("fuyao.api", f"{path}: {msg}")
                 _flt.warning("fuyao", f"接口限流,进入冷却 {_cfg().get('cooldown_sec', 60)}s",
                              context={"path": path, "code": data.get("code"), "message": msg})
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _e:  # noqa: BLE001
+                _fault(_e)
         raise RuntimeError(f"fuyao {path} 业务错误 code={data.get('code')}: {msg}")
     try:
         from app.support import fault as _flt
         _flt.record_success("fuyao.api")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e)
     with _LOCK:
         _CACHE[key] = {"t": time.time(), "v": data.get("data")}
     return data.get("data")
