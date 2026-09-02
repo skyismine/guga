@@ -232,6 +232,7 @@ DEFAULTS = {
             "price": True, "sector": True, "mood": True,
             "signal": True, "volume": True,
         },
+        "dynamic_stop": {"enabled": True},   # 动态止损盘中跟踪(浮盈跨档建议上移/跌破当前止损预警, 只上移不下移)
         "sector_net_yi": 5.0,    # 板块 10 分钟净流入阈值(亿)
         "sector_pct": 2.0,       # 板块涨幅阈值(%)
         "fg_extreme_low": 20,    # 恐贪极值(<=)
@@ -440,12 +441,12 @@ DEFAULTS = {
                 "def_etf": {"atr": 1.0, "pct": 0.03},
                 "repair": {"atr": 1.2, "pct": 0.04},
             },
-            "dynamic_stop": {          # 5.1 动态止损阶梯(浮盈阈值)
+            "dynamic_stop": {          # 5.1 动态止损阶梯(按标的类型差异化; 波动越大阈值/回撤越大)
                 "enabled": True,
-                "breakeven_pct": 0.05,  # 浮盈5% → 保本止损
-                "lock_pct": 0.10,       # 浮盈10% → 止损上移至浮盈5%
-                "trail_pct": 0.20,      # 浮盈20% → 跟踪止损(最高价回撤8%)
-                "trail_drawdown": 0.08,
+                "mood":   {"breakeven_pct": 0.08, "lock_pct": 0.15, "trail_pct": 0.25, "trail_drawdown": 0.10},
+                "mid":    {"breakeven_pct": 0.05, "lock_pct": 0.10, "trail_pct": 0.20, "trail_drawdown": 0.08},
+                "repair": {"breakeven_pct": 0.04, "lock_pct": 0.08, "trail_pct": 0.15, "trail_drawdown": 0.06},
+                "etf":    {"breakeven_pct": 0.03, "lock_pct": 0.06, "trail_pct": 0.12, "trail_drawdown": 0.05},
             },
             "batch_type": {            # 5.2 分类型分批比例(可三批)
                 "mood": [0.40, 0.30, 0.30],

@@ -91,6 +91,73 @@ def _fast_levels(code: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------- 动态止损盘中跟踪
+# code -> {"hi": 持仓期最高价, "stage": 0初始/1保本/2锁定/3跟踪, "alerted": 已提醒的最高阶段}
+# 止损价「只上移不下移」: stage 只增不减, hi 只取新高 → 止损只会上移
+_DS_STATE = {}
+_DS_DEFAULTS = {"breakeven_pct": 0.05, "lock_pct": 0.10, "trail_pct": 0.20, "trail_drawdown": 0.08}
+
+
+def _monitor_atype(code: str, category) -> str:
+    """持仓标的主推断类型(供动态止损按类型取参数): ETF/补涨/情绪/其余默认中军。"""
+    c = str(code)
+    if c.startswith(("5", "159", "588")) or (category and ("ETF" in str(category) or "基金" in str(category))):
+        return "etf"
+    if category and "补涨" in str(category):
+        return "repair"
+    if category and ("情绪" in str(category) or "激进" in str(category)):
+        return "mood"
+    return "mid"
+
+
+def _check_dynamic_stop(code, price, cost, category, cfg) -> list:
+    """动态止损盘中跟踪(第2块): 浮盈跨档→建议上移止损(info); 跌破当前阶段止损→预警(warning)。
+
+    只上移不下移: 阶段随浮盈/最高价只增不减, 止损价只升不降。
+    """
+    dsm = (cfg.get("monitor") or {}).get("dynamic_stop") or {}
+    ep = ((cfg.get("decision") or {}).get("exec_param") or {})
+    dscfg = (ep.get("dynamic_stop") or {})
+    if not dsm.get("enabled", True) or not cost or cost <= 0 or not dscfg.get("enabled", True):
+        return []
+    _atype = _monitor_atype(code, category)
+    d = {**_DS_DEFAULTS, **(dscfg.get(_atype) or dscfg.get("mid") or {})}
+    _be = float(d["breakeven_pct"]); _lk = float(d["lock_pct"])
+    _tr = float(d["trail_pct"]); _dd = float(d["trail_drawdown"])
+    pnl = float(price) / float(cost) - 1
+    st = _DS_STATE.setdefault(str(code), {"hi": float(price), "stage": 0, "alerted": 0})
+    if float(price) > st["hi"]:
+        st["hi"] = float(price)
+    if pnl >= _tr:
+        _stage = 3
+    elif pnl >= _lk:
+        _stage = 2
+    elif pnl >= _be:
+        _stage = 1
+    else:
+        _stage = 0
+    if _stage > st["stage"]:
+        st["stage"] = _stage        # 只上移不下移
+    if st["stage"] == 0:
+        return []                    # 初始阶段由静态止损/价位规则覆盖
+    _lbl = {1: "保本", 2: "锁定浮盈", 3: "跟踪"}[st["stage"]]
+    if st["stage"] == 3:
+        _stop = round(st["hi"] * (1 - _dd), 2)
+    elif st["stage"] == 2:
+        _stop = round(float(cost) * (1 + _be), 2)
+    else:
+        _stop = round(float(cost), 2)
+    out = []
+    if float(price) <= _stop:
+        out.append({"rule": "dyn_stop", "level": "warning",
+                    "msg": f"跌破{_lbl}止损 {_stop:.2f}(浮盈 {pnl * 100:+.1f}%,成本 {cost:.2f}),建议执行止损/减仓"})
+    elif st["stage"] > st["alerted"]:
+        st["alerted"] = st["stage"]
+        out.append({"rule": "dyn_stop", "level": "info",
+                    "msg": f"浮盈已达 {pnl * 100:.1f}%,进入{_lbl}阶段,建议止损上移至 {_stop:.2f}(只上移不下移)"})
+    return out
+
+
 def _check_position(code, price, pct_chg, amount, cfg, predictor, quotes) -> list:
     mon = cfg["monitor"]
     rules = mon["rules"]
@@ -144,6 +211,7 @@ def check_once(positions: list = None) -> list:
     quotes = get_spot_quotes(codes)
     out = []
     predictor = Predictor()
+    pos_map = {str(p.get("code", "")).zfill(6): p for p in positions}
 
     for c in codes:
         q = quotes.get(c)
@@ -152,6 +220,11 @@ def check_once(positions: list = None) -> list:
         base = {"code": c}
         for a in _check_position(c, q["price"], q["pct_chg"], q["amount"], cfg, predictor, quotes):
             out.append({**base, **a})
+        # 动态止损盘中跟踪(持仓标的, 需成本; 只上移不下移)
+        _p = pos_map.get(str(c).zfill(6))
+        if _p and _p.get("cost"):
+            for a in _check_dynamic_stop(c, q["price"], _p["cost"], _p.get("category"), cfg):
+                out.append({**base, **a})
 
     if rules.get("sector", True):
         try:

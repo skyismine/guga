@@ -2007,17 +2007,20 @@ def _execution_plan_impl(target: dict, total_asset: float, taste: str,
     # ---- 止损阶段化(退潮收紧20% / 主升放宽20% / 高潮收紧), 且不得高于现价
     stop = min(stop * pcfg["stop_adj"], price * 0.98)
 
-    # ---- 5.1 动态止损阶梯(基于浮盈阈值): 保本 → 锁定浮盈 → 跟踪回撤
-    ds = eparam.get("dynamic_stop", {})
+    # ---- 5.1 动态止损阶梯(基于浮盈阈值, 按标的类型差异化): 保本 → 锁定浮盈 → 跟踪回撤
+    ds = eparam.get("dynamic_stop", {}) or {}
+    _dscfg = dict(ds.get(_atype) or ds.get("mid") or {})
+    _ds_defaults = {"breakeven_pct": 0.05, "lock_pct": 0.10, "trail_pct": 0.20, "trail_drawdown": 0.08}
+    _dscfg = {**_ds_defaults, **_dscfg}
     dynamic_stop = None
-    if ds.get("enabled"):
+    if ds.get("enabled", True):
         dynamic_stop = {
-            "breakeven": {"threshold_pct": float(ds.get("breakeven_pct", 0.05)),
+            "breakeven": {"threshold_pct": float(_dscfg.get("breakeven_pct", 0.05)),
                           "stop": round(avg_cost, 2)},
-            "lock": {"threshold_pct": float(ds.get("lock_pct", 0.10)),
-                     "stop": round(avg_cost * (1 + float(ds.get("breakeven_pct", 0.05))), 2)},
-            "trailing": {"threshold_pct": float(ds.get("trail_pct", 0.20)),
-                         "trail_drawdown": float(ds.get("trail_drawdown", 0.08))},
+            "lock": {"threshold_pct": float(_dscfg.get("lock_pct", 0.10)),
+                     "stop": round(avg_cost * (1 + float(_dscfg.get("breakeven_pct", 0.05))), 2)},
+            "trailing": {"threshold_pct": float(_dscfg.get("trail_pct", 0.20)),
+                         "trail_drawdown": float(_dscfg.get("trail_drawdown", 0.08))},
         }
 
     # ---- 5.4 风险预算: 单只标的风险(仓位×止损幅度) ≤ 总资金 single_pct
