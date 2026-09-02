@@ -426,8 +426,10 @@ def _build_stable(cfg: dict) -> dict:
         penalty, pen_reasons = _en._veto_penalty(r, dcfg, stats, zt_available=zt_available)
         # 3.4 风格偏转分数微调(与当前大小盘风格对齐/背离, 弱市降权)
         s_adj = _en._style_score_adj(style, r.get("size_bias", 0), scale=_style_scale) if ext_on else 0.0
-        # 3.2 准入线动态调整(板块历史分位+波动率)
-        adj = _en._sector_admission_adj(name, r["score"])
+        # 3.2 准入线动态调整(板块历史分位+波动率+防御属性, 带明细)
+        _adj_r = _en._sector_admission_adj_detail(name, r["score"])
+        adj = _adj_r[0]
+        _adj_note = _adj_r[1]
         # 第五轮:梯队变差确认(盘中炸板不立即生效,连续 N 周期才反映到分数)
         r = _ladder_hold(r, st, cfg, dcfg)
         score = round(r["score"] - penalty + s_adj, 2)
@@ -440,6 +442,7 @@ def _build_stable(cfg: dict) -> dict:
             _extra["style_adj"] = s_adj
         if adj:
             _extra["admission_adj"] = adj
+            _extra["admission_adj_note"] = _adj_note
         if st.get("in_passed"):
             # 已在正式池:滞回保级(保级线随板块动态准入调整)
             if score < down_eff:

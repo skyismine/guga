@@ -891,11 +891,21 @@ def _load_sector_score_arch() -> dict:
 
 
 def _sector_admission_adj(name: str, score: float) -> float:
-    """准入线动态调整(3.2): 板块近60日评分分位数(80%分位以上下调5/20%以下上调5)
-    + 波动率(标准差>10 上调3 / <5 下调3), 总浮动不超过 ±10。返回调整值(可为0)。"""
+    """准入线动态调整(3.2): 返回调整值(可为0)。明细见 _sector_admission_adj_detail。"""
+    return _sector_admission_adj_detail(name, score)[0]
+
+
+def _sector_admission_adj_detail(name: str, score: float) -> tuple:
+    """准入线动态调整(3.2+): 板块近60日评分分位数(分档) + 波动率 + 防御属性。
+
+    - 分位分档: ≥80%分位→-5 / 60-80%→-2 / 40-60%→0 / 20-40%→+2 / ≤20%→+5;
+    - 波动率: 标准差>10→+3 / <5→-3;
+    - 防御属性板块(评分天然偏低)→准入线下调 defensive_adj(默认2);
+    - 总浮动不超过 ±max_adj(10)。返回 (adj, 调整明细字符串)。
+    """
     aacfg = _cfg().get("mainline", {}).get("admission_adj", {})
     if not aacfg.get("enabled", True):
-        return 0.0
+        return 0.0, ""
     today = _today()
     hist = []
     try:
@@ -906,23 +916,44 @@ def _sector_admission_adj(name: str, score: float) -> float:
             hist.append(float(vals[name]))
         hist = hist[-60:]
     except Exception:  # noqa: BLE001
-        return 0.0
+        return 0.0, ""
     if len(hist) < int(aacfg.get("min_hist", 10)):
-        return 0.0
+        return 0.0, ""
     pct = sum(1 for v in hist if v < score) / len(hist)
     m = sum(hist) / len(hist)
     std = (sum((v - m) ** 2 for v in hist) / len(hist)) ** 0.5
     adj = 0.0
-    if pct >= float(aacfg.get("pct_up", 0.80)):
-        adj -= float(aacfg.get("pct_pts", 5.0))          # 高历史分位 → 下调准入线(更易入选)
-    elif pct <= float(aacfg.get("pct_down", 0.20)):
-        adj += float(aacfg.get("pct_pts", 5.0))          # 低历史分位 → 上调准入线(更难入选)
+    notes = []
+    _pts = float(aacfg.get("pct_pts", 5.0))
+    _mid = float(aacfg.get("pct_mid_pts", 2.0))
+    _pu, _pum = float(aacfg.get("pct_up", 0.80)), float(aacfg.get("pct_up_mid", 0.60))
+    _pd, _pdm = float(aacfg.get("pct_down", 0.20)), float(aacfg.get("pct_down_mid", 0.40))
+    if pct >= _pu:
+        adj -= _pts
+        notes.append(f"历史{pct:.0%}分位-{_pts:.0f}")
+    elif pct >= _pum:
+        adj -= _mid
+        notes.append(f"历史{pct:.0%}分位-{_mid:.0f}")
+    elif pct <= _pd:
+        adj += _pts
+        notes.append(f"历史{pct:.0%}分位+{_pts:.0f}")
+    elif pct <= _pdm:
+        adj += _mid
+        notes.append(f"历史{pct:.0%}分位+{_mid:.0f}")
     if std > float(aacfg.get("vol_high", 10.0)):
-        adj += float(aacfg.get("vol_pts", 3.0))          # 高波动 → 上调(更谨慎)
+        adj += float(aacfg.get("vol_pts", 3.0))
+        notes.append(f"高波动+{float(aacfg.get('vol_pts', 3.0)):.0f}")
     elif std < float(aacfg.get("vol_low", 5.0)):
-        adj -= float(aacfg.get("vol_pts", 3.0))          # 低波动 → 下调
-    return round(max(-float(aacfg.get("max_adj", 10.0)),
-                     min(float(aacfg.get("max_adj", 10.0)), adj)), 1)
+        adj -= float(aacfg.get("vol_pts", 3.0))
+        notes.append(f"低波动-{float(aacfg.get('vol_pts', 3.0)):.0f}")
+    # 防御板块属性: 评分天然偏低, 准入线下调(退潮期也能发挥防御作用)
+    _def_adj = float(aacfg.get("defensive_adj", 2.0) or 0.0)
+    if _def_adj and _sector_pool(name) == "defensive":
+        adj -= _def_adj
+        notes.append(f"防御属性-{_def_adj:.0f}")
+    adj = round(max(-float(aacfg.get("max_adj", 10.0)),
+                    min(float(aacfg.get("max_adj", 10.0)), adj)), 1)
+    return adj, "、".join(notes) + f",净调整{adj:+.1f}" if notes else ""
 
 
 # ---------------------------------------------------------------- 3.4 风格偏转分数微调
@@ -1117,11 +1148,12 @@ def mainline_select() -> dict:
             if s_adj:
                 item["score"] = round(item["score"] + s_adj, 2)
                 item["style_adj"] = s_adj
-        # 3.2 准入线动态调整(板块历史分位+波动率)
-        admission_adj = _sector_admission_adj(r["industry"], item["score"])
+        # 3.2 准入线动态调整(板块历史分位+波动率+防御属性, 带调整明细透明化)
+        admission_adj, _adj_note = _sector_admission_adj_detail(r["industry"], item["score"])
         eff_admission = round(admission + admission_adj, 1)
         if admission_adj:
             item["admission_adj"] = admission_adj
+            item["admission_adj_note"] = _adj_note
         if item["score"] >= eff_admission:
             item["reasons"] = _pass_reasons(r, stats, item["score"])
             if item.get("volume_adj"):
@@ -1133,6 +1165,8 @@ def mainline_select() -> dict:
                 item["reasons"].append(f"扣分: {_p}")
             if item.get("style_adj"):
                 item["reasons"].append(f"风格偏转 {'对齐' if item['style_adj'] > 0 else '背离'} {item['style_adj']:+.1f} 分")
+            if item.get("admission_adj_note"):
+                item["reasons"].append(f"准入线调整: {item['admission_adj_note']}(生效线 {eff_admission:.0f})")
             item["pool"] = _sector_pool(r["industry"])
             passed.append(item)
         else:
@@ -1144,7 +1178,7 @@ def mainline_select() -> dict:
                     + ("上涨" if (r.get("pct_chg") or 0) > 0 else "下跌")
                 vtxt = f"(量能比 {vr:.2f} {vtag},量能修正 {item.get('volume_adj') or 0:+.1f} 分)"
             item["reasons"] = [f"综合评分 {item['score']} 分,低于阶段准入线 {eff_admission} 分"
-                               + (f"(板块动态{admission_adj:+.1f})" if admission_adj else "")
+                               + (f"(板块动态{admission_adj:+.1f}:{_adj_note})" if admission_adj else "")
                                + f",仅跟踪{vtxt}"]
             for _p in pen_reasons:
                 item["reasons"].append(f"扣分: {_p}")
