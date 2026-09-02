@@ -378,15 +378,23 @@ DEFAULTS = {
             },
             "low_pos_ret3d": 0.05,     # 近3日涨幅<此值 视为低位启动(上修信号)
             "high_pos_ret3d": 0.15,    # 近3日涨幅>=此值 视为短期高位(下修信号)
-            # ---- 4.4 多维信号修正(累计±2档上限) ----
+            # ---- 4.4 多维信号修正(累计±3档上限) ----
             "phase_adjust": {          # 市场阶段修正
                 "retreat": -1, "startup": 0, "main": 0, "climax": 0,
                 "main_core_boost": 1,  # 主升期核心板块额外上修1档
             },
             "vol_price": {"enabled": True, "up_vol": 1, "up_shrink": -1, "down_vol": -2},
-            "technical": {"enabled": True, "break_up": 1, "break_down": -2},
+            "technical": {"enabled": True, "break_up": 1, "break_down": -2,
+                          "near_pct": 0.02,        # 支撑/压力"临近"判定带宽
+                          "near_support": 1,       # 回踩支撑位附近 → 低吸机会(上修1)
+                          "near_resistance": -1},  # 逼近压力位 → 突破不确定(下修1)
+            "tech_signal": {"enabled": True,       # 技术指标形态修正(RSI/MACD/KDJ/BB → 信号层)
+                            "oversold_gold": 1,    # 超卖+金叉 → 关注低吸(上修1)
+                            "overbought_dead": -1, # 超买+死叉 → 兑现(下修1)
+                            "bb_over": -1,         # 突破布林上轨 → 超买回归(下修1)
+                            "bb_under": 1},        # 跌破布林下轨 → 超卖反弹(上修1)
             "fund_flow": {"enabled": True, "up": 1, "down": -1},   # 近3日资金连续流入/流出(数据缺失跳过)
-            "max_delta": 2,            # 单标的信号累计上修/下修不超过2档
+            "max_delta": 3,            # 单标的信号累计上修/下修不超过3档
             "note": True,              # 输出信号修正说明
         },
         # 第四层 不同风险偏好的单笔风险系数(占总资金)

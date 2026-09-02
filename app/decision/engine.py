@@ -1339,15 +1339,47 @@ def _adjust_signal(item: dict, sector_level: str) -> dict:
             elif pct < 0 and vr >= 1.05:
                 _adj(int(vp.get("down_vol", -2)), f"放量下跌(量比 {vr:.2f})")
 
-    # 5) 技术形态修正:突破压力位上修 / 跌破支撑位下修2档
+    # 5) 技术形态修正: 突破压力/跌破支撑 + 支撑/压力"临近"(低吸/谨慎)信号
     tech = scfg.get("technical", {})
     if tech.get("enabled", True):
         lv = item.get("levels") or {}
         price = item.get("price")
-        if price and lv.get("resistance") and float(lv["resistance"]) > 0 and price >= float(lv["resistance"]):
-            _adj(int(tech.get("break_up", 1)), f"突破压力位 {lv['resistance']}")
-        elif price and lv.get("support") and float(lv["support"]) > 0 and price <= float(lv["support"]):
-            _adj(int(tech.get("break_down", -2)), f"跌破支撑位 {lv['support']}")
+        _np = float(tech.get("near_pct", 0.02) or 0.02)
+        if price and lv.get("resistance") and float(lv["resistance"]) > 0:
+            _res = float(lv["resistance"])
+            if price >= _res:
+                _adj(int(tech.get("break_up", 1)), f"突破压力位 {_res}")
+            elif price >= _res * (1 - _np):
+                _adj(int(tech.get("near_resistance", -1)),
+                     f"逼近压力位(现价 {price:.2f} 距 {_res:.2f} {(1 - price / _res) * 100:.1f}%)")
+        if price and lv.get("support") and float(lv["support"]) > 0:
+            _sup = float(lv["support"])
+            if price <= _sup:
+                _adj(int(tech.get("break_down", -2)), f"跌破支撑位 {_sup}")
+            elif price <= _sup * (1 + _np):
+                _adj(int(tech.get("near_support", 1)),
+                     f"回踩支撑位(现价 {price:.2f} 距 {_sup:.2f} {(price / _sup - 1) * 100:.1f}%)")
+
+    # 5b) 技术指标形态修正(RSI/MACD/KDJ/布林带 → 信号层; 矛盾以模型集成为准)
+    tir = scfg.get("tech_signal", {})
+    if tir.get("enabled", True):
+        t = item.get("tech") or {}
+        if t:
+            _rsi = t.get("rsi")
+            _macd = t.get("macd")
+            _kdj = t.get("kdj") or {}
+            _bb = t.get("bb_pos")
+            _kg = _kdj.get("k") is not None and _kdj.get("d") is not None and _kdj["k"] > _kdj["d"]
+            _kd = _kdj.get("k") is not None and _kdj.get("d") is not None and _kdj["k"] < _kdj["d"]
+            if (_rsi is not None and _rsi < 35 and _macd == "金叉") or (_kg and _kdj.get("j") is not None and _kdj["j"] < 20):
+                _adj(int(tir.get("oversold_gold", 1)), "超卖+金叉(技术面低吸机会)")
+            elif (_rsi is not None and _rsi > 70 and _macd == "死叉") or (_kd and _kdj.get("j") is not None and _kdj["j"] > 80):
+                _adj(int(tir.get("overbought_dead", -1)), "超买+死叉(技术面兑现压力)")
+            if _bb is not None:
+                if _bb > 0.9:
+                    _adj(int(tir.get("bb_over", -1)), f"突破布林上轨(位置 {_bb:.2f}),超买回归风险")
+                elif _bb < 0.1:
+                    _adj(int(tir.get("bb_under", 1)), f"跌破布林下轨(位置 {_bb:.2f}),超卖反弹机会")
 
     # 6) 资金流修正:近3日连续流入(近似)/连续流出
     fund = scfg.get("fund_flow", {})
