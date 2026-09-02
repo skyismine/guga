@@ -467,6 +467,11 @@ DEFAULTS = {
             "pos_cutoff": {            # 高位回落位置修正阈值(近3日涨幅超此值下修)
                 "steady": 0.18, "aggressive": 0.12, "repair": 0.10,
             },
+            "vol_ratio": {             # 大盘量能比平滑参数(2.3): EWMA α + 异常值截断(Winsorize)
+                "ewma_alpha": 0.5,     # EWMA 平滑系数(越大对新变化越敏感)
+                "clip_lo": 0.3,        # 原始量能比截断下限
+                "clip_hi": 3.0,        # 原始量能比截断上限(冷启动折算/数据毛刺防污染 EWMA)
+            },
         },
         # 第三层 板块性价比维度(避免无脑追高)
         "value": {

@@ -248,14 +248,19 @@ def _market_vol_ratio(rows: list, amount_yi):
 
     2.3 优化:
     - 存档写入加文件锁(dal.file_lock,跨平台),避免并发写冲突损坏存档;
-    - 平滑改用 EWMA(alpha=0.5)替代简单移动平均,近期样本权重更高;
+    - 平滑改用 EWMA 替代简单移动平均,近期样本权重更高(α 可配置,无窗口边界跳变);
+    - 原始量能比先做 Winsorize 截断(clip_lo~clip_hi),防冷启动折算/数据毛刺污染 EWMA;
     - 增加量能趋势判定(连续放量/缩量),供前端与评分参考;
     - 冷启动: 相同时段存档不足5日时,用近5日全天均额按当日交易进度折算,
       而非直接对比全天均额(避免开盘初期被误判为大幅缩量)。
     """
     _ARCH_KEEP_DAYS = 7   # 存档保留天数(只需覆盖近5个交易日)
     _SMOOTH_SEC = 300     # 滚动平滑窗口=5分钟
-    _EWMA_ALPHA = 0.5     # EWMA 权重(近期权重更高)
+    # 平滑参数(settings.decision.exec_param.vol_ratio 可调)
+    _vr_cfg = (_cfg().get("exec_param") or {}).get("vol_ratio", {}) or {}
+    _EWMA_ALPHA = float(_vr_cfg.get("ewma_alpha", 0.5) or 0.5)
+    _CLIP_LO = float(_vr_cfg.get("clip_lo", 0.3) or 0.3)
+    _CLIP_HI = float(_vr_cfg.get("clip_hi", 3.0) or 3.0)
     if not amount_yi:
         return None, None
     now = dt.datetime.now()
@@ -292,14 +297,16 @@ def _market_vol_ratio(rows: list, amount_yi):
         vr_raw = float(amount_yi) / (sum(samples) / len(samples))
     if vr_raw is None:
         return None, None
+    # Winsorize 截断: 异常原始量能比(冷启动折算可放大至 5+ / 数据毛刺)先夹到合理区间, 防污染 EWMA
+    vr_raw_c = max(_CLIP_LO, min(_CLIP_HI, vr_raw))
     t = time.time()
     _VR_SMOOTH[:] = [(x, v) for x, v in _VR_SMOOTH if t - x <= _SMOOTH_SEC]
-    _VR_SMOOTH.append((t, vr_raw))
-    # EWMA 平滑(近期权重更高),替代简单移动平均
+    _VR_SMOOTH.append((t, vr_raw_c))
+    # EWMA 平滑(近期权重更高),替代简单移动平均;无窗口边界跳变(旧值指数衰减而非突然剔除)
     ewma = None
     for _, v in sorted(_VR_SMOOTH):
         ewma = v if ewma is None else _EWMA_ALPHA * v + (1 - _EWMA_ALPHA) * ewma
-    vr = ewma if ewma is not None else vr_raw
+    vr = ewma if ewma is not None else vr_raw_c
     # 量能趋势: 连续放量/缩量(供前端展示与复盘)
     d_ = "up" if vr >= 1.05 else ("down" if vr <= 0.95 else "flat")
     if _VR_TREND["dir"] == d_:
