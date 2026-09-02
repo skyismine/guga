@@ -652,35 +652,69 @@ def _sw_stats() -> dict:
             "raw_switches": _SWITCH["raw_switches"], "stable_switches": _SWITCH["stable_switches"]}
 
 
+def health_metrics() -> dict:
+    """稳定器健康指标(供系统健康面板/监控): 启用/最近计算年龄/是否单飞计算中/切换统计。"""
+    with _LOCK:
+        data = _LAST_OUTPUT["data"]
+        t = _LAST_OUTPUT["t"]
+        return {
+            "enabled": bool((_mainline_cfg()).get("enable_stabilizer", True)),
+            "has_output": data is not None,
+            "last_compute_age_s": round(time.time() - t, 1) if t else None,
+            "computing": _COMPUTING.is_set(),
+            "stats": _sw_stats(),
+        }
+
+
 # ------------------------------------------------------------------ 对外入口
 def stabilize() -> dict:
-    """稳定器对外入口(线程安全, 推进一个快照周期)。
+    """稳定器对外入口(线程安全, 单飞推进一个快照周期)。
 
-    - `enable_stabilizer=False`:直接透传原始流水线结果(兼容历史回测);
-    - 单飞: 后台轮询计算中, 并发 Web 访问直接复用最近输出(不重复抓取/不阻塞等待);
-    - 否则:原始结果进 `raw`,稳定结果进 `stable`;结果写入 `_LAST_OUTPUT`。
+    - 单飞: 并发请求只让一个线程真正计算(先到者抢占 _COMPUTING), 其余直接复用最近输出,
+      不重复抓取、不阻塞等待(页面不被稳定器抓板块数据拖住);
+    - 计算在 _LOCK 外执行(状态原子发布到 _LAST_OUTPUT), 使 _COMPUTING 可被并发线程观察到;
+    - `enable_stabilizer=False`:直接透传原始流水线结果(兼容历史回测)。
     """
+    # 快路径: 单飞中(另一线程正计算) → 复用最近输出
     with _LOCK:
-        if _COMPUTING.is_set() and _LAST_OUTPUT["data"] is not None:
-            return _LAST_OUTPUT["data"]        # 另一线程正在计算, 复用最近输出(单飞)
+        _computing = _COMPUTING.is_set()
+        _data = _LAST_OUTPUT["data"]
+    if _computing and _data is not None:
+        return _data
+    if _computing:
+        # 冷启动计算中且尚无输出: 轻量等待首个线程完成(最多 ~5s)
+        for _ in range(50):
+            time.sleep(0.1)
+            with _LOCK:
+                if _LAST_OUTPUT["data"] is not None:
+                    return _LAST_OUTPUT["data"]
+                if not _COMPUTING.is_set():
+                    break
+    # 抢占计算权(双重检查: 等待期间可能已被后台轮询完成)
+    with _LOCK:
+        if _COMPUTING.is_set():
+            return _LAST_OUTPUT["data"] if _LAST_OUTPUT["data"] is not None else None
         _COMPUTING.set()
-        try:
-            cfg = _mainline_cfg()
-            if not cfg.get("enable_stabilizer", True):
+    try:
+        cfg = _mainline_cfg()
+        if not cfg.get("enable_stabilizer", True):
+            raw = _en.mainline_select()
+            out = {"raw": raw, "stable": raw, "stabilizer_enabled": False,
+                   "stats": _sw_stats()}
+        else:
+            with _cycle_flow_cache():
                 raw = _en.mainline_select()
-                out = {"raw": raw, "stable": raw, "stabilizer_enabled": False,
-                       "stats": _sw_stats()}
-            else:
-                with _cycle_flow_cache():
-                    raw = _en.mainline_select()
-                    stable = _build_stable(cfg)
-                _update_switches(raw, stable)
-                out = {"raw": raw, "stable": stable, "stabilizer_enabled": True,
-                       "stats": _sw_stats()}
+                stable = _build_stable(cfg)
+            _update_switches(raw, stable)
+            out = {"raw": raw, "stable": stable, "stabilizer_enabled": True,
+                   "stats": _sw_stats()}
+        # 状态原子发布(锁内一次性替换, 读方不会读到半更新)
+        with _LOCK:
             _LAST_OUTPUT["t"] = time.time()
             _LAST_OUTPUT["data"] = out
-            return out
-        finally:
+        return out
+    finally:
+        with _LOCK:
             _COMPUTING.clear()
 
 

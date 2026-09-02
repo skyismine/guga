@@ -2465,6 +2465,11 @@ def api_system_health():
         out["decision"] = _dt.metrics()
     except Exception:  # noqa: BLE001
         out["decision"] = {"ok": False, "reason": "决策追踪未就绪"}
+    try:
+        from app.support import mainline_stabilizer as _stab
+        out["stabilizer"] = _stab.health_metrics()
+    except Exception:  # noqa: BLE001
+        out["stabilizer"] = {"enabled": False, "error": "稳定器未就绪"}
     return jsonify(out)
 
 
