@@ -18,6 +18,8 @@ _ENV_OVERRIDE_FILE = os.path.join(config.DATA_DIR, f"settings.{_ENV}.json")
 # 版本与最近有效配置(供非法配置回退)
 _VERSION = 1
 _LAST_VALID = None
+# 热更新 mtime 缓存: 文件未变则直接返回深拷贝, 变更则重载
+_CFG_MEMO = {"mtime": None, "data": None}
 
 # 6.3 配置校验规则: 路径 -> (类型, 范围)
 _VALIDATE_RULES = {
@@ -97,8 +99,19 @@ def _read_meta() -> dict:
 
 
 def load() -> dict:
-    """读取生效配置(默认 + json 覆盖 + 环境覆盖 + 敏感信息env)。校验失败回退上一版本。"""
+    """读取生效配置(默认 + json 覆盖 + 环境覆盖 + 敏感信息env)。校验失败回退上一版本。
+
+    热更新: 每次读文件 → 配置修改即生效; mtime 缓存避免高频调用重复解析(文件变化自动重载)。
+    返回深拷贝, 防调用方误改污染缓存。
+    """
     global _LAST_VALID
+    mtime = None
+    try:
+        mtime = os.path.getmtime(_SETTINGS_PATH)
+    except OSError:
+        pass
+    if _CFG_MEMO["data"] is not None and _CFG_MEMO["mtime"] == mtime:
+        return json.loads(json.dumps(_CFG_MEMO["data"]))
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
         with open(_SETTINGS_PATH, encoding="utf-8") as f:
@@ -113,13 +126,15 @@ def load() -> dict:
         _env_overrides(cfg)
     ok, errors = _validate(cfg)
     if not ok:
-        # 非法配置拒绝加载: 回退最近有效配置 + 告警
+        # 非法配置拒绝加载: 回退最近有效配置 + 告警(memo 指向有效版本, 文件修复后 mtime 变才重载)
         if _LAST_VALID is not None:
             from app.support import fault as _flt
             _flt.warning("settings", "配置校验失败,回退上一版本", context={"errors": errors[:6]})
+            _CFG_MEMO.update(mtime=mtime, data=json.loads(json.dumps(_LAST_VALID)))
             return json.loads(json.dumps(_LAST_VALID))
     else:
         _LAST_VALID = json.loads(json.dumps(cfg))
+    _CFG_MEMO.update(mtime=mtime, data=json.loads(json.dumps(cfg)))
     return cfg
 
 
@@ -146,6 +161,8 @@ def save(over: dict) -> None:
         json.dump({"version": _VERSION, "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
                    "env": _ENV}, f, ensure_ascii=False, indent=2)
     _LAST_VALID = json.loads(json.dumps(cfg))
+    _CFG_MEMO.update(mtime=None, data=None)   # 使 mtime 缓存失效(下个 load 重载)
+    print(f"[settings] 配置已保存 v{_VERSION} (热更新: 各模块下次调用即生效)")
 
 
 def rollback() -> dict:
@@ -161,6 +178,7 @@ def rollback() -> dict:
     with open(_META_FILE, "w", encoding="utf-8") as f:
         json.dump({"version": prev, "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
                    "env": _ENV}, f, ensure_ascii=False, indent=2)
+    _CFG_MEMO.update(mtime=None, data=None)
     return load()
 
 
@@ -179,6 +197,7 @@ def config_info() -> dict:
 def reset() -> None:
     global _LAST_VALID
     _LAST_VALID = None
+    _CFG_MEMO.update(mtime=None, data=None)
     try:
         if os.path.exists(_SETTINGS_PATH):
             os.remove(_SETTINGS_PATH)

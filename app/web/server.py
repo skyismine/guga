@@ -2426,6 +2426,14 @@ def api_settings_save():
     from app.support import settings as st
     try:
         st.save(_flatten_form(request.form))
+        # 配置热更新: 失效决策/阶段/市场许可缓存, 下个请求即用新参数重算(无需重启)
+        try:
+            from app.decision import engine as _en
+            _DECISION_CACHE.update(t=0.0, data=None, err=None)
+            _en._PHASE_CACHE.update(t=0.0, phase=None)
+            _en._PERMIT_CACHE.update(t=0.0, data=None)
+        except Exception:  # noqa: BLE001
+            pass
         return jsonify({"ok": True})
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 500
