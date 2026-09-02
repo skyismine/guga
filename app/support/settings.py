@@ -287,6 +287,8 @@ DEFAULTS = {
             "COOL_DOWN_MINUTE": 20,         # 被移出正式池后的冷却分钟数,冷却中只能进入 candidate
             "PASS_HYSTERESIS_UP": 62.0,     # 新板块进入正式池(passed)的分数门槛
             "PASS_HYSTERESIS_DOWN": 58.0,   # 已在正式池内的板块,分数低于此值才允许移出(滞回)
+            "hyst_phase_span": 3.0,         # 滞回门槛随 stab_cycle_adj 阶段化: 每单位系数调整跨度(分)
+                                            # 冷却时间 = base × stab_cycle_adj(退潮更久/主升更短)
             "weaken_news_on_no_5d_money": True,  # 无5日资金净流入时,新闻催化满分降为低档(防消息脉冲)
             # ---- 第五轮:扩展因子(可配置开关,默认开启;回测可关闭保持原逻辑) ----
             "enable_extend_factor": True,   # 扩展因子总开关(连板梯队 + 大小盘风格偏转)

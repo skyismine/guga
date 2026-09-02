@@ -353,12 +353,26 @@ def _build_stable(cfg: dict) -> dict:
     watch_n = int(cfg.get("watch_n", 3))
     # 阶段联动: 退潮加长驻留周期/提高准入, 主升适度放宽灵敏度; 3.3 超越幅度阶段化
     margin = 5.0
+    _phase_adj_txt = ""
     try:
         from app.decision.engine import phase_cfg
         _p = phase_cfg()
-        N = max(1, int(N * _p.get("stab_cycle_adj", 1.0)))
+        _sadj = float(_p.get("stab_cycle_adj", 1.0) or 1.0)
+        N = max(1, int(N * _sadj))
         pass_score = float(_p["admission"])
         margin = float(_p.get("lead_margin", 5.0))
+        # 阶段化(3.3+): 冷却时间与滞回门槛随 stab_cycle_adj 缩放
+        # 退潮(adj=1.5): 冷却更长防追高、更难进正式池(up↑)/更容易被移出(down↓)
+        # 主升(adj=0.8): 冷却更短快切换、更容易进(up↓)/更难移出(down↑)
+        cool_min = max(1, int(cool_min * _sadj))
+        _span = float(cfg.get("hyst_phase_span", 3.0) or 3.0)
+        up = up + (_sadj - 1.0) * _span
+        down = down - (_sadj - 1.0) * _span
+        _label = str(_p.get("label", _p.get("phase", "")))
+        if not _label.endswith("期"):
+            _label += "期"
+        _phase_adj_txt = (f"{_label}: 驻留 {N} 周期、"
+                          f"冷却 {cool_min} 分钟、替换阈值 {margin:.0f} 分、晋升/保级线 {up:.1f}/{down:.1f}")
     except Exception:  # noqa: BLE001
         pass
     now = time.time()
@@ -391,11 +405,13 @@ def _build_stable(cfg: dict) -> dict:
                                degraded=True, degrade_reason="主线未更新(数据源异常)")
             if _core or _defen:
                 return {"core": _core, "defensive": _defen, "watch": [], "rejected": [],
-                        "candidate": [], "pass_score": pass_score, "degraded": True}
+                        "candidate": [], "pass_score": pass_score, "degraded": True,
+                        "phase_adjustment": _phase_adj_txt}
         except Exception:  # noqa: BLE001
             pass
         return {"core": None, "defensive": None, "watch": [], "rejected": [],
-                "candidate": [], "pass_score": pass_score, "degraded": True}
+                "candidate": [], "pass_score": pass_score, "degraded": True,
+                "phase_adjustment": _phase_adj_txt}
 
     # 弱市判定: 最高非淘汰评分 < 准入线 → 风格偏转降权(避免3分在低分聚集区主导观察池)
     _top_score = max((r.get("score") or 0) for r in rows if r.get("level") != "rejected") if rows else 0
@@ -604,7 +620,8 @@ def _build_stable(cfg: dict) -> dict:
     return {"core": core, "defensive": defen, "watch": watch,
             "rejected": rejected[:max(watch_n, 5)],
             "candidate": candidate[:12],
-            "pass_score": pass_score}
+            "pass_score": pass_score,
+            "phase_adjustment": _phase_adj_txt}
 
 
 # ------------------------------------------------------------------ 切换统计
