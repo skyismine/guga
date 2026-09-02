@@ -269,7 +269,10 @@ DEFAULTS = {
         # ---- 3.1 一票否决改分级扣分(软性项不再直接否决) ----
         "veto_penalty": {
             "net_out": {"enabled": True, "max_pts": 10.0},   # 净流出按占成交额比例扣分(0-10)
-            "zt_short": {"enabled": True, "per_missing": 5.0},  # 涨停不足min_zt: 每缺1家扣5分
+            "zt_short": {"enabled": True, "per_missing": 5.0,  # 涨停不足min_zt: 每缺1家扣5分
+                         "trend_exempt_pct": 3.0,   # 无涨停但有趋势豁免: 板块涨幅>此值(3%)
+                         "trend_exempt_leader": 5.0, # 且领涨股涨幅>此值(5%)
+                         "trend_exempt_pts": 3.0},   # 豁免时仅扣此分(替代缺家扣分, 防误杀大金融/消费趋势板块)
             "overheat": {"enabled": True, "threshold": 0.15, "max_pts": 10.0},  # 过热按超出幅度扣分
         },
         # 第二层 主线准入与分级

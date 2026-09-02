@@ -764,15 +764,27 @@ def _veto_penalty(r, dcfg, stats, zt_available=True) -> tuple:
         pts = float(ncfg.get("max_pts", 10.0)) * ratio
         penalty += pts
         reasons.append(f"主力净流出 {r['net_yi']:.1f} 亿(占成交额 {ratio * 100:.0f}%),扣 {pts:.1f} 分")
-    # 涨停不足(每缺1家扣 per_missing)
+    # 涨停不足(每缺1家扣 per_missing; 0家但有趋势 → 豁免降扣防误杀大金融/消费等趋势板块)
     zcfg = vp.get("zt_short", {})
     min_zt = int(dcfg.get("veto", {}).get("min_zt_in_sector", 2))
     if zcfg.get("enabled", True) and zt_available:
-        missing = max(0, min_zt - int(r.get("zt_count", 0)))
+        zt_n = int(r.get("zt_count", 0))
+        missing = max(0, min_zt - zt_n)
         if missing > 0:
-            pts = missing * float(zcfg.get("per_missing", 5.0))
-            penalty += pts
-            reasons.append(f"涨停 {r.get('zt_count', 0)} 家,不足 {min_zt} 家,扣 {pts:.1f} 分")
+            _zt_trend_exempt = float(zcfg.get("trend_exempt_pct", 3.0) or 3.0)
+            _leader_exempt = float(zcfg.get("trend_exempt_leader", 5.0) or 5.0)
+            _exempt_pts = float(zcfg.get("trend_exempt_pts", 3.0) or 3.0)
+            if (zt_n == 0 and (r.get("pct_chg") or 0) > _zt_trend_exempt
+                    and (r.get("leader_pct") or 0) > _leader_exempt):
+                # 无涨停但有趋势: 板块强势且领涨股大涨(中军趋势型板块), 只轻扣
+                penalty += _exempt_pts
+                reasons.append(f"涨停 {zt_n} 家,但板块涨幅 {r.get('pct_chg', 0):+.1f}%>"
+                               f"{_zt_trend_exempt:.0f}% 且领涨 {r.get('leader_pct', 0):+.1f}%>"
+                               f"{_leader_exempt:.0f}%(无涨停但有趋势),仅扣 {_exempt_pts:.0f} 分")
+            else:
+                pts = missing * float(zcfg.get("per_missing", 5.0))
+                penalty += pts
+                reasons.append(f"涨停 {zt_n} 家,不足 {min_zt} 家,扣 {pts:.1f} 分")
     # 近3日过热(0-10)
     ocfg = vp.get("overheat", {})
     thr = float(ocfg.get("threshold", dcfg.get("veto", {}).get("max_gain_3d", 0.15)))
