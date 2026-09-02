@@ -1937,11 +1937,18 @@ def _load_report_file(date_str: str) -> str:
 
 def _start_auto_report(interval_sec: int = 60) -> None:
     """唯一调度入口:交易日到点(auto_report_time,默认 16:00)自动生成复盘(内存展示,统一入口)。
-    落盘由 settings 控制(need_save_report)。"""
+
+    落盘由 settings 控制(need_save_report)。
+    触发条件修复: 到点后 30 分钟窗口内「当天只自动执行一次」——不依赖 _REPORT_HTML.date
+    (否则当天早先打开/手动生成过报告会把 date 置为今天, 16:00 被误跳过);
+    精确分钟判定脆弱(轮询漂移即错过), 改为窗口判定; 生成失败在窗口内每分钟重试。
+    """
     import datetime as _dt
     import threading as _th
     from app.support import settings as _st
     from app.support import daily_report as _rep
+
+    _run_state = {"date": None, "in_progress": False}
 
     def _run():
         while True:
@@ -1953,14 +1960,29 @@ def _start_auto_report(interval_sec: int = 60) -> None:
                 except ValueError:
                     hh, mm = 16, 0
                 today = now.strftime("%Y-%m-%d")
-                if (now.weekday() < 5 and now.hour == hh and now.minute == mm
-                        and _REPORT_HTML["date"] != today):
-                    cfg = _st.load()
-                    _set_report(_rep.generate(use_cache=True,
-                                              save=bool(cfg.get("need_save_report", False))))
-                    print(f"[report] 已生成复盘 {today} (页面内展示)")
+                run = _run_state
+                if now.weekday() < 5 and run["date"] != today and not run["in_progress"]:
+                    fire_ts = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                    if fire_ts <= now <= fire_ts + _dt.timedelta(minutes=30):
+                        run["in_progress"] = True
+                        try:
+                            cfg = _st.load()
+                            _set_report(_rep.generate(
+                                use_cache=True,
+                                save=bool(cfg.get("need_save_report", False))))
+                            run["date"] = today
+                            print(f"[report] 已自动生成复盘 {today} (页面内展示)")
+                            try:
+                                from app.support import fault as _flt
+                                _flt.info("report.auto", f"16点自动复盘已生成 {today}")
+                            except Exception:  # noqa: BLE001
+                                pass
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[report] 16点自动生成失败(窗口内将每分钟重试): {e}")
+                        finally:
+                            run["in_progress"] = False
             except Exception as e:  # noqa: BLE001
-                print(f"[report] 调度失败: {e}")
+                print(f"[report] 调度异常: {e}")
             _time.sleep(interval_sec)
 
     _th.Thread(target=_run, daemon=True, name="daily-report").start()
