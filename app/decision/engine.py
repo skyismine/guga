@@ -21,6 +21,8 @@ from app.support import mainline as _ml
 from app.support.portfolio import _one
 from app.data import dal
 from app.features.market_features import market_snapshot, fear_greed_label
+from app.support.signals import (_SIGNAL_LEVELS, _SIGNAL_RANK, _ACTION_TO_SIGNAL,
+                                 shift_signal as _shift_signal, _TRIGGER_TPL)
 
 def _fault(e: BaseException, note: str = ""):
     """记录一次被降级吞掉的异常(接入 fault 统一日志, 不再静默; 保持原降级语义)。"""
@@ -1262,24 +1264,7 @@ def mainline_select() -> dict:
 
 
 # ---------------------------------------------------------------- 第三层 标的精准匹配
-# 统一 5 档操作信号口径(全系统统一命名),从 advisor 动作映射并叠加修正
-_SIGNAL_LEVELS = ["观望", "减仓兑现", "持有观察", "突破跟进", "关注低吸"]  # 强度升序
-_SIGNAL_RANK = {s: i for i, s in enumerate(_SIGNAL_LEVELS)}
-# advisor 原始动作(action_key) -> 5 档信号
-_ACTION_TO_SIGNAL = {
-    "buy": "关注低吸",
-    "add": "突破跟进",
-    "hold": "持有观察",
-    "reduce": "减仓兑现",
-    "sell": "观望",
-    "wait": "观望",
-}
-
-
-def _shift_signal(sig: str, delta: int) -> str:
-    """信号档位移(正=上修/更积极, 负=下修/更保守),越界封顶。"""
-    idx = _SIGNAL_RANK.get(sig, 0) + delta
-    return _SIGNAL_LEVELS[max(0, min(len(_SIGNAL_LEVELS) - 1, idx))]
+# 统一 5 档操作信号口径/信号位移/触发模板已迁至 app.support.signals(顶部导入)
 
 
 def _adjust_signal(item: dict, sector_level: str) -> dict:
@@ -1419,14 +1404,6 @@ def _adjust_signal(item: dict, sector_level: str) -> dict:
     item["action"] = sig
     item["adj_notes"] = notes if scfg.get("note", True) else []
     return item
-
-
-_TRIGGER_TPL = {
-    "aggressive": "回踩支撑位 {support} 企稳(缩量)关注,或放量突破压力位 {resistance} 启动信号",
-    "steady": "回踩 {entry_low}~{support} 区间分批低吸关注",
-    "repair": "补涨优选:回踩 {support} 企稳低吸,放量启动确认后跟进",
-    "etf": "板块异动期折价/平价时关注,回调至 {support} 附近分批观察",
-}
 
 
 def _tech_indicators(df) -> dict:

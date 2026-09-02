@@ -16,6 +16,7 @@ import threading
 import time
 
 from app.support import settings as _st
+from app.support.signals import shift_signal as _shift_signal, _TRIGGER_TPL as _TTPL
 
 
 def _fault(e: BaseException, note: str = ""):
@@ -189,7 +190,6 @@ def _excess_adjust(item: dict, sector_name: str, cfg: dict) -> None:
 
     近3日/近5日个股跑赢板块 → 动作档位+1;持续跑输 → 档位-1(在 adjust_signal 之后叠加)。
     """
-    from app.decision.engine import _shift_signal
     code = str(item.get("code") or "").zfill(6)
     try:
         from app.features.concept_features import _get_concept_close
@@ -501,7 +501,7 @@ def _render_item(it: dict, role: str, sector_name: str, sector_level: str,
     if cfg.get("enable_excess_return_adjust"):
         _excess_adjust(item, sector_name, cfg)
     lv = item.get("levels") or {}
-    tpl = _en._TRIGGER_TPL.get(role, _en._TRIGGER_TPL["steady"])
+    tpl = _TTPL.get(role, _TTPL["steady"])
     item["trigger"] = tpl.format(support=lv.get("support", "-"),
                                  resistance=lv.get("resistance", "-"),
                                  entry_low=lv.get("entry_low", "-"))
@@ -553,7 +553,7 @@ def _match_etf_v2(sector_name, quotes, predictor, market, sector_level,
         _en._adjust_signal(item, _boost_level(sector_level, sector_status, cfg))
         lv = item.get("levels") or {}
         if lv:
-            item["trigger"] = _en._TRIGGER_TPL["etf"].format(
+            item["trigger"] = _TTPL["etf"].format(
                 support=lv.get("support", "-"), resistance=lv.get("resistance", "-"))
         else:
             item["trigger"] = "板块强势期间低吸对应 ETF,注意流动性"
