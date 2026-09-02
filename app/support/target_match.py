@@ -485,6 +485,13 @@ def _render_item(it: dict, role: str, sector_name: str, sector_level: str,
             "continue_rank_cycle": int(it.get("continue_rank_cycle", 1)),
             "rank_score": round(it.get("rank_score", 0), 4) if it.get("rank_score") else None,
             "match_source": it.get("match_source", "candidate" if candidate else "normal")}
+    # 数据不足/补抓填充标记透传(决策结果可追溯, 非真实数据时避免误读)
+    if it.get("data_insufficient"):
+        item["data_insufficient"] = True
+        item["data_insufficient_reason"] = it.get("data_insufficient_reason") or "历史数据不足,保守计分"
+    if it.get("filled"):
+        item["filled"] = True
+        item["fill_method"] = it.get("fill_method", "fetch_on_miss")
     pred = _en._predict_one(c["code"], predictor, quotes, market)
     if pred.get("error"):
         item["error"] = pred["error"]

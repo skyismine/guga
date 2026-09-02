@@ -19,6 +19,15 @@ _BOARD_NUM = {"two_board": 2, "three_board": 3, "four_board": 4,
               "five_board": 5, "six_board": 6, "seven_over": 7}
 
 
+def _deg(e: Exception, name: str) -> None:
+    """fuyao 子模块降级: 记录 fault 日志, 该子块返回「暂缺」(不阻塞报告)。"""
+    try:
+        from app.support import fault as _flt
+        _flt.warning("ths_special", f"同花顺特色数据「{name}」获取失败,降级为暂缺", exc=e)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _ladder_review() -> dict:
     """连板梯队摘要: 最近交易日各板位家数 + 最高板 + 次日晋级观察(seal_nextday)。
 
@@ -28,7 +37,11 @@ def _ladder_review() -> dict:
     from app.data.fuyao import get_limit_up_ladder, enabled
     if not enabled():
         return {}
-    lad = get_limit_up_ladder()
+    try:
+        lad = get_limit_up_ladder()
+    except Exception as e:  # noqa: BLE001
+        _deg(e, "连板梯队")
+        return {}
     if not lad:
         return {}
     last = max(lad, key=lambda x: x.get("date", ""))   # 最近交易日(列表新→旧,末尾是最旧的一天)
@@ -53,7 +66,11 @@ def _hot_review() -> list:
     from app.data.fuyao import get_hot_stock_list, enabled
     if not enabled():
         return []
-    return get_hot_stock_list("day")[:10]
+    try:
+        return get_hot_stock_list("day")[:10]
+    except Exception as e:  # noqa: BLE001
+        _deg(e, "热股榜")
+        return []
 
 
 def _dragon_review() -> list:
@@ -61,7 +78,11 @@ def _dragon_review() -> list:
     from app.data.fuyao import get_dragon_tiger_list, enabled
     if not enabled():
         return []
-    d = get_dragon_tiger_list("all")
+    try:
+        d = get_dragon_tiger_list("all")
+    except Exception as e:  # noqa: BLE001
+        _deg(e, "龙虎榜")
+        return []
     items = d.get("stock_items") or []
     return sorted([s for s in items if s.get("net_value")],
                   key=lambda x: -float(x.get("net_value") or 0))[:8]
@@ -72,7 +93,11 @@ def _anomaly_review() -> list:
     from app.data.fuyao import get_anomaly_analysis_list, enabled
     if not enabled():
         return []
-    return get_anomaly_analysis_list()[:8]
+    try:
+        return get_anomaly_analysis_list()[:8]
+    except Exception as e:  # noqa: BLE001
+        _deg(e, "个股异动")
+        return []
 
 
 def special_data_review(d: dict) -> list:

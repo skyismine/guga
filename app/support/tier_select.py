@@ -160,10 +160,13 @@ def _split_pools(stocks, spot) -> tuple:
         fmv = (sp.get("float_mv") or s.get("float_mv")
                or sp.get("total_mv") or (sp.get("amount") or 0))   # 市值缺失→当日额代理
         df = _hist(code)
+        _hlen = len(df) if df is not None else 0
         rated.append({**s, "code": code, "_fmv": float(fmv or 0),
                       "_avg": _avg_amount20(code), "_vol": _vol20(df),
                       "_pos20": _pos20(df), "_vr": _vol_ratio(df),
-                      "_ret3": _ret_n(df, 3), "_ret5": _ret_n(df, 5)})
+                      "_ret3": _ret_n(df, 3), "_ret5": _ret_n(df, 5),
+                      "_hist_len": _hlen,
+                      "_insufficient": 0 < _hlen < 20})   # 新股/历史过短: 标记数据不足(保守)
     if not rated:
         return [], []
     fmv_sorted = sorted(r["_fmv"] for r in rated if r["_fmv"] > 0)
@@ -183,6 +186,50 @@ def _split_pools(stocks, spot) -> tuple:
         if pct < 0.6 and liq_ok_agg and vol_ok:
             aggressive.append(r)
     return steady, aggressive
+
+
+# ------------------------------------------------------------------ 缺缓存补抓(root-cause) + 保守降权
+def _refresh_rated(r: dict) -> None:
+    """补抓成功后重算该股指标(保留 _mv_pct 等池级字段)。"""
+    code = r["code"]
+    df = _hist(code)
+    _hlen = len(df) if df is not None else 0
+    r.update(_avg=_avg_amount20(code), _vol=_vol20(df), _pos20=_pos20(df),
+             _vr=_vol_ratio(df), _ret3=_ret_n(df, 3), _ret5=_ret_n(df, 5),
+             _hist_len=_hlen)
+    r["_insufficient"] = (_hlen == 0) or (0 < _hlen < 20)
+
+
+def _ensure_shortlist(pool: list) -> None:
+    """对入围(top-N)候选确保有真实日线缓存(本地缺失 → 短超时补抓真实历史, 而非中性填充)。
+
+    补抓成功: 重算指标并标注 filled/fill_method="fetch_on_miss"(可追溯);
+    补抓失败: 标记 data_insufficient(数据不足, 后续保守计分, 不填板块均值)。
+    """
+    for r in pool:
+        if r.get("_hist_len", 0) >= 6:
+            continue
+        from app.support.stock_utils import ensure_hist as _eh
+        df = _eh(r["code"])
+        if df is not None and len(df) >= 6:
+            _refresh_rated(r)
+            r["filled"] = True
+            r["fill_method"] = "fetch_on_miss"
+        else:
+            r["data_insufficient"] = True
+            r["data_insufficient_reason"] = "本地缓存缺失且补抓失败,按保守值计分"
+            r["_hist_len"] = 0
+
+
+def _penalize_insufficient(scored: list) -> list:
+    """数据不足标的分 ×0.5(保守降权, 避免不可控中性), 并带可追溯标记。"""
+    for c in scored:
+        it = c["it"]
+        if it.get("data_insufficient") or it.get("_insufficient"):
+            it["data_insufficient"] = True
+            it.setdefault("data_insufficient_reason", "历史数据不足,保守计分")
+            c["score"] = round(c["score"] * 0.5, 4)
+    return scored
 
 
 # ------------------------------------------------------------------ 综合评分
@@ -436,6 +483,9 @@ def select_three_tiers(sector_name: str, sector_level: str, sector_status: str,
         _pool_n = 5
     steady_pool = _cap_candidates(steady_pool, "steady", _pool_n)
     aggressive_pool = _cap_candidates(aggressive_pool, "aggressive", _pool_n)
+    # root-cause: 入围短名单缺缓存 → 短超时补抓真实历史(标注 filled/fetch_on_miss 或 data_insufficient)
+    _ensure_shortlist(steady_pool)
+    _ensure_shortlist(aggressive_pool)
     cons_n = len(stocks)
     quota = _tier_quota_by_level(sector_status if sector_status in ("core", "defensive", "branch")
                                  else sector_level, cons_n)
@@ -457,6 +507,7 @@ def select_three_tiers(sector_name: str, sector_level: str, sector_status: str,
     used = set()
     if quota["steady"] and steady_pool:
         scored = sorted(_score_steady(steady_pool), key=lambda x: -x["score"])
+        scored = _penalize_insufficient(scored)
         formal, watch, cold = _persistence(sector_name, "steady", scored, quota["steady"])
         for c in formal:
             it = c["it"]
@@ -473,6 +524,7 @@ def select_three_tiers(sector_name: str, sector_level: str, sector_status: str,
     if quota["aggressive"] and aggressive_pool:
         rest = [r for r in aggressive_pool if r["code"] not in used]
         scored = sorted(_score_aggressive(rest, sector_name), key=lambda x: -x["score"])
+        scored = _penalize_insufficient(scored)
         formal, watch, _ = _persistence(sector_name, "aggressive", scored, quota["aggressive"])
         for c in formal:
             it = c["it"]
@@ -488,6 +540,7 @@ def select_three_tiers(sector_name: str, sector_level: str, sector_status: str,
         rest = [r for r in stocks if r["code"] not in used]
         if len(rest) >= 3:
             scored = sorted(_score_repair(rest, sector_name), key=lambda x: -x["score"])
+            scored = _penalize_insufficient(scored)
             best = scored[0]
             if best["score"] >= 0.4:                 # 综合得分阈值, 不硬凑
                 it = best["it"]

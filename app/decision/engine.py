@@ -83,8 +83,14 @@ def _sector_stats_uncached(name: str) -> dict | None:
                 # 板块量能比:当日成交量 / 近5日均量(>1 放量,<1 缩量)
                 if "volume" in df.columns and len(df["volume"]) >= 6:
                     v = df["volume"].astype(float)
-                    if float(v.tail(5).mean()) > 0:
-                        out["volume_ratio"] = float(v.iloc[-1] / v.tail(5).mean())
+                    last = float(v.iloc[-1])
+                    base = float(v.tail(5).mean())
+                    if base > 0 and last > 0:
+                        out["volume_ratio"] = float(last / base)
+                    elif base > 0:
+                        # 当日量缺失/停牌: 用近5日均量(比值=1.0)填充并标注, 不做板块均值外推
+                        out["volume_ratio"] = 1.0
+                        out["volume_ratio_filled"] = "history_mean"
             return out
     except Exception:  # noqa: BLE001
         pass
