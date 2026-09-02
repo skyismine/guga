@@ -497,6 +497,11 @@ def _render_item(it: dict, role: str, sector_name: str, sector_level: str,
         item["error"] = pred["error"]
         return item
     item.update(pred)
+    # 个股级数据校准落地: 数据异常/不一致标注到标的上("数据可能异常,建议核实")
+    if pred.get("data_warning"):
+        item["data_note"] = "数据可能异常,建议核实: " + "; ".join(pred["data_warning"][:2])
+        if item.get("reasons"):
+            item["reasons"] = item["reasons"][:2] + [item["data_note"]]
     _en._adjust_signal(item, _boost_level(sector_level, sector_status, cfg))
     if cfg.get("enable_excess_return_adjust"):
         _excess_adjust(item, sector_name, cfg)

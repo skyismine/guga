@@ -1482,6 +1482,38 @@ def _ensemble_vote(tech: dict, pred: dict) -> dict:
             "note": f"集成投票 {'一致' if agree else '分歧'}: " + "/".join(v[0] for v in votes)}
 
 
+def _stock_data_warnings(code, df, quotes=None, market_date=None) -> list:
+    """个股数据一致性/异常检测(轻量, 个股级校准的最小落地):
+    - 双源价差: 实时价(新浪)与日线收盘(fuyao/akshare)同日差异 >1% → 提示不一致;
+    - 涨跌幅超限: 实时涨跌幅 >25%(超 A 股涨跌停上限, 注意除权跳空);
+    - 实时价 0/缺失。
+    返回 warning 字符串列表; 命中仅标注+告警, 不改预测(保守)。
+    """
+    warns = []
+    try:
+        spot = (quotes or {}).get(str(code).zfill(6)) or {}
+        price = spot.get("price")
+        pct = spot.get("pct_chg")
+        if df is None or len(df) < 2:
+            return ["历史日线缺失/过短"]
+        last = float(df["close"].astype(float).iloc[-1])
+        df_last_date = str(df.index[-1])[:10]
+        today = dt.date.today().isoformat()
+        same_day = df_last_date >= today or (market_date and df_last_date == str(market_date)[:10])
+        if same_day and price and last > 0:
+            diff = abs(float(price) / last - 1)
+            if diff > 0.01:
+                warns.append(f"实时价 {price} 与日线收盘 {last:.2f} 差异 {diff * 100:.1f}%"
+                             "(数据不一致,建议核实)")
+        if pct is not None and abs(float(pct)) > 25:
+            warns.append(f"实时涨跌幅 {float(pct):+.1f}% 超涨跌停上限,疑似数据异常(注意除权跳空)")
+        if price is not None and float(price) <= 0:
+            warns.append("实时价为 0/缺失,该标的数据可能未成交或异常")
+    except Exception as e:  # noqa: BLE001
+        warns.append(f"数据校验异常({type(e).__name__})")
+    return warns
+
+
 def _predict_one(code, predictor, quotes, market):
     try:
         df, pred, adv = _one(code, predictor, quotes, market, _st.load())
@@ -1512,6 +1544,17 @@ def _predict_one(code, predictor, quotes, market):
         }
         if tech:
             out["tech"] = tech
+        # 个股级数据校准落地: 一致性/异常检测(命中仅标注+告警, 不改预测)
+        try:
+            _warns = _stock_data_warnings(code, df, quotes,
+                                          (market or {}).get("market_date"))
+            if _warns:
+                out["data_warning"] = _warns
+                from app.support import fault as _flt
+                _flt.warning("predict.data", f"个股 {code} 数据异常/不一致检测",
+                             context={"warnings": _warns[:3]})
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
         try:
             tmc = _st.load().get("target_match") or {}
             if tmc.get("enable_model_ensemble"):
