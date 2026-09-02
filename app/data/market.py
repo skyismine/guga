@@ -24,12 +24,16 @@ _INTRADAY_TTL = 60
 
 
 def _is_trading_time(now=None) -> bool:
-    """是否处于交易时段(工作日 9:30-11:30 / 13:00-15:00)。"""
+    """是否在交易日(周一~周五 9:30-15:00 连续,含午休)。
+
+    午休(11:30-13:00)期间当日盘中数据仍有效,应继续用实时口径,
+    否则会回退到"收盘口径=上一完整交易日",导致当日涨停/涨跌家数停在昨日。
+    """
     now = now or dt.datetime.now()
     if now.weekday() >= 5:
         return False
     hm = now.hour * 60 + now.minute
-    return (9 * 60 + 30) <= hm <= (11 * 60 + 30) or (13 * 60) <= hm <= (15 * 60)
+    return (9 * 60 + 30) <= hm <= (15 * 60)
 
 
 # ---------------------------------------------------------------- 缓存
@@ -367,11 +371,24 @@ def get_market_activity(use_cache: bool = True) -> Dict:
     if _is_trading_time():
         try:
             result = _activity_from_fuyao_realtime()
-        except Exception as e:  # noqa: BLE001
-            print(f"[market] fuyao 实时涨跌家数获取失败,回退收盘口径: {e}")
-        else:
             _save_cache("activity", result)
             return result
+        except Exception as e:  # noqa: BLE001
+            # 盘中实时失败: 不回退到上一交易日收盘口径(会显示昨日数据),
+            # 优先保留当日缓存(若有当日数据), 否则走乐咕(可能给今日)。
+            print(f"[market] fuyao 实时涨跌家数获取失败,保留当日缓存/走乐咕: {e}")
+            cached = _load_cache("activity", ttl=None)
+            today = dt.date.today().isoformat()
+            if cached and str(cached.get("date", ""))[:10] >= today:
+                return cached
+            # 无当日缓存 → 落回乐咕(盘中 60s 实时)
+            try:
+                return _activity_from_legu()
+            except Exception as e2:  # noqa: BLE001
+                print(f"[market] 乐咕涨跌家数失败: {e2}")
+                if cached:
+                    return cached   # 兜底: 保留任意缓存(可能昨日,标注由上层判断)
+                raise
     try:
         result = _activity_from_fuyao()
     except Exception as e:  # noqa: BLE001
@@ -380,6 +397,11 @@ def get_market_activity(use_cache: bool = True) -> Dict:
         _save_cache("activity", result)
         return result
     # P3 回退: 乐咕乐股(原源;页面反爬/结构变化时可能抛异常)
+    return _activity_from_legu()
+
+
+def _activity_from_legu() -> Dict:
+    """P3 回退: 乐咕乐股全市场涨跌家数(盘中 60s 实时, 页面反爬/结构变化时可能抛异常)。"""
     import akshare as ak
     df = ak.stock_market_activity_legu()
     mapping = {r["item"]: r["value"] for _, r in df.iterrows()}
