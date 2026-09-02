@@ -507,14 +507,42 @@ def _load_last_grade() -> tuple:
     return (arch[sorted(arch.keys())[-1]] if arch else None), arch
 
 
+def _grade_cfg() -> dict:
+    """评级滞回参数(settings.decision.grade_hysteresis, 缺省回退内置常量)。"""
+    try:
+        return _cfg().get("grade_hysteresis", {}) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _last_grade_floor(last: str, rules: dict) -> float:
+    """当前评级维持所需的最低评分(用于熔断式降级判定)。"""
+    if last == "A":
+        return float(rules.get("score_full", 70))
+    if last == "B":
+        return float(rules.get("score_ok", 50))
+    if last == "C":
+        return float(rules.get("score_hold", 30))
+    return 0.0
+
+
 def _grade(score, zt, adv_ratio, rules) -> tuple:
     """评级滞回(2.4): 抑制 A→B→A 式频繁切换。
 
-    - 滞回: 升级用更严阈值(bias=+5), 降级用更松阈值(bias=-5);
-    - 切换确认: 盘中需连续 _GRADE_CONFIRM 次(5分钟窗口)满足, 收盘后单次即定;
+    - 滞回: 升级用更严阈值(bias=+up), 降级用更松阈值(bias=-down);
+    - 切换确认: 盘中需连续 confirm 次(5分钟窗口)满足, 收盘后单次即定;
+    - 熔断式降级: 盘中评分骤降(低于当前评级门槛 crash_score_drop 分)或极端指标时,
+      跳过确认立即降级(防恐慌/断崖被确认周期拖住);
     - 单日最多变化1级(限幅);
     - 切换/维持输出明确原因, 供复盘; 当日评级持久化到 grade_history.json。
+    参数均来自 settings.decision.grade_hysteresis(可随市场环境调节)。
     """
+    _gc = _grade_cfg()
+    _up = float(_gc.get("up_bias", _GRADE_UP_BIAS) or _GRADE_UP_BIAS)
+    _down = float(_gc.get("down_bias", _GRADE_DOWN_BIAS) or _GRADE_DOWN_BIAS)
+    _confirm = int(_gc.get("confirm", _GRADE_CONFIRM) or _GRADE_CONFIRM)
+    _step = int(_gc.get("max_step", _GRADE_MAX_STEP) or _GRADE_MAX_STEP)
+    _crash = float(_gc.get("crash_score_drop", 10.0) or 10.0)
     raw = _grade_raw(score, zt, adv_ratio, rules, bias=0.0)
     last, arch = _load_last_grade()
     change_reason = None
@@ -527,7 +555,7 @@ def _grade(score, zt, adv_ratio, rules) -> tuple:
         order = _GRADE_ORDER
         lv, rv = order.get(last, 1), order.get(raw, 1)
         # 单日限幅: 向 raw 方向最多变化1级
-        if abs(rv - lv) > _GRADE_MAX_STEP:
+        if abs(rv - lv) > _step:
             direction = 1 if rv > lv else -1
             raw = [g for g, o in order.items() if o == lv + direction][0]
             rv = order[raw]
@@ -536,15 +564,22 @@ def _grade(score, zt, adv_ratio, rules) -> tuple:
         else:
             # 滞回判定: 升级需更严(bias>0)/降级需更松(bias<0)
             if rv > lv:
-                cand = _grade_raw(score, zt, adv_ratio, rules, bias=_GRADE_UP_BIAS)
+                cand = _grade_raw(score, zt, adv_ratio, rules, bias=_up)
                 justified = order[cand] > lv
             else:
-                cand = _grade_raw(score, zt, adv_ratio, rules, bias=-_GRADE_DOWN_BIAS)
+                cand = _grade_raw(score, zt, adv_ratio, rules, bias=-_down)
                 justified = order[cand] < lv
             if not justified:
                 grade = last
                 change_reason = (f"滞回: 未满足「{'升级' if rv > lv else '降级'}」确认阈值"
                                  f"(需更{'严' if rv > lv else '松'}边界),维持 {last}")
+                _GRADE_PENDING.update({"grade": None, "count": 0, "ts": 0.0})
+            elif rv < lv and _in_trading_time() and (
+                    score < _last_grade_floor(last, rules) - _crash):
+                # 熔断式降级: 盘中评分骤降 → 跳过连续确认立即降级
+                grade = raw
+                change_reason = (f"熔断式降级 {last}→{raw}(评分 {score:.1f} 低于当前评级门槛"
+                                 f" {_last_grade_floor(last, rules):.0f}-{_crash:.0f} 分,跳过确认)")
                 _GRADE_PENDING.update({"grade": None, "count": 0, "ts": 0.0})
             elif not _in_trading_time():
                 grade = raw
@@ -556,13 +591,13 @@ def _grade(score, zt, adv_ratio, rules) -> tuple:
                     _GRADE_PENDING["count"] += 1
                 else:
                     _GRADE_PENDING.update({"grade": raw, "count": 1, "ts": now})
-                if _GRADE_PENDING["count"] >= _GRADE_CONFIRM:
+                if _GRADE_PENDING["count"] >= _confirm:
                     grade = raw
                     change_reason = f"评级切换 {last}→{raw}(5分钟窗口连续确认)"
                     _GRADE_PENDING.update({"grade": None, "count": 0, "ts": 0.0})
                 else:
                     grade = last
-                    change_reason = f"评级切换待确认 {last}→{raw}({_GRADE_PENDING['count']}/{_GRADE_CONFIRM})"
+                    change_reason = f"评级切换待确认 {last}→{raw}({_GRADE_PENDING['count']}/{_confirm})"
 
     # 持久化当日评级
     arch[today] = grade
