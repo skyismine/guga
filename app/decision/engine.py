@@ -393,36 +393,56 @@ def _fg_series(fg) -> list:
     return [float(v) for _, v in sorted(arch.items())][-10:]
 
 
-def _adaptive_weights(fg_hist: list, closes: list) -> dict:
-    """环境自适应评分权重(2.1)。
+def _adaptive_weights(fg_hist: list, closes: list, amounts: list = None) -> dict:
+    """环境自适应评分权重(2.1 升级: 情绪市方向修正 + 判据细化)。
 
-    - 趋势市(20日涨跌幅| |>5%): trend 30 / mood 20
-    - 震荡市(20日涨跌幅| |<2%): breadth 35 / trend 10
-    - 情绪市(恐贪波动率>20):   mood 35 / vp 0(显式清零)
-    近5组权重均值平滑 + 单维度±50%限幅(显式清零维度除外) + 归一化总分100。
+    - 趋势市(|20日涨幅|≥5% 且 MA20 斜率>0.3%/日): trend 30 / mood 20 / vp 10
+    - 震荡市(|20日涨幅|<2% 且 20日振幅<8%): breadth 35 / mood 25 / trend 10
+    - 情绪市(恐贪10日波动率>20 或 量能比近5日标准差>0.3): mood 20 / vp 15 / zt 25 / trend 15
+      —— 情绪市恐贪剧烈波动应低配恐贪降噪、高配量价/涨停(量能才是情绪持续性关键),
+         修正 2.1「恐贪35/量价0」的相反方向;
+    - 中性市: 默认(恐贪30/宽度25/涨停20/量价5/趋势20); 情绪市优先于趋势/震荡判定。
+    近5组权重均值平滑 + 单维度±50%限幅 + 归一化总分100。
     """
     _BASE = {"mood": 30.0, "breadth": 25.0, "zt": 20.0, "vp": 5.0, "trend": 20.0}
     _SMOOTH_N, _LIMIT = 5, 0.5
     w = dict(_BASE)
     mode = "neutral"
-    if closes and len(closes) >= 21:
-        ret20 = float(closes[-1]) / float(closes[-21]) - 1
-        if abs(ret20) > 0.05:
-            mode = "trend"
-        elif abs(ret20) < 0.02:
-            mode = "range"
+    ret20 = ma_slope = amp20 = None
+    c = [float(x) for x in (closes or []) if x]
+    if len(c) >= 26:
+        ret20 = c[-1] / c[-21] - 1
+        ma_now = sum(c[-20:]) / 20.0
+        ma_prev = sum(c[-25:-5]) / 20.0 if len(c) >= 25 else ma_now
+        ma_slope = (ma_now / ma_prev - 1) / 5.0 if ma_prev else 0.0    # MA20 每日斜率(小数/日)
+        lo20 = min(c[-20:])
+        amp20 = (max(c[-20:]) / lo20 - 1) if lo20 else 0.0             # 20日振幅
     mood_vol = 0.0
     if fg_hist and len(fg_hist) >= 5:
         m = sum(fg_hist) / len(fg_hist)
         mood_vol = (sum((v - m) ** 2 for v in fg_hist) / len(fg_hist)) ** 0.5
-    if mode == "trend":
-        w["trend"], w["mood"] = 30.0, 20.0
-    elif mode == "range":
-        w["breadth"], w["trend"] = 35.0, 10.0
-    zero_keys = set()
-    if mood_vol > 20:                       # 情绪市: 恐贪权重提升、量价归零(显式规则)
-        w["mood"], w["vp"] = 35.0, 0.0
-        zero_keys.add("vp")
+    amt_std5 = 0.0
+    a = [float(x) for x in (amounts or []) if x]
+    if len(a) >= 6:
+        ratios = [a[i] / a[i - 1] for i in range(1, len(a)) if a[i - 1] and a[i]]
+        if len(ratios) >= 5:
+            r = ratios[-5:]
+            rm = sum(r) / len(r)
+            amt_std5 = (sum((v - rm) ** 2 for v in r) / len(r)) ** 0.5   # 量能比近5日标准差
+    trend_ok = (ret20 is not None and abs(ret20) >= 0.05
+                and (ma_slope is not None and abs(ma_slope) > 0.003))
+    range_ok = (ret20 is not None and abs(ret20) < 0.02
+                and amp20 is not None and amp20 < 0.08)
+    emotion_ok = mood_vol > 20 or amt_std5 > 0.3
+    if emotion_ok:                       # 情绪市优先(题材炒作期恐贪/量能剧变须特殊处理)
+        mode = "emotion"
+        w.update(mood=20.0, vp=15.0, zt=25.0, trend=15.0)
+    elif trend_ok:
+        mode = "trend"
+        w.update(trend=30.0, mood=20.0, vp=10.0)
+    elif range_ok:
+        mode = "range"
+        w.update(breadth=35.0, mood=25.0, trend=10.0)
     w["mode"] = mode
     # 5组权重均值平滑(当日重复调用稳定,避免单次环境抖动引发权重跳变)
     _WEIGHT_HIST.append(dict(w))
@@ -432,11 +452,8 @@ def _adaptive_weights(fg_hist: list, closes: list) -> dict:
     if len(_WEIGHT_HIST) > 1:
         avg = {k: sum(h[k] for h in _WEIGHT_HIST) / len(_WEIGHT_HIST) for k in keys}
         w.update(avg)
-    # 单维度 ±50% 限幅(显式清零的维度保持 0)
+    # 单维度 ±50% 限幅
     for k in keys:
-        if k in zero_keys:
-            w[k] = 0.0
-            continue
         w[k] = max(_BASE[k] * (1 - _LIMIT), min(_BASE[k] * (1 + _LIMIT), w[k]))
     tot = sum(w[k] for k in keys) or 100.0
     for k in keys:
@@ -590,7 +607,7 @@ def market_permit() -> dict:
         pass
 
     # 2.1 环境自适应权重(趋势市/震荡市/情绪市 → 动态权重, 5日均值平滑)
-    weights = _adaptive_weights(_fg_series(fg), closes)
+    weights = _adaptive_weights(_fg_series(fg), closes, amounts)
     score = _market_score(fg, adv_ratio, zt, vp, trend, weights)
     # 2.4 评级滞回(升级更严/降级更松 + 切换确认 + 单日限幅)
     grade, grade_change = _grade(score, zt, adv_ratio, rules)
@@ -607,7 +624,7 @@ def market_permit() -> dict:
                        "ok": adv_ratio is not None and adv_ratio >= rules["adv_ratio_full"],
                        "ok_min": adv_ratio is not None and adv_ratio >= rules["adv_ratio_ok"]},
     }
-    _W_MODE_TAG = {"trend": "趋势市", "range": "震荡市", "neutral": "中性市"}
+    _W_MODE_TAG = {"trend": "趋势市", "range": "震荡市", "emotion": "情绪市", "neutral": "中性市"}
     reasons = []
     if fg is not None:
         reasons.append(f"恐贪指数 {fg:.0f} 分({fear_greed_label(fg)}),贡献评分 {fg / 100 * weights['mood']:.0f}/{weights['mood']:.0f}")
