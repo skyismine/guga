@@ -1146,6 +1146,7 @@ def mainline_select() -> dict:
         if ext_cfg and style:
             s_adj = _style_score_adj(style, r.get("size_bias", 0), scale=_style_scale)
             if s_adj:
+                item["style_raw_score"] = item["score"]   # 调整前(扣分/量价修正后)原始分
                 item["score"] = round(item["score"] + s_adj, 2)
                 item["style_adj"] = s_adj
         # 3.2 准入线动态调整(板块历史分位+波动率+防御属性, 带调整明细透明化)
@@ -1164,7 +1165,10 @@ def mainline_select() -> dict:
             for _p in pen_reasons:
                 item["reasons"].append(f"扣分: {_p}")
             if item.get("style_adj"):
-                item["reasons"].append(f"风格偏转 {'对齐' if item['style_adj'] > 0 else '背离'} {item['style_adj']:+.1f} 分")
+                _sraw = item.get("style_raw_score")
+                item["reasons"].append(
+                    f"风格偏转 {'对齐' if item['style_adj'] > 0 else '背离'} {item['style_adj']:+.1f} 分"
+                    + (f"({_sraw:.1f}→{item['score']:.1f})" if _sraw is not None else ""))
             if item.get("admission_adj_note"):
                 item["reasons"].append(f"准入线调整: {item['admission_adj_note']}(生效线 {eff_admission:.0f})")
             item["pool"] = _sector_pool(r["industry"])
