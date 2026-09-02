@@ -47,11 +47,26 @@ def _is_etf(code) -> bool:
 _CACHE = {}
 _LOCK = threading.Lock()
 _LAST_CALL = 0.0
+# 429/4001 限流冷却: 收到限流后进入冷却期,期间直接快速失败(不再发请求, 防止重试空耗配额)
+_QUOTA_COOLDOWN = 0.0
+_QUOTA_COOLDOWN_SEC = 60
+_LIMIT_CODES = (429, 4001, 400)
+
+
+def _limit_hit(code, msg) -> bool:
+    if code in _LIMIT_CODES:
+        return True
+    m = str(msg or "").lower()
+    return ("limit" in m or "频率" in m or "频次" in m or "too many" in m or "rate" in m)
 
 
 def _get(path: str, params: dict = None, ttl: int = 0):
-    """GET /api/** 返回 data 容器。未启用抛 RuntimeError;业务错误按 code 抛。"""
-    global _LAST_CALL
+    """GET /api/** 返回 data 容器。未启用抛 RuntimeError;业务错误按 code 抛。
+
+    限流(429/4001)时: 记录 fault 熔断 + 进入 _QUOTA_COOLDOWN_SEC 冷却,
+    冷却期内直接抛错快速失败(不实际发请求), 上层重试不空耗配额, 由 akshare/新浪降级。
+    """
+    global _LAST_CALL, _QUOTA_COOLDOWN
     if not enabled():
         raise RuntimeError("fuyao 未启用(settings.fuyao.enabled)")
     key = json.dumps([path, params], ensure_ascii=False, sort_keys=True)
@@ -59,6 +74,9 @@ def _get(path: str, params: dict = None, ttl: int = 0):
         hit = _CACHE.get(key)
         if hit and time.time() - hit["t"] < ttl:
             return hit["v"]
+        # 限流冷却: 快速失败, 不触发网络
+        if time.time() < _QUOTA_COOLDOWN:
+            raise RuntimeError(f"fuyao {path} 限流冷却中,{int(_QUOTA_COOLDOWN - time.time())}s 后再试")
         # 节流:距上次请求不足 qps_gap 时等待
         gap = float(_cfg().get("qps_gap", 0.3) or 0.3)
         wait = _LAST_CALL + gap - time.time()
@@ -72,7 +90,22 @@ def _get(path: str, params: dict = None, ttl: int = 0):
     except ValueError:
         raise RuntimeError(f"fuyao {path} 响应非JSON: HTTP {r.status_code}")
     if data.get("code") != 0:
-        raise RuntimeError(f"fuyao {path} 业务错误 code={data.get('code')}: {data.get('message')}")
+        msg = data.get("message")
+        if _limit_hit(data.get("code"), msg):
+            _QUOTA_COOLDOWN = time.time() + float(_cfg().get("cooldown_sec", 60) or 60)
+            try:
+                from app.support import fault as _flt
+                _flt.record_failure("fuyao.api", f"{path}: {msg}")
+                _flt.warning("fuyao", f"接口限流,进入冷却 {_cfg().get('cooldown_sec', 60)}s",
+                             context={"path": path, "code": data.get("code"), "message": msg})
+            except Exception:  # noqa: BLE001
+                pass
+        raise RuntimeError(f"fuyao {path} 业务错误 code={data.get('code')}: {msg}")
+    try:
+        from app.support import fault as _flt
+        _flt.record_success("fuyao.api")
+    except Exception:  # noqa: BLE001
+        pass
     with _LOCK:
         _CACHE[key] = {"t": time.time(), "v": data.get("data")}
     return data.get("data")
