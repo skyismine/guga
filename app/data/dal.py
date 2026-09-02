@@ -285,22 +285,63 @@ def is_alarmed(data_type: str) -> bool:
 
 
 # ---------------------------------------------------------------- 数据质量
-def with_quality(obj, score: float = 1.0, src: str = "", note: str = "") -> dict:
+# 来源可靠性基准(0~1): 主源=1.0, 回退/缓存/过期缓存逐级降低
+_SRC_BASE = {
+    "fuyao": 1.0, "sina": 1.0, "sina_hq": 1.0, "ths": 0.95, "sina_daily": 0.90,
+    "market": 1.0, "legu": 0.80, "eastmoney": 0.85, "em": 0.85, "tencent": 0.85,
+    "cache": 0.70, "stale_cache": 0.15, "fallback": 0.40, "-": 0.0, "": 0.0,
+}
+
+
+def quality_for(src: str, age_seconds: float = 0.0, missing_ratio: float = 0.0) -> float:
+    """多维度质量评分(0~1, 对齐「数据质量细粒度评分」最小方案)。
+
+    - 来源可靠性(0.2): 主源(fuyao/新浪)=1.0, 东财/腾讯=0.85, 缓存=0.70, 过期缓存=0.40;
+    - 新鲜度(0.3): ≤30s 满分, 每 5 分钟扣 0.05, 最低 0;
+    - 完整性(0.4): 按缺省填充比例(1 - missing_ratio);
+    - 一致性(0.1): 回退源给 0.05(存在偏差风险), 其余 0.1。
+    """
+    base = _SRC_BASE.get(src or "", 0.60)
+    src_w = base * 0.2
+    fresh_w = max(0.0, 0.3 - max(0.0, float(age_seconds) - 30) / 300.0 * 0.05)
+    comp_w = 0.4 * max(0.0, min(1.0, 1 - float(missing_ratio or 0.0)))
+    cons_w = 0.05 if (src or "") in ("stale_cache", "fallback", "legu") else 0.1
+    return round(max(0.0, min(1.0, src_w + fresh_w + comp_w + cons_w)), 3)
+
+
+def with_quality(obj, score: float = None, src: str = "", note: str = "") -> dict:
     """为 dict 结果注入质量字段(新副本,不污染原对象)。score∈[0,1]。
-    用于"每个数据源返回数据时附带 data_quality 字段"。"""
+    用于"每个数据源返回数据时附带 data_quality 字段"。score 缺省按 quality_for(src) 计算。"""
+    if score is None:
+        score = quality_for(src)
     out = dict(obj) if isinstance(obj, dict) else {"value": obj}
     out["data_quality"] = round(max(0.0, min(1.0, score)), 3)
     out["data_source"] = src
     out["data_note"] = note
+    record_quality(src, out["data_quality"])
     return out
 
 
-def attach_quality(obj: dict, score: float = 1.0, src: str = "", note: str = "") -> dict:
-    """原地注入质量字段(调用方持有该 dict 时用)。"""
+def attach_quality(obj: dict, score: float = None, src: str = "", note: str = "") -> dict:
+    """原地注入质量字段(调用方持有该 dict 时用)。score 缺省按 quality_for(src) 计算。"""
+    if score is None:
+        score = quality_for(src)
     obj["data_quality"] = round(max(0.0, min(1.0, score)), 3)
     obj["data_source"] = src
     obj["data_note"] = note
+    record_quality(src, obj["data_quality"])
     return obj
+
+
+def record_quality(src: str, score: float) -> None:
+    """把一次数据质量分登记到 fault 聚合(供健康面板按来源统计均分与趋势)。"""
+    if score is None or src is None:
+        return
+    try:
+        from app.support import fault as _flt
+        _flt.record_quality(str(src), float(score))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def quality_summary(collectors: dict) -> dict:

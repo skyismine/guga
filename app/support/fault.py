@@ -29,6 +29,9 @@ _CB: dict = {}
 _GLOBAL = {"ok": 0, "fail": 0}
 # 全局熔断状态
 _GLOBAL_TRIP = {"open": False, "until": 0.0}
+# 数据质量聚合: src -> {sum, n, recent(滚动窗口)}
+_QUALITY: dict = {}
+_QUALITY_WINDOW = 50
 _ALERT_HOOK = None      # 可注入告警回调(webhook/邮件), 默认仅日志
 
 _CB_FAIL_THRESHOLD = 5      # 连续失败次数(可由 settings.system 覆盖)
@@ -207,7 +210,8 @@ def global_health() -> dict:
                 m: {"open": st["open_until"] > time.time(), "fail": st["fail"],
                     "opens": st["opens"], "last_error": st["last_error"]}
                 for m, st in _CB.items()},
-            "threshold": thr, "open_minutes": mins}
+            "threshold": thr, "open_minutes": mins,
+            "quality": quality_health()}
 
 
 def guarded(module: str, fn, fallback=None, trace_id: str = None, context: dict = None):
@@ -229,6 +233,35 @@ def guarded(module: str, fn, fallback=None, trace_id: str = None, context: dict 
 def new_trace_id() -> str:
     """生成决策链路 trace_id。"""
     return f"{dt.datetime.now().strftime('%Y%m%d%H%M%S')}{os.getpid()}{threading.get_ident()}"
+
+
+# ---------------------------------------------------------------- 数据质量聚合
+def record_quality(src: str, score: float) -> None:
+    """登记一次数据质量分(按来源聚合, 供健康面板展示均分/趋势)。"""
+    if score is None:
+        return
+    st = _QUALITY.setdefault(str(src), {"sum": 0.0, "n": 0, "recent": []})
+    st["sum"] += float(score)
+    st["n"] += 1
+    st["recent"].append(float(score))
+    if len(st["recent"]) > _QUALITY_WINDOW:
+        st["recent"].pop(0)
+
+
+def quality_health() -> dict:
+    """各来源平均质量分 + 近窗口趋势(下降触发告警)。"""
+    out = {}
+    for src, st in _QUALITY.items():
+        if not st["n"]:
+            continue
+        avg = st["sum"] / st["n"]
+        rec = st["recent"]
+        trend = round(rec[-1] - rec[0], 3) if len(rec) >= 10 else 0.0
+        if trend <= -0.2:
+            warning("quality", f"数据源 {src} 质量分趋势下降 {trend:+.3f},请关注",
+                    context={"avg": round(avg, 3), "samples": st["n"]})
+        out[src] = {"avg": round(avg, 3), "samples": st["n"], "trend": trend}
+    return out
 
 
 # ---------------------------------------------------------------- 降级助手(标注)

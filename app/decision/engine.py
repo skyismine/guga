@@ -625,6 +625,19 @@ def market_permit() -> dict:
     reasons.append(f"大盘综合评分 {score},达 {grade} 级标准,当前市场阶段「{pcfg['label']}」总仓位上限 {cap:.0%}")
     if grade_change:
         reasons.append(grade_change)
+    # 数据质量: 行情日期是否当日 + 关键维度是否缺失(供决策层降权)
+    _dq, _dq_note = 1.0, ""
+    try:
+        _mdate = str(snap.get("market_date") or "")
+        _today_s = str(dt.date.today())
+        if _mdate and _mdate[:10] < _today_s:
+            _dq, _dq_note = 0.55, f"行情日期滞后(快照 {_mdate},今日 {_today_s})"
+        elif fg is None or adv_ratio is None or amount_yi is None:
+            _dq, _dq_note = 0.65, "关键维度缺失(恐贪/涨跌家数/成交额)"
+    except Exception:  # noqa: BLE001
+        pass
+    if _dq < 0.8:
+        reasons.append(f"数据质量 {_dq:.2f}:{_dq_note}")
     out = {
         "grade": grade,
         "grade_label": {"A": "A级·积极配置", "B": "B级·谨慎配置",
@@ -638,6 +651,8 @@ def market_permit() -> dict:
         "weight_mode": weights.get("mode"),
         "vol_trend": {"dir": _VR_TREND["dir"], "count": _VR_TREND["count"]},
         "grade_change": grade_change,
+        "data_quality": round(_dq, 2),
+        "data_quality_note": _dq_note,
         "market_phase": phase,
         "phase_label": pcfg["label"],
         "operation_keynote": pcfg["keynote"],
@@ -1583,11 +1598,13 @@ def _matrix_cap(grade: str, asset_type: str, dcfg: dict) -> float | None:
 def execution_plan(target: dict, total_asset: float, taste: str,
                    market_cap: float = None, single_cap: float = None,
                    grade: str = None, asset_type: str = None,
-                   sector_used_pct: float = 0.0, sector_cap_pct: float = None) -> dict:
+                   sector_used_pct: float = 0.0, sector_cap_pct: float = None,
+                   data_quality: float = None) -> dict:
     """6.1 执行参数计算守卫: 异常 → 保守输出(空仓建议) + "计算异常" 标注。"""
     try:
         return _execution_plan_impl(target, total_asset, taste, market_cap, single_cap,
-                                    grade, asset_type, sector_used_pct, sector_cap_pct)
+                                    grade, asset_type, sector_used_pct, sector_cap_pct,
+                                    data_quality)
     except Exception as e:  # noqa: BLE001
         from app.support import fault as _flt
         _flt.error("execution_plan", f"执行参数计算异常 {target.get('code')}", exc=e,
@@ -1601,8 +1618,13 @@ def execution_plan(target: dict, total_asset: float, taste: str,
 def _execution_plan_impl(target: dict, total_asset: float, taste: str,
                          market_cap: float = None, single_cap: float = None,
                          grade: str = None, asset_type: str = None,
-                         sector_used_pct: float = 0.0, sector_cap_pct: float = None) -> dict:
+                         sector_used_pct: float = 0.0, sector_cap_pct: float = None,
+                         data_quality: float = None) -> dict:
     """第四层:单标的精确执行参数(ATR止损 / 分批建仓 / 目标价 / 仓位)。
+
+    数据质量联动(最小方案):
+    - data_quality < 0.5: 拒绝该数据驱动决策, 输出观望;
+    - 0.5 <= data_quality < 0.8: 仓位 ×0.8 并标注「数据质量一般」。
 
     market_cap:市场评级总仓位上限;single_cap:单只标的上限(旧模式)。
     grade:市场评级(A/B/C/D);asset_type:标的类型(mood|mid|etf|def_etf),动态仓位矩阵。
@@ -1629,6 +1651,16 @@ def _execution_plan_impl(target: dict, total_asset: float, taste: str,
         # 高潮加速/退潮: 禁止新增开仓/加仓(风控前置拦截, 而非事后提示)
         return {"ok": False, "name": target.get("name"), "code": target.get("code"),
                 "reason": f"当前阶段「{pcfg['label']}」禁止新增开仓/加仓(单次上限 0)"}
+    if data_quality is not None and data_quality < 0.5:
+        # 数据质量过低: 不使用该数据驱动决策, 回退观望(最小方案)
+        return {"ok": False, "name": target.get("name"), "code": target.get("code"),
+                "reason": f"数据质量过低({data_quality:.2f}),建议观望/使用最近有效值",
+                "degraded": True, "degrade_reason": f"数据质量过低({data_quality:.2f})"}
+    _dq_factor = 1.0
+    _dq_note = ""
+    if data_quality is not None and data_quality < 0.8:
+        _dq_factor = 0.8
+        _dq_note = f";数据质量一般({data_quality:.2f}),仓位×{_dq_factor}"
     lv = target.get("levels") or {}
     atr = target.get("atr14")
     atr = float(atr) if atr else None
@@ -1774,6 +1806,8 @@ def _execution_plan_impl(target: dict, total_asset: float, taste: str,
     else:
         single_cap = single_cap if single_cap is not None else _st.load().get("risk", {}).get("single_pct", 0.10)
     max_mv = total_asset * min(market_cap or 1.0, single_cap, pcfg["single_cap"])  # 阶段单票上限并入
+    if _dq_factor < 1.0:
+        max_mv = max_mv * _dq_factor   # 数据质量一般: 仓位 ×0.8
 
     # ---- 5.4 板块集中度: 单板块总仓位上限(主升放宽40%), 超出则压缩 + 预警
     pm_block = pm if use_matrix else {}
@@ -1912,7 +1946,8 @@ def _execution_plan_impl(target: dict, total_asset: float, taste: str,
         "note": (f"单笔风险 {risk_money:,.0f} 元(总资金 {risk_rate:.1%}),预计最大亏损 {max_loss:,.0f} 元"
                  f"({max_loss / total_asset:.2%} 占总资金),止损 {stop:.2f}(亏 {loss_per_share:.2f}/股),"
                  f"建议仓位 {shares} 股 / {pos_value:,.0f} 元({pos_value / total_asset:.1%})。{mode_note}"
-                 f"{matrix_note}{block_note}{rb_note}。{_td_note}"),
+                 f"{matrix_note}{block_note}{rb_note}{_dq_note}。{_td_note}"),
+        "data_quality": data_quality,
     }
 
 
@@ -2150,7 +2185,8 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
                 continue
             p = execution_plan(
                 item, total_asset, taste, market_cap=p1["cap"],
-                grade=p1["grade"], asset_type=atype, sector_used_pct=blk_used)
+                grade=p1["grade"], asset_type=atype, sector_used_pct=blk_used,
+                data_quality=p1.get("data_quality"))
             # 三档差异化仓位系数: 中军×1.5 / 情绪×0.5 / 补涨×0.6(随标的输出)
             coef = float(item.get("position_coef") or 1.0)
             if p.get("ok") and p.get("position_pct"):
@@ -2172,7 +2208,7 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
                     item, total_asset, taste, market_cap=p1["cap"],
                     single_cap=_st.load().get("risk", {}).get("single_pct", 0.10),
                     grade=p1["grade"], asset_type="def_etf",
-                    sector_used_pct=0.0)
+                    sector_used_pct=0.0, data_quality=p1.get("data_quality"))
                 plans.setdefault(defensive["name"], {})["etf"] = p
 
     # 5.4 跨标的约束后处理: 板块集中度(前二≤50%/产业链) + 相关性 + 总风险预算

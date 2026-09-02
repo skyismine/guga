@@ -381,7 +381,7 @@ def get_spot_quote(code: str) -> Dict:
                     quote[k] = 0.0
             quote["pct_chg"] = (quote["price"] - quote["prev_close"]) / quote["prev_close"] if quote["prev_close"] else 0.0
             quote["datetime"] = f"{quote.get('date')} {quote.get('time')}"
-            dal.attach_quality(quote, 1.0, "sina_hq", "实时快照")
+            dal.attach_quality(quote, src="sina_hq", note="实时快照")
             dal.mem_set(_key, quote, 30)
             return quote
     except Exception as _e:  # noqa: BLE001  实时失败降级本地快照
@@ -437,7 +437,7 @@ def get_spot_quotes(codes: List[str]) -> Dict[str, Dict]:
                         except (TypeError, ValueError):
                             q[k] = 0.0
                     q["pct_chg"] = (q["price"] - q["prev_close"]) / q["prev_close"] if q["prev_close"] else 0.0
-                    dal.attach_quality(q, 1.0, "sina_hq", "实时快照")
+                    dal.attach_quality(q, src="sina_hq", note="实时快照")
                     c = symbol_to_code(symbol)
                     out[c] = q
                     dal.mem_set(dal.cache_key("spot", c, date=_today), q, 30)
