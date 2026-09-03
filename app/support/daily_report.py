@@ -47,7 +47,20 @@ def generate(use_cache: bool = True, save: bool = True, use_llm: bool = None,
     date = str(r.get("date") or d.get("date") or dt.date.today())
     ctx = r.get("snapshot_ctx") or {}
 
+    sections = r.get("sections") or {}
+    overview = sections.get("snapshot")
+    others = [s for k, s in sections.items() if k != "snapshot"]
+
     lines = [f"# 每日深度复盘  {date}", ""]
+    # 可读性 P0: 30秒速览置于标题后第 1 屏(先结论后细节)
+    if overview:
+        _append_section(lines, overview)
+        lines.append("")
+    # 可读性 P2: 导读条(模块索引, 替代易失效的 md 锚点目录)
+    _guide = " · ".join(s["title"].lstrip("# ").split("(")[0] for s in others if s.get("title"))
+    if _guide:
+        lines.append(f"> 📑 本节导读: {_guide}")
+        lines.append("")
     llm_on = (use_llm if use_llm is not None else bool((cfg.get("llm") or {}).get("enable")))
     if llm_on:
         # LLM 只写「核心结论」叙事段: 输入含 速览指标/近3日趋势/决策验证/持仓与合规摘要
@@ -59,15 +72,24 @@ def generate(use_cache: bool = True, save: bool = True, use_llm: bool = None,
         }
         out = _llm.generate_strategy_cached(d, extra=extra)
         if out["ok"] and _llm_check(out["text"], ctx):
-            lines.append(out["text"])
+            lines.append("## 🤖 核心结论(大模型叙事)")
+            lines.append("")
+            # 可读性 P0: 模型输出若为「5 行小标题」则转列表渲染, 否则原样兜底
+            _nl = [ln for ln in str(out["text"]).splitlines() if ln.strip()]
+            if _nl and all(ln.strip().startswith("**") for ln in _nl):
+                for ln in _nl:
+                    lines.append(f"- {ln.strip()}")
+            else:
+                lines.append(out["text"])
             lines.append("")
             lines.append(f"> 核心结论叙事由大模型基于当日盘面+持仓+操作数据生成,已通过关键数值校验"
                         f"(模型:{(_cfg_llm().get('model') or '-')})。")
             lines.append("")
         else:
             print(f"[report] LLM 核心结论降级: {out.get('reason') or '数值校验未通过'}")
-    # 规则主体: 渲染全部结构化 sections(表格/清单/方案/校验/纪律/来源)
-    _append_rule_fallback(lines, r)
+    # 规则主体: 渲染其余结构化 sections(表格/清单/方案/校验/纪律/来源)
+    for sec in others:
+        _append_section(lines, sec)
 
     lines.append("")
     lines.append(f"> **免责声明**:{cfg.get('disclaimer')}")
@@ -136,29 +158,58 @@ def _cfg_llm() -> dict:
     return _st.load().get("llm") or {}
 
 
-def _append_rule_fallback(lines: list, r: dict) -> None:
-    """规则兜底: 输出结构化完整结论(全部模块 items 渲染为 Markdown),而非简单文本堆砌。"""
-    for sec in (r.get("sections") or {}).values():
-        lines.append(f"## {sec['title']}")
-        for it in sec.get("items", []):
-            if "t" in it:
-                lines.append(f"- {it['t']}")
-            elif "head" in it:
-                lines.append(f"**{it['head']}**")
-            elif "table" in it:
-                t = it["table"]
-                if t.get("title"):
-                    lines.append(f"**{t['title']}**")
-                cols = t["cols"]
-                lines.append("| " + " | ".join(cols) + " |")
-                lines.append("|" + "|".join(["---"] * len(cols)) + "|")
-                for row in t["rows"]:
-                    cells = []
-                    for c in row:
-                        v = str(c.get("v", "")) if isinstance(c, dict) else str(c)
-                        cells.append(" ".join(v.split()))
-                    lines.append("| " + " | ".join(cells) + " |")
-            lines.append("")
+def _clean_line(txt: str) -> str:
+    """列表符号统一: 去掉 t 文本自带的 '· ' '• ' '- ' 等引导符, 统一由渲染层加 '- '。"""
+    s = txt.strip()
+    if not s:
+        return s
+    if s[0] in ("·", "•"):
+        s = s[1:].lstrip()
+    elif s.startswith("- ") or s.startswith("– "):
+        s = s[1:].lstrip()
+    return s
+
+
+def _cap_cell(v: str, limit: int = 30) -> str:
+    """表格长文本统一截断: 避免新闻/异动长句在格内断到词中, 超限截断加省略号。"""
+    if len(v) <= limit:
+        return v
+    return v[:limit] + "…"
+
+
+def _append_section(lines: list, sec: dict) -> None:
+    """渲染单个 section(标题 + items), 统一:
+    - 列表项单 '- ' 引导(兼容 t 自带 '· ');
+    - 多行 t(含内嵌 \n)首行加 '- ', 续行保持缩进;
+    - 表格单元格压缩空白 + 长文本截断。
+    """
+    lines.append(f"## {sec['title']}")
+    for it in sec.get("items", []):
+        if "t" in it:
+            sub = str(it["t"]).split("\n")
+            first = sub[0]
+            lines.append(f"- {_clean_line(first)}" if _clean_line(first) else "")
+            for extra in sub[1:]:
+                e = extra.strip()
+                if e:
+                    lines.append(f"  {_clean_line(e)}")
+        elif "head" in it:
+            lines.append(f"**{it['head']}**")
+        elif "table" in it:
+            t = it["table"]
+            if t.get("title"):
+                lines.append(f"**{t['title']}**")
+            cols = t["cols"]
+            lines.append("| " + " | ".join(cols) + " |")
+            lines.append("|" + "|".join(["---"] * len(cols)) + "|")
+            for row in t["rows"]:
+                cells = []
+                for c in row:
+                    v = str(c.get("v", "")) if isinstance(c, dict) else str(c)
+                    v = _clean_line(" ".join(str(v).split()))
+                    cells.append(_cap_cell(v))
+                lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
 
 
 def _last_report_date() -> str:

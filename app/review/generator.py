@@ -244,23 +244,11 @@ def _sector_rotation(d: Dict) -> List[Dict]:
     up = sorted([f for f in flows if f["pct_chg"] > 0], key=lambda x: x["pct_chg"], reverse=True)
     down = sorted([f for f in flows if f["pct_chg"] < 0], key=lambda x: x["pct_chg"])
     by_net = sorted(flows, key=lambda x: x["net_yi"], reverse=True)
+    diverge = [f for f in up[:10] if f["net_yi"] < -0.5]
 
     items = []
-    # 1) 领涨主线(涨幅 + 资金共振)
-    mains = sorted([f for f in up[:15] if f["net_yi"] > 0],
-                   key=lambda x: x["net_yi"], reverse=True)[:3]
-    if not mains:
-        mains = up[:3]
-    items.append(_head("领涨主线(资金与涨幅共振)"))
-    mrows = [[f["industry"], _cell(f"{f['pct_chg']:+.2f}%", "up"),
-              _cell(f"{f['net_yi']:+.2f} 亿", "up"), f"{f['leader']} {f['leader_pct']:+.2f}%"]
-             for f in mains]
-    items.append(_table("", ["板块", "涨跌幅", "主力净流入", "领涨股"], mrows))
-    main_names = {f["industry"] for f in mains}
-    spread = [f for f in up[:10] if f["industry"] not in main_names]
-    if spread:
-        items.append(_t("扩散分支:" + "、".join(f["industry"] for f in spread[:4])
-                        + " 同步跟涨,形成板块级资金合力,主线由单一板块向同链条扩散。"))
+    # P1 可读性: 删除与「板块结构分类」/「资金面」重复的零散表(领涨主线Top3=分类表资金主线Top3;
+    # 分歧兑现=五高位风险), 避免同批板块 3 处重复; 领跌方向(跌幅口径)与五(净流出口径)不同保留。
 
     # ---- P1 板块结构分类(资金主线 / 异动脉冲 / 退潮回落)+ 驱动属性标签 ----
     # 注意: 此处「资金主线」仅按当日净流入居前界定(资金结构), 与 section 三 主线分级(评分)口径不同,
@@ -283,15 +271,7 @@ def _sector_rotation(d: Dict) -> List[Dict]:
                             _cell(f"{f['net_yi']:+.2f}亿", "down"), "回避/观察"])
     items.append(_table("", ["板块", "结构分类", "涨跌幅", "主力净流入", "驱动属性"], struct_rows))
 
-    # 2) 分歧 / 兑现主线(涨幅高但资金净流出)
-    diverge = [f for f in up[:10] if f["net_yi"] < -0.5]
-    if diverge:
-        items.append(_head("分歧 / 兑现主线(涨但资金流出,风险信号)"))
-        drows = [[f["industry"], _cell(f"{f['pct_chg']:+.2f}%", "up"),
-                  _cell(f"{f['net_yi']:+.2f} 亿", "down"), "冲高回落 / 获利兑现压力"] for f in diverge[:3]]
-        items.append(_table("", ["板块", "涨跌幅", "主力净流出", "风险提示"], drows))
-
-    # 3) 领跌方向
+    # 2) 领跌方向(跌幅最深口径; 与五「主力净流出口径」不同,保留)
     if down:
         items.append(_head("领跌方向(资金流出)"))
         down_rows = [[f["industry"], _cell(f"{f['pct_chg']:+.2f}%", "down"),

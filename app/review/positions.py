@@ -21,6 +21,16 @@ def _fmt_asset(v) -> str:
     return f"{v / 1e4:.2f}万" if v is not None and abs(v) >= 1e4 else str(v)
 
 
+_ATTR_CN = {"wait": "观望", "profit": "盈利保护", "band": "波段持有",
+            "core": "核心", "watch": "观望", "-": "-"}
+
+
+def _attr_cn(r: dict) -> str:
+    """属性(plan_kind)汉化: 原英文状态标签(如 wait/profit/band)对读者不友好。"""
+    v = str(r.get("plan_kind") or "")
+    return _ATTR_CN.get(v, v or "-")
+
+
 def positions_review(d: dict) -> list:
     """生成「持仓与交易体系」结构化 items(账户概览/持仓明细/合规校验/逐仓方案/交易纪律)。"""
     from app.support.risk import load_portfolio
@@ -95,7 +105,7 @@ def positions_review(d: dict) -> list:
                 f"{r.get('cost') or 0:.3f}", f"{r.get('price') or 0:.3f}",
                 _cell(f"{pct:+.2f}%" if pct is not None else "-"),
                 _cell(f"{r.get('pnl_pct', 0) * 100:+.1f}%"),
-                _cell(f"{r.get('plan_kind') or '-'}"),
+                _cell(_attr_cn(r)),
             ])
         items.append({"table": {"title": f"{bname}(市值 {_fmt_asset(grp_mv)})",
                                 "cols": ["名称", "代码", "分类", "持仓数", "成本", "收盘", "当日涨跌", "持仓盈亏", "属性"],
@@ -129,7 +139,7 @@ def positions_review(d: dict) -> list:
     if hold_viol:
         items.append({"t": "**存量持仓合规**:" + "；".join(f"⚠ {v}" for v in hold_viol[:4])})
     for c in audit["checks"][:3]:
-        items.append({"t": f"· {c}"})
+        items.append({"t": f"{c}"})
     if not ops:
         items.append({"t": "今日无交易记录(合规按持仓状态审计)。"})
     # 违规整改建议: 超仓标的 → 减仓目标位与优先级(针对存量超仓)
@@ -137,11 +147,13 @@ def positions_review(d: dict) -> list:
     if _fixes:
         items.append({"head": "违规整改建议(超仓减仓目标位)"})
         for f in _fixes:
-            items.append({"t": f"· **{f['name']}({f['code']})** 仓位 **{f['pct']:.1%}**,建议反弹至 **{f['target_price']:.2f}** 时减仓至 **{f['target_pct']:.0%}** 以内"})
+            items.append({"t": f"**{f['name']}({f['code']})** 仓位 **{f['pct']:.1%}**,建议反弹至 **{f['target_price']:.2f}** 时减仓至 **{f['target_pct']:.0%}** 以内"})
 
-    # ---- 明日逐仓操作方案
+    # ---- 明日逐仓操作方案(触发规则统一注一行, 不在每行重复模板句)
     items.append({"head": "明日持仓操作方案"})
     half = "半小时不收回" if (_st.load().get("discipline") or {}).get("half_hour_stop", True) else ""
+    if half:
+        items.append({"t": "触发规则: 跌破止损位 {half}→止损/减仓; 反弹至减仓位→分批减仓; 目标位达→分批兑现。".format(half=half)})
     plan_rows = []
     for r in rows:
         code = r["code"]
@@ -151,21 +163,16 @@ def positions_review(d: dict) -> list:
         tgt = lv.get("target")
         if not (res or stop):
             continue
-        trig = []
-        if stop:
-            trig.append(f"跌破 {stop:.2f} {half}止损/减仓")
-        if res:
-            trig.append(f"反弹至 {res:.2f} 减仓")
         plan_rows.append([
             _cell(r.get("name") or code), code,
             _cell(f"{res:.2f}" if res else "-"),
             _cell(f"{stop:.2f}" if stop else "-"),
             _cell(f"{tgt:.2f}" if tgt else "-"),
-            "；".join(trig),
+            _cell(f"{r.get('pnl_pct', 0) * 100:+.1f}%"),
         ])
     if plan_rows:
         items.append({"table": {"title": "",
-                                "cols": ["标的", "代码", "反弹减仓位", "止损位", "目标位", "触发条件"],
+                                "cols": ["标的", "代码", "反弹减仓位", "止损位", "目标位", "持仓盈亏"],
                                 "rows": plan_rows}})
     else:
         items.append({"t": "逐仓方案暂缺(持仓行情/模型数据未就绪)。"})
@@ -175,7 +182,7 @@ def positions_review(d: dict) -> list:
     if rules:
         items.append({"head": "统一交易纪律重申"})
         for r_ in rules:
-            items.append({"t": f"· {r_}"})
+            items.append({"t": f"{r_}"})
     return items
 
 

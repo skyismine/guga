@@ -320,11 +320,26 @@ def watch_pool_review(d: dict) -> list:
         # 数据未就绪: 复用前一日三档推荐, 标注 T日待更新(废弃「暂缺」空档)
         prev_rows = _prev_day_targets(d)
         if prev_rows:
-            items.append({"t": "决策引擎当日标的未就绪,以下复用前一日三档推荐并标注「T日数据待更新」。"})
-            items.append({"table": {"title": "",
-                                    "cols": ["板块", "角色", "代码", "名称", "当日涨幅",
-                                             "买入区间", "止损", "目标", "盈亏比", "建议仓位", "观察要点"],
-                                    "rows": prev_rows}})
+            # 可读性 P1: 复用态无当日买入区间/止损/目标(全部 '-'), 用紧凑清单替代
+            # 近空宽表(且同码多角色不再重复成行, 合并为一行), 数据就绪后仍出完整表
+            seen = {}
+            for p in prev_rows:
+                code = str(p[2] or "") if len(p) > 2 else ""
+                if not code:
+                    continue
+                ent = seen.setdefault(code, {"code": code,
+                                             "name": str(p[3]) if len(p) > 3 else code,
+                                             "sector": str(p[0]) if p and p[0] else "-",
+                                             "roles": [], "pct": str(p[4]) if len(p) > 4 else "-"})
+                role = str(p[1]) if len(p) > 1 else ""
+                if role and role not in ent["roles"]:
+                    ent["roles"].append(role)
+            txt = []
+            for code, e in list(seen.items())[:8]:
+                roles = "/".join(e["roles"]) or "-"
+                txt.append(f"{e['name']}({code},{e['sector']},{roles},{e['pct']})")
+            items.append({"t": "决策引擎当日标的未就绪,复用前一日三档推荐并标注「T日数据待更新」:"
+                               + "；".join(txt)})
         else:
             items.append({"t": "决策引擎当日标的未就绪,且无前一日推荐可复用。"})
 
