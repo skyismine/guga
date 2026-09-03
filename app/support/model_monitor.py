@@ -65,17 +65,26 @@ def _save_rows(rows: list) -> None:
 
 
 def record(code: str, pred: dict) -> None:
-    """记录一次预测(当日同 code 去重; 追加写 + 进程内记忆, 避免每标的全量重写)。"""
+    """记录一次预测(当日同 code 去重; 追加写 + 进程内记忆, 避免每标的全量重写)。
+
+    direction = 模型(Gbm)原始方向(metrics 现行口径, 兼容); 铺路归因字段:
+    src = 方向来源(gbm), ens_dir = 集成投票后方向(-1/0/1, 未启用为 None),
+    ens_agree = 模型与集成是否一致 —— 样本积累后可按 gbm/集成分别算准确率(动态调权/降级前提)。
+    """
     if not (pred and pred.get("direction")):
         return
     today = _today()
     code = str(code).zfill(6)
+    ens = pred.get("ensemble") or {}
     rec = {
         "date": today,
         "code": code,
         "p_up": round(float(pred.get("p_up") or 0), 4),
         "p_down": round(float(pred.get("p_down") or 0), 4),
         "direction": _DIRN.get(pred.get("direction")),
+        "src": "gbm",
+        "ens_dir": ens.get("ensemble_dir"),
+        "ens_agree": ens.get("agree"),
         "actual": None,
     }
     if _TODAY_MEM.get(code) == rec:
