@@ -38,7 +38,7 @@ def _req(prompt: str, system: str = None) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.4,
-        "max_tokens": int(c.get("max_tokens", 1500)),
+        "max_tokens": int(c.get("max_tokens", 2000)),
         "stream": False,
     }
     try:
@@ -112,7 +112,9 @@ def _compact_data(d: dict) -> dict:
     return out
 
 
-_MIN_CONTENT_LEN = 300   # 复盘文案最小有效长度:低于此值视为推理预算耗尽/截断,触发重试
+_MIN_CONTENT_LEN = 160   # 复盘文案最小有效长度。可读性改版后为「5 行小标题」要点
+#                        # (每行40-90字, 总长≈250~450), 阈值随之下调, 避免高频误判"过短"降级;
+#                        # 仍保留对 空/近空(推理预算耗尽/截断)的兜底。
 
 
 def generate_strategy(review_data: dict = None, extra: dict = None) -> dict:
@@ -140,7 +142,7 @@ def generate_strategy(review_data: dict = None, extra: dict = None) -> dict:
     prompt_lines.append("请基于以上数据撰写今日深度复盘文案。")
     prompt = "\n".join(prompt_lines)
 
-    last_reason = "模型返回内容过短(推理预算耗尽或输出被截断),建议调大 max_tokens"
+    last_reason = "模型返回内容过短/被截断(已重试3次);可在设置 llm.max_tokens 调大,或检查模型输出格式"
     for attempt in range(3):
         try:
             text = _req(prompt)
