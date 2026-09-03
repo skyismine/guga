@@ -609,17 +609,48 @@ _DECISION_CACHE = {"t": 0.0, "data": None, "err": None}
 _DECISION_TTL = 600
 _DECISION_LOCK = _threading.Lock()
 _DECISION_WORKER = {"running": False}
+# 交易日前移自动感知: 数据源恢复(如 fuyao 限流解除)后无需重启/改配置,
+# 进程内低频探针发现最新交易日 > 缓存决策日期即判 stale → 自动重算到新交易日。
+_MKT_DATE_MEMO = {"t": 0.0, "date": None}
+_MKT_DATE_PROBE_TTL = 300
 
 
-def _decision_stale() -> bool:
-    return (_DECISION_CACHE["data"] is None or _DECISION_CACHE["err"]
-            or _time.time() - _DECISION_CACHE["t"] > _DECISION_TTL)
+def _mkt_date_probe(force: bool = False) -> str:
+    """低频(≤1次/300s)获取最新交易日, 复用 review_date 的 fuyao→akshare 回退与 dal 缓存。
+    force=True(手动刷新)绕过节流立即探一次, 数据源恢复后点刷新即感知新交易日。"""
+    import datetime as _ddt
+    now = _time.time()
+    m = _MKT_DATE_MEMO
+    if m["date"] and now - m["t"] < _MKT_DATE_PROBE_TTL and not force:
+        return m["date"]
+    try:
+        from app.review.data import review_date
+        m["date"] = str(review_date())
+    except Exception:  # noqa: BLE001
+        m["date"] = m["date"] or _ddt.date.today().isoformat()
+    m["t"] = now
+    return m["date"]
 
 
-def _compute_decision():
+def _decision_stale(probe_force: bool = False) -> bool:
+    if _DECISION_CACHE["data"] is None or _DECISION_CACHE["err"]:
+        return True
+    if _time.time() - _DECISION_CACHE["t"] > _DECISION_TTL:
+        return True
+    # 缓存决策日期落后于最新交易日 → 强制重算(自愈, 无需重启)
+    try:
+        cached_date = str((_DECISION_CACHE["data"] or {}).get("date") or "")
+        if cached_date and cached_date < _mkt_date_probe(force=probe_force):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _compute_decision(force_probe: bool = False):
     """单飞计算:并发请求/预热线程共用一次计算,避免重复重算拖慢。"""
     with _DECISION_LOCK:
-        if not _decision_stale():
+        if not _decision_stale(probe_force=force_probe):
             return _DECISION_CACHE
         from app.decision.engine import decision_brief
         try:
@@ -633,9 +664,10 @@ def _compute_decision():
 
 
 def _get_decision(refresh=False):
-    """refresh 强制同步重算;非 refresh 冷缓存直接返回(不阻塞),由后台 worker 计算。"""
+    """refresh 强制同步重算;非 refresh 冷缓存直接返回(不阻塞),由后台 worker 计算。
+    refresh=1 时日期探针绕过节流(force_probe=True),数据源恢复后点刷新即感知新交易日。"""
     if refresh:
-        return _compute_decision()
+        return _compute_decision(force_probe=True)
     return _DECISION_CACHE
 
 
