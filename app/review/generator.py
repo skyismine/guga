@@ -27,6 +27,12 @@ def _fmt_float(x, nd=2) -> str:
     return f"{x:.{nd}f}" if x is not None else "-"
 
 
+def _elide(text, n: int) -> str:
+    """标题类字段截断: 超长统一加省略号, 避免断到词中/显式截断无标记。"""
+    text = str(text or "")
+    return text if len(text) <= n else text[:n] + "…"
+
+
 def _avg(rows, key):
     vals = [r[key] for r in rows if r.get(key) is not None]
     return sum(vals) / len(vals) if vals else 0.0
@@ -313,6 +319,15 @@ def _sector_rotation(d: Dict) -> List[Dict]:
         elif _avg_idx < -0.003 and _ratio > 0.55:
             items.append(_t("**指数弱、个股抗跌**:指数回调而多数个股上涨,权重拖累指数,题材高低切换,"
                             "以结构性修复机会为主。"))
+        elif abs(_avg_idx) <= 0.003:
+            # 指数近持平: 宽度决定定性, 避免误标「同步」 (微涨但跌多涨少时不该称同步)
+            if _ratio > 0.55:
+                items.append(_t("**指数横盘、个股普涨**:指数基本走平而多数个股上涨,宽度偏暖,结构性机会为主。"))
+            elif _ratio < 0.45:
+                items.append(_t(f"**指数横盘、个股普跌**:指数基本走平而跌多涨少(上涨 {adv:.0f} / 下跌 {dec:.0f}),"
+                                "赚钱效应弱、追高容错低。"))
+            else:
+                items.append(_t("**指数与个股同步**:指数方向与涨跌家数一致,结构风险与机会并存,精选个股为主。"))
         else:
             items.append(_t("**指数与个股同步**:指数方向与涨跌家数一致,结构风险与机会并存,精选个股为主。"))
 
@@ -504,7 +519,7 @@ def _events_v2(d: Dict) -> List[Dict]:
                     reso = "共振(板块资金流入),次日延续概率高"
                 elif fl.get("pct_chg") is not None and fl["pct_chg"] <= 0:
                     reso = "背离(以盘面资金为准)"
-            erows.append([title[:26], "、".join(matched) or "-", tier or "-",
+            erows.append([_elide(title, 26), "、".join(matched) or "-", tier or "-",
                           _event_note(kws), reso])
         items.append(_table("", ["要闻", "对应板块", "主线层级", "解读", "共振判断"], erows))
     if not hot:
@@ -637,7 +652,8 @@ def generate_review(d: Dict) -> Dict:
     risk_txt = "退潮主线不接力、无承接超跌不抄底"
     for it in layers_items:
         if it.get("t") and "核心风险点" in it["t"]:
-            risk_txt = it["t"].split(":", 1)[-1].strip()[:60]
+            # 剥掉 split 后冒号处可能残留的 '· ' 引导符(速览/风险条内嵌 '·' 显示为 ':·')
+            risk_txt = it["t"].split(":", 1)[-1].strip().lstrip("· ").strip()[:60]
     _cap_txt = "阶段仓位上限见明日策略"
     try:
         from app.decision.engine import phase_cfg

@@ -138,7 +138,13 @@ def positions_review(d: dict) -> list:
         items.append({"t": "**新开仓合规**:" + "；".join(f"⚠ {v}" for v in new_viol[:4])})
     if hold_viol:
         items.append({"t": "**存量持仓合规**:" + "；".join(f"⚠ {v}" for v in hold_viol[:4])})
-    for c in audit["checks"][:3]:
+    # 合规审计备注去重(保序), 避免 audit 生成的重复检查行(如同一标的"昨收缺失"多次)原样输出
+    _seen_c, _checks = set(), []
+    for c in audit["checks"]:
+        if c not in _seen_c:
+            _seen_c.add(c)
+            _checks.append(c)
+    for c in _checks[:3]:
         items.append({"t": f"{c}"})
     if not ops:
         items.append({"t": "今日无交易记录(合规按持仓状态审计)。"})

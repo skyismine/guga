@@ -98,7 +98,11 @@ def _driver_text(name: str, row: dict, events: list) -> str:
     from app.support.mainline import _concept_kw
     kw = _concept_kw(name)
     if kw and events:
-        matched = [e["title"][:18] for e in events if kw and kw in e.get("title", "")][:2]
+        matched = []
+        for e in events:
+            if kw and kw in e.get("title", "") and len(matched) < 2:
+                t = str(e.get("title") or "")
+                matched.append(t if len(t) <= 18 else t[:18] + "…")   # 标题截断加省略号
         if matched:
             parts.append("事件:" + "、".join(matched))
     return "；".join(parts) or "-"
