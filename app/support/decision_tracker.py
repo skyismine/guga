@@ -113,8 +113,7 @@ def _df_cache(code: str):
 
 def _mkt_after_pct(date: str) -> list:
     """date 之后的首批交易日涨跌幅列表(升序, 最多5)。collect_market_daily 行升序。
-    pct 口径归一: 历史行存「百分数值」(-0.97=-0.97%), fuyao 最新行存小数(0.0042=0.42%),
-    统一按小数处理(|pct|>0.5 视为百分数值÷100)。
+    md 行 pct_chg 统一为「百分值」(0.43=+0.43%, 东财/校准后 fuyao 一致), 复利需换算小数 ÷100。
     """
     try:
         from app.review.data import collect_market_daily
@@ -125,10 +124,7 @@ def _mkt_after_pct(date: str) -> list:
     for r in rows:
         d = str(r.get("date") or "")[:10]
         if d > str(date) and r.get("pct_chg") is not None:
-            pct = float(r["pct_chg"])
-            if abs(pct) > 0.5:
-                pct = pct / 100.0
-            aft.append(pct)
+            aft.append(float(r["pct_chg"]) / 100.0)
         if len(aft) >= 5:
             break
     return aft

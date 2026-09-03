@@ -794,7 +794,8 @@ def collect_market_daily(days: int = 10) -> List[Dict]:
                     rows[-1]["amount_yi"] = round((float(sh["turnover"]) / 1e8), 1)
                 if sh.get("last_price") is not None:
                     rows[-1]["close"] = float(sh["last_price"])
-                    rows[-1]["pct_chg"] = float(sh.get("price_change_ratio_pct") or 0) / 100.0
+                    # pct 口径与东财行一致=百分值(0.43=+0.43%);勿 ÷100(那是 indices 的小数约定)
+                    rows[-1]["pct_chg"] = float(sh.get("price_change_ratio_pct") or 0)
             if sh and sz and sh.get("turnover") and sz.get("turnover"):
                 rows[-1]["amount_yi"] = round((float(sh["turnover"]) + float(sz["turnover"])) / 1e8, 1)
             if sh:
