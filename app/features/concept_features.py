@@ -323,16 +323,31 @@ def _load_concept_daily(name: str) -> pd.DataFrame:
         raise KeyError(name)
     os.makedirs(_INDEX_DIR, exist_ok=True)
     path = os.path.join(_INDEX_DIR, f"{code}.pkl")
-    if os.path.exists(path) and time.time() - os.path.getmtime(path) <= config.CACHE_TTL_SECONDS:
+    # 可读/配额优化(B): 概念指数为日线, 盘内不变 → 每概念"每日首次 + 收盘后一次定值升级",
+    # 取代按 CACHE_TTL(小时级)反复抓取(数百概念会把 fuyao 日配额打光)。
+    if os.path.exists(path):
         try:
             with open(path, "rb") as f:
                 obj = pickle.load(f)
-            if isinstance(obj, pd.Series):  # 旧版缓存只有 close,重新抓取
-                pass
-            elif isinstance(obj, pd.DataFrame) and {"close", "volume"}.issubset(obj.columns):
-                return obj
         except Exception:
-            pass
+            obj = None
+        if isinstance(obj, pd.DataFrame) and {"close", "volume"}.issubset(obj.columns):
+            try:
+                import datetime as _dtt
+                today = _dtt.date.today().isoformat()
+                mday = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(path)))
+                now = _dtt.datetime.now()
+                _fresh = False
+                if mday == today:
+                    if (now.hour, now.minute) >= (15, 30):
+                        # 收盘后: 允许一次定值升级(把当日收盘 bar 纳入)
+                        _fresh = str(obj.index.max())[:10] >= today
+                    else:
+                        _fresh = True
+                if _fresh:
+                    return obj
+            except Exception:
+                pass
     last = None
     # fuyao 优先: 仅当概念名存在于 fuyao 同花顺目录时才走官方 API(避免对不存在的码空转请求)
     try:

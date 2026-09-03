@@ -360,7 +360,8 @@ def _activity_cache_ttl(cached: Dict) -> int:
     交易时段无论缓存来自实时还是收盘口径都 60s 刷新,便于盘中持续跟进;
     非交易时段数据已定型,4h 内复用。
     """
-    return _INTRADAY_TTL if _is_trading_time() else config.CACHE_TTL_SECONDS
+    _INTRADAY_HEAVY_TTL = 300   # 5min intraday: fuyao full-market snapshot(5000 rows) heavy payload
+    return _INTRADAY_HEAVY_TTL if _is_trading_time() else config.CACHE_TTL_SECONDS
 
 
 def get_market_activity(use_cache: bool = True) -> Dict:

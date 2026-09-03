@@ -59,6 +59,8 @@ _LAST_CALL = 0.0
 # 429/4001 限流冷却: 收到限流后进入冷却期,期间直接快速失败(不再发请求, 防止重试空耗配额)
 _QUOTA_COOLDOWN = 0.0
 _QUOTA_COOLDOWN_SEC = 60
+_QUOTA_STRIKES = 0
+_LAST_429_TS = 0.0
 _LIMIT_CODES = (429, 4001, 400)
 
 
@@ -75,7 +77,7 @@ def _get(path: str, params: dict = None, ttl: int = 0):
     限流(429/4001)时: 记录 fault 熔断 + 进入 _QUOTA_COOLDOWN_SEC 冷却,
     冷却期内直接抛错快速失败(不实际发请求), 上层重试不空耗配额, 由 akshare/新浪降级。
     """
-    global _LAST_CALL, _QUOTA_COOLDOWN
+    global _LAST_CALL, _QUOTA_COOLDOWN, _QUOTA_STRIKES, _LAST_429_TS
     if not enabled():
         raise RuntimeError("fuyao 未启用(settings.fuyao.enabled)")
     key = json.dumps([path, params], ensure_ascii=False, sort_keys=True)
@@ -101,7 +103,15 @@ def _get(path: str, params: dict = None, ttl: int = 0):
     if data.get("code") != 0:
         msg = data.get("message")
         if _limit_hit(data.get("code"), msg):
-            _QUOTA_COOLDOWN = time.time() + float(_cfg().get("cooldown_sec", 60) or 60)
+            _ts429 = time.time()
+            if _ts429 - _LAST_429_TS > 900:
+                _QUOTA_STRIKES = 1
+            else:
+                _QUOTA_STRIKES += 1
+            _LAST_429_TS = _ts429
+            _base = float(_cfg().get("cooldown_sec", 60) or 60)
+            _cap = float(_cfg().get("cooldown_max", 900) or 900)
+            _QUOTA_COOLDOWN = _ts429 + min(_base * (2 ** (_QUOTA_STRIKES - 1)), _cap)
             try:
                 from app.support import fault as _flt
                 _flt.record_failure("fuyao.api", f"{path}: {msg}")
@@ -112,6 +122,7 @@ def _get(path: str, params: dict = None, ttl: int = 0):
         raise RuntimeError(f"fuyao {path} 业务错误 code={data.get('code')}: {msg}")
     try:
         from app.support import fault as _flt
+        _QUOTA_STRIKES = 0   # 任一成功: 连续 429 计数清零(冷却恢复基准 60s)
         _flt.record_success("fuyao.api")
     except Exception as _e:  # noqa: BLE001
         _fault(_e)
@@ -248,7 +259,7 @@ def get_ths_index_daily(ths: str, days: int = 400):
     import pandas as pd
     start, end = _ms_range(int(days * 1.6) + 30)
     data = _get("/api/a-share-index/prices/historical",
-                {"thscode": ths, "interval": "1d", "start": start, "end": end}, ttl=3600)
+                {"thscode": ths, "interval": "1d", "start": start, "end": end}, ttl=86400)
     items = (data or {}).get("item") or []
     if not items:
         raise RuntimeError(f"fuyao 指数 {ths} 历史K线为空")
