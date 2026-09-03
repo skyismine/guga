@@ -406,40 +406,44 @@ def collect_sector_flow(use_cache: bool = True) -> list:
     import akshare as ak
     try:
         df = _retry(lambda: ak.stock_fund_flow_concept(symbol="即时"), n=2, slp=0.8)
+        # akshare 偶发内部 requests 异常(如 NoneType.text)或静默返回 None/空表,
+        # 取数与解析统一在 try 内: 任何异常 → 回退最近快照, 不把半成品抛到决策链路
+        if df is None or len(df) == 0:
+            raise RuntimeError("akshare 返回空数据")
+        df = df.rename(columns={df.columns[i]: c for i, c in enumerate(
+            ["no", "industry", "index_name", "pct", "inflow", "outflow",
+             "net", "num", "leader", "leader_pct", "leader_price"])})
+        net = pd.to_numeric(df["net"], errors="coerce")   # 单位:亿元
+        pct = pd.to_numeric(df["pct"], errors="coerce")
+        rows = []
+        for _, r in df.iterrows():
+            rows.append({
+                "industry": str(r["industry"]),
+                "pct_chg": float(pct.get(r.name, 0)) if pd.notna(pct.get(r.name)) else 0.0,
+                "net_yi": round(float(net.get(r.name, 0) or 0), 2),   # 已是亿元
+                "inflow_yi": round(float(r.get("inflow", 0) or 0), 2),
+                "outflow_yi": round(float(r.get("outflow", 0) or 0), 2),
+                "num": int(r["num"]) if pd.notna(r["num"]) else 0,
+                "leader": str(r["leader"]),
+                "leader_pct": float(r["leader_pct"]) if pd.notna(r["leader_pct"]) else 0.0,
+            })
+        # 去重: 同花顺概念资金流偶发重复板块名(同名同值),保留首次出现
+        seen, uniq = set(), []
+        for r in rows:
+            if r["industry"] in seen:
+                continue
+            seen.add(r["industry"])
+            uniq.append(r)
+        rows = uniq
+        rows.sort(key=lambda x: x["net_yi"], reverse=True)
+        _sf_save("sector_flow", rows)
+        _q("sector_flow", 1.0, "ths", "同花顺概念资金流(即时)")
+        return rows
     except Exception as e:  # noqa: BLE001
         rows = _sf_fallback("sector_flow", "同花顺概念资金流", e)
         _q("sector_flow", 0.5, "stale_cache", "实时抓取失败,回退最近快照")
         dal.record_missing("sector_flow", False, "同花顺概念资金流失败,回退快照")
         return rows
-    df = df.rename(columns={df.columns[i]: c for i, c in enumerate(
-        ["no", "industry", "index_name", "pct", "inflow", "outflow",
-         "net", "num", "leader", "leader_pct", "leader_price"])})
-    net = pd.to_numeric(df["net"], errors="coerce")   # 单位:亿元
-    pct = pd.to_numeric(df["pct"], errors="coerce")
-    rows = []
-    for _, r in df.iterrows():
-        rows.append({
-            "industry": str(r["industry"]),
-            "pct_chg": float(pct.get(r.name, 0)) if pd.notna(pct.get(r.name)) else 0.0,
-            "net_yi": round(float(net.get(r.name, 0) or 0), 2),   # 已是亿元
-            "inflow_yi": round(float(r.get("inflow", 0) or 0), 2),
-            "outflow_yi": round(float(r.get("outflow", 0) or 0), 2),
-            "num": int(r["num"]) if pd.notna(r["num"]) else 0,
-            "leader": str(r["leader"]),
-            "leader_pct": float(r["leader_pct"]) if pd.notna(r["leader_pct"]) else 0.0,
-        })
-    # 去重: 同花顺概念资金流偶发重复板块名(同名同值),保留首次出现
-    seen, uniq = set(), []
-    for r in rows:
-        if r["industry"] in seen:
-            continue
-        seen.add(r["industry"])
-        uniq.append(r)
-    rows = uniq
-    rows.sort(key=lambda x: x["net_yi"], reverse=True)
-    _sf_save("sector_flow", rows)
-    _q("sector_flow", 1.0, "ths", "同花顺概念资金流(即时)")
-    return rows
 
 
 def collect_sector_flow_5d(use_cache: bool = True) -> list:
@@ -457,30 +461,32 @@ def collect_sector_flow_5d(use_cache: bool = True) -> list:
     import akshare as ak
     try:
         df = _retry(lambda: ak.stock_fund_flow_concept(symbol="5日排行"), n=2, slp=0.8)
+        if df is None or len(df) == 0:
+            raise RuntimeError("akshare 返回空数据")
+        df = df.rename(columns={df.columns[i]: c for i, c in enumerate(
+            ["no", "industry", "num", "index_name", "pct", "inflow", "outflow", "net"])})
+        net = pd.to_numeric(df["net"], errors="coerce")
+        inflow = pd.to_numeric(df["inflow"], errors="coerce")
+        outflow = pd.to_numeric(df["outflow"], errors="coerce")
+        pct = pd.to_numeric(df["pct"].astype(str).str.replace("%", "", regex=False), errors="coerce")
+        rows = []
+        for _, r in df.iterrows():
+            rows.append({
+                "industry": str(r["industry"]),
+                "pct_5d": round(float(pct.get(r.name, 0) or 0), 2),      # 5日累计涨跌幅(%)
+                "inflow_5d_yi": round(float(inflow.get(r.name, 0) or 0), 2),
+                "outflow_5d_yi": round(float(outflow.get(r.name, 0) or 0), 2),
+                "net_5d_yi": round(float(net.get(r.name, 0) or 0), 2),   # 5日累计净流入(亿元)
+            })
+        rows.sort(key=lambda x: x["net_5d_yi"], reverse=True)
+        _sf_save("sector_flow_5d", rows)
+        _q("sector_flow_5d", 1.0, "ths", "同花顺5日概念资金流")
+        return rows
     except Exception as e:  # noqa: BLE001
         rows = _sf_fallback("sector_flow_5d", "同花顺5日概念资金流", e)
         _q("sector_flow_5d", 0.5, "stale_cache", "实时抓取失败,回退最近快照")
         dal.record_missing("sector_flow_5d", False, "同花顺5日概念资金流失败,回退快照")
         return rows
-    df = df.rename(columns={df.columns[i]: c for i, c in enumerate(
-        ["no", "industry", "num", "index_name", "pct", "inflow", "outflow", "net"])})
-    net = pd.to_numeric(df["net"], errors="coerce")
-    inflow = pd.to_numeric(df["inflow"], errors="coerce")
-    outflow = pd.to_numeric(df["outflow"], errors="coerce")
-    pct = pd.to_numeric(df["pct"].astype(str).str.replace("%", "", regex=False), errors="coerce")
-    rows = []
-    for _, r in df.iterrows():
-        rows.append({
-            "industry": str(r["industry"]),
-            "pct_5d": round(float(pct.get(r.name, 0) or 0), 2),      # 5日累计涨跌幅(%)
-            "inflow_5d_yi": round(float(inflow.get(r.name, 0) or 0), 2),
-            "outflow_5d_yi": round(float(outflow.get(r.name, 0) or 0), 2),
-            "net_5d_yi": round(float(net.get(r.name, 0) or 0), 2),   # 5日累计净流入(亿元)
-        })
-    rows.sort(key=lambda x: x["net_5d_yi"], reverse=True)
-    _sf_save("sector_flow_5d", rows)
-    _q("sector_flow_5d", 1.0, "ths", "同花顺5日概念资金流")
-    return rows
 
 
 # ---------------------------------------------------------------- 北向资金
