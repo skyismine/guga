@@ -299,7 +299,9 @@ def get_stock_name(code: str) -> str:
     code = str(code).zfill(6)
     try:
         quote = get_spot_quote(code)
-        return quote.get("name", code)
+        name = quote.get("name") or ""
+        if name:
+            return name
     except Exception as _e:  # noqa: BLE001
         _fault(_e)
     try:
@@ -391,6 +393,35 @@ def get_spot_quote(code: str) -> Dict:
         dal.attach_quality(fb, 0.6, "local_snapshot", "本地日快照(实时接口不可达)")
         dal.mem_set(_key, fb, 30)
         return fb
+    # fuyao 官方行情兜底(股票): 新浪/本地快照均缺时取同花顺快照, 避免静默回退旧日线
+    try:
+        from app.data.fuyao import enabled as _fy_enabled, _get, _thscode
+        if _fy_enabled() and not is_etf(code):
+            _data = _get("/api/a-share/prices/snapshot",
+                         {"thscodes": _thscode(code)}, ttl=30) or {}
+            for _it in (_data.get("item") or []):
+                _lp = _it.get("last_price")
+                if not _lp:
+                    break
+                _pc = float(_it.get("prev_price") or 0) or 0.0
+                try:
+                    _pct = (float(_lp) - _pc) / _pc if _pc else 0.0
+                except (TypeError, ValueError):  # noqa: BLE001
+                    _pct = 0.0
+                _q = {
+                    "name": "", "price": float(_lp), "prev_close": _pc,
+                    "open": float(_it.get("open_price") or 0) or 0.0,
+                    "high": float(_it.get("high_price") or 0) or 0.0,
+                    "low": float(_it.get("low_price") or 0) or 0.0,
+                    "volume": float(_it.get("volume") or 0) or 0.0,
+                    "amount": float(_it.get("turnover") or 0) or 0.0,
+                    "pct_chg": _pct,
+                }
+                dal.attach_quality(_q, 1.0, "fuyao", "官方行情快照(兜底)")
+                dal.mem_set(_key, _q, 30)
+                return _q
+    except Exception as _e:  # noqa: BLE001
+        _fault(_e, "fuyao 单票行情兜底失败")
     raise ConnectionError(f"新浪实时行情无数据: {code}")
 
 
@@ -443,6 +474,53 @@ def get_spot_quotes(codes: List[str]) -> Dict[str, Dict]:
                     dal.mem_set(dal.cache_key("spot", c, date=_today), q, 30)
             except Exception as _e:  # noqa: BLE001  实时失败按已有快照继续
                 _fault(_e, "新浪批量行情失败,按本地快照继续")
+        # fuyao 官方行情兜底: 本地快照/新浪均缺的股票, 批量取同花顺快照(收盘后=当日收盘)。
+        # 解决新浪实时不可达时持仓/标的行情静默回退"上一交易日日线"致复盘数据滞后一日。
+        miss = [c for c in codes if c not in out and not is_etf(c)]
+        if miss:
+            names = {}
+            try:
+                _lst = get_stock_list()
+                if _lst is not None and len(_lst):
+                    names = {str(r["code"]).zfill(6): str(r["name"])
+                             for r in _lst.to_dict("records")}
+            except Exception:  # noqa: BLE001
+                names = {}
+            try:
+                from app.data.fuyao import enabled as _fy_enabled
+                if _fy_enabled():
+                    from app.data.fuyao import _get, _thscode
+                    for _i in range(0, len(miss), 50):
+                        _chunk = miss[_i:_i + 50]
+                        _data = _get("/api/a-share/prices/snapshot",
+                                     {"thscodes": ",".join(_thscode(c) for c in _chunk)},
+                                     ttl=30) or {}
+                        for _it in (_data.get("item") or []):
+                            _c = str(_it.get("ticker", ""))[-6:]
+                            _lp = _it.get("last_price")
+                            if not _lp:
+                                continue
+                            _pc = float(_it.get("prev_price") or 0) or 0.0
+                            try:
+                                _pct = (float(_lp) - _pc) / _pc if _pc else 0.0
+                            except (TypeError, ValueError):  # noqa: BLE001
+                                _pct = 0.0
+                            _q = {
+                                "name": names.get(_c, ""),
+                                "price": float(_lp),
+                                "prev_close": _pc,
+                                "open": float(_it.get("open_price") or 0) or 0.0,
+                                "high": float(_it.get("high_price") or 0) or 0.0,
+                                "low": float(_it.get("low_price") or 0) or 0.0,
+                                "volume": float(_it.get("volume") or 0) or 0.0,
+                                "amount": float(_it.get("turnover") or 0) or 0.0,
+                                "pct_chg": _pct,
+                            }
+                            dal.attach_quality(_q, 1.0, "fuyao", "官方行情快照(兜底)")
+                            out[_c] = _q
+                            dal.mem_set(dal.cache_key("spot", _c, date=_today), _q, 30)
+            except Exception as _e:  # noqa: BLE001  官方兜底失败按现有行情继续
+                _fault(_e, "fuyao 行情兜底失败,按现有快照继续")
     return out
 
 

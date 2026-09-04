@@ -150,75 +150,189 @@ def _sina_spot_batch(symbols) -> Dict[str, Dict]:
     return out
 
 
+# 指数多源元数据(新浪代码, 同花顺 ths, 东财 secid, 名称),按主流大盘指数顺序
+_INDEX_META = [
+    ("sh000001", "000001.SH", "1.000001", "上证指数"),
+    ("sz399001", "399001.SZ", "0.399001", "深证成指"),
+    ("sz399006", "399006.SZ", "0.399006", "创业板指"),
+    ("sh000300", "000300.SH", "1.000300", "沪深300"),
+    ("sh000016", "000016.SH", "1.000016", "上证50"),
+    ("sh000905", "000905.SH", "1.000905", "中证500"),
+    ("sh000852", "000852.SH", "1.000852", "中证1000"),
+    ("sh000688", "000688.SH", "1.000688", "科创50"),
+]
+
+
+def _idx_row(sym: str, name: str, date: dt.date, close: float, pct: float,
+             src: str, note: str, q: float = 1.0) -> Dict:
+    """指数条目统一构造: 附带 bar_date(实际数据日), 供上层判断新鲜度。"""
+    return dal.with_quality({"symbol": sym, "name": name, "date": str(date),
+                             "bar_date": str(date),
+                             "close": float(close), "pct_chg": float(pct)},
+                            q, src, note)
+
+
+def _em_index_latest(sym: str, name: str, date: dt.date):
+    """东财指数日线最新一根(收盘后即含当日)。仅当末根 bar 日期==目标日才返回,否则 None。"""
+    meta = next((m for m in _INDEX_META if m[0] == sym), None)
+    if not meta:
+        return None
+    try:
+        data = _em_kline_rows(meta[2], lmt=8)
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("index", False, f"东财指数日线 {sym} 失败: {e}")
+        return None
+    if not data:
+        return None
+    ds = sorted(data)[-1]
+    if ds != str(date):
+        return None   # 东财也无当日 bar: 视为不可用,交后续兜底
+    r = data[ds]
+    try:
+        return _idx_row(sym, name, date, float(r["close"]),
+                        float(r["pct_chg"]) / 100.0,   # 东财 pct 为百分值,统一转小数
+                        "eastmoney_daily", "东财日线收盘(含当日)", 0.95)
+    except (TypeError, ValueError):  # noqa: BLE001
+        return None
+
+
+def _fy_index_latest(sym: str, name: str, date: dt.date):
+    """同花顺官方指数日线(fuyao)最新一根, 权威收盘口径。仅当末根 bar 日期==目标日才返回。"""
+    meta = next((m for m in _INDEX_META if m[0] == sym), None)
+    if not meta:
+        return None
+    try:
+        from app.data.fuyao import enabled as _fy_enabled, get_ths_index_daily
+        if not _fy_enabled():
+            return None
+        df = get_ths_index_daily(meta[1], days=8)
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("index", False, f"fuyao 指数日线 {sym} 失败: {e}")
+        return None
+    if df is None or len(df) < 2:
+        return None
+    last = pd.Timestamp(df.index[-1]).date()
+    if last != date:
+        return None   # 官方当日 bar 未出: 视为不可用
+    c0 = float(df["close"].iloc[-2])
+    c1 = float(df["close"].iloc[-1])
+    return _idx_row(sym, name, date, c1, c1 / c0 - 1.0,
+                    "fuyao_daily", "官方日线收盘(含当日)", 0.95)
+
+
+def _sina_daily_candidate(sym: str, name: str, date: dt.date):
+    """新浪日线(存在收盘后滞后一日问题)。末根 bar 匹配当日→当日口径;
+    否则返回 (None, stale_date) 交上层标注滞后,不冒充当日。"""
+    try:
+        df = _retry(lambda: _index_daily(sym))
+    except Exception as e:  # noqa: BLE001
+        dal.record_missing("index", False, f"指数日线 {sym} 失败: {e}")
+        return None, None
+    if df is None or len(df) < 2:
+        return None, None
+    last = pd.Timestamp(df.index[-1]).date()
+    c0 = float(df["close"].iloc[-2])
+    c1 = float(df["close"].iloc[-1])
+    if last == date:
+        return _idx_row(sym, name, date, c1, c1 / c0 - 1.0,
+                        "sina_daily", "日线收盘(含当日)", 0.9), None
+    # 滞后(如 16:00 新浪日线尚未发布当日 bar): 仅作"最近可得"候选, 明确标注实际日期
+    stale_row = _idx_row(sym, name, last, c1, c1 / c0 - 1.0,
+                         "stale_sina_daily",
+                         f"实时/当日日线源不可用,回退最近日线({last});非当日收盘",
+                         0.2)
+    stale_row["stale"] = True
+    return None, stale_row
+
+
 def collect_indices(date: dt.date = None) -> list:
-    """各大盘指数收盘点数/涨跌幅。优先 fuyao 官方指数快照(权威收盘口径,解决新浪滞后/抖动),
-    失败回退新浪实时(收盘后=当日收盘),再回退日线。附带 data_quality 质量汇总。"""
-    # fuyao 官方指数快照优先: 上证/深成/创业板/沪深300/上证50/中证500/中证1000/科创50
-    _INDEX_THS = [("000001.SH", "上证指数"), ("399001.SZ", "深证成指"), ("399006.SZ", "创业板指"),
-                  ("000300.SH", "沪深300"), ("000016.SH", "上证50"), ("000905.SH", "中证500"),
-                  ("000852.SH", "中证1000"), ("000688.SH", "科创50")]
-    rows = []
+    """各大盘指数收盘点数/涨跌幅, 数据新鲜度守卫 + 多源降级。
+
+    每个指数优先「当日」口径(bar_date==复盘日), 层级:
+      fuyao 官方快照 → 新浪实时(收盘后=当日收盘) → 东财日线 → fuyao 官方日线;
+    新浪日线存在收盘后滞后一日问题, 仅当日 bar 已发布才作当日口径;
+    以上全不可得时才回退「最近可得日线」并在条目上明确标注实际数据日(stale),
+    避免把上一交易日收盘静默冒充当日(曾致复盘报告大盘数据整体滞后一日)。
+    """
+    date = date or review_date()
+    fresh: Dict[str, Dict] = {}   # sym -> 当日口径条目
+    stale: Dict[str, Dict] = {}   # sym -> 滞后条目(仅作为最后兜底)
+    ths_list = [m[1] for m in _INDEX_META]
+
+    # ① fuyao 官方快照(整批, 权威, 优先)
     try:
         from app.data.fuyao import enabled as _fy_enabled, get_index_snapshot
         if _fy_enabled():
-            items = get_index_snapshot(",".join(t for t, _ in _INDEX_THS))
+            items = get_index_snapshot(",".join(ths_list))
             by_ths = {it.get("thscode"): it for it in items}   # 按 thscode 匹配(上证 ticker 是 1A0001)
-            for ths, name in _INDEX_THS:
+            for sym, ths, _em, name in _INDEX_META:
                 it = by_ths.get(ths)
                 if it and it.get("last_price") is not None:
-                    rows.append(dal.with_quality(
-                        {"symbol": ths, "name": name,
-                         "close": float(it["last_price"]),
-                         "pct_chg": float(it.get("price_change_ratio_pct") or 0) / 100.0},
-                        1.0, "fuyao", "官方收盘快照"))
-            if rows:
+                    fresh[sym] = _idx_row(
+                        sym, name, date, float(it["last_price"]),
+                        float(it.get("price_change_ratio_pct") or 0) / 100.0,
+                        "fuyao", "官方收盘快照", 1.0)
+            if len(fresh) == len(_INDEX_META):
                 _q("index", 1.0, "fuyao", "官方指数快照(收盘口径)")
-                return rows
-            dal.record_missing("index", False, "fuyao 指数快照为空")
+                return [fresh[sym] for sym, *_ in _INDEX_META]
+            dal.record_missing("index", False, "fuyao 指数快照为空/部分缺失")
     except Exception as e:  # noqa: BLE001
         dal.record_missing("index", False, f"fuyao 指数快照失败: {e}")
-    symbols = [s for s, _ in MAJOR_INDICES]
+
+    # ② 新浪实时(整批, 收盘后=当日收盘)
+    missing = [m[0] for m in _INDEX_META if m[0] not in fresh]
     try:
-        spots = _retry(lambda: _sina_spot_batch(symbols), n=2)
+        spots = _retry(lambda: _sina_spot_batch(missing), n=2)
     except Exception as e:  # noqa: BLE001
         dal.record_missing("index", False, f"新浪指数实时失败: {e}")
         spots = {}
-    for sym, name in MAJOR_INDICES:
-        item = {"symbol": sym, "name": name}
+    for sym, ths, _em, name in _INDEX_META:
         sp = spots.get(sym)
         if sp:
-            item.update({"close": sp["price"], "pct_chg": sp["pct_chg"]})
-            item = dal.with_quality(item, 1.0, "sina_hq", "实时快照(收盘后=收盘)")
+            fresh[sym] = _idx_row(sym, name, date, sp["price"], sp["pct_chg"],
+                                  "sina_hq", "实时快照(收盘后=收盘)", 1.0)
+
+    # ③ 逐指数补齐: 东财日线 → fuyao 官方日线 → 新浪日线(仅当日) → 滞后标注兜底
+    for sym, ths, _em, name in _INDEX_META:
+        if sym in fresh:
+            continue
+        item = _em_index_latest(sym, name, date) or _fy_index_latest(sym, name, date)
+        if item is None:
+            item, stale_row = _sina_daily_candidate(sym, name, date)
+            if item is None and stale_row is not None:
+                stale[sym] = stale_row
+                continue
+        if item is not None:
+            fresh[sym] = item
+
+    if fresh or stale:
+        rows = [fresh.get(sym) or stale.get(sym)
+                for sym, *_ in _INDEX_META]
+        rows = [r for r in rows if r]
+        if not stale:
+            _q("index", 1.0, "fuyao/sina/eastmoney", "当日指数收盘(含当日)")
         else:
-            try:
-                df = _retry(lambda: _index_daily(sym))
-                if len(df) >= 2:
-                    c0 = float(df["close"].iloc[-2])
-                    c1 = float(df["close"].iloc[-1])
-                    item.update({"close": c1, "pct_chg": (c1 / c0 - 1)})
-                    item = dal.with_quality(item, 0.9, "sina_daily", "日线收盘(无当日实时)")
-            except Exception as e:  # noqa: BLE001
-                dal.record_missing("index", False, f"指数日线 {sym} 失败: {e}")
-        if "close" in item:
-            rows.append(item)
-    if rows:
-        _q("index", 1.0, "sina", "新浪实时/日线")
+            _n = len(stale)
+            _q("index", 0.3 if not fresh else 0.6, "stale_mix",
+               f"{_n} 个指数仅最近可得日线(非当日),待校准")
+            dal.record_missing("index", False, f"{_n} 个指数数据滞后(非当日口径),待校准")
         return rows
-    # 关键数据缺失: 回退最近有效值(上证指数日线缓存)并标注降级
+
+    # 全部源均不可得: 回退最近有效值(上证指数日线缓存)并标注降级
     try:
         cache = _load_cache("idx_sh000001", ttl=None)
         if cache is not None and len(cache):
+            last = pd.Timestamp(cache.index[-1]).date()
             c1 = float(cache["close"].iloc[-1])
             c0 = float(cache["close"].iloc[-2]) if len(cache) >= 2 else c1
-            rows = [dal.with_quality({"symbol": "sh000001", "name": "上证指数",
-                                      "close": c1, "pct_chg": (c1 / c0 - 1)},
-                                     0.4, "stale_cache", "实时/日线均失败,回退最近有效值")]
-            _q("index", 0.4, "stale_cache", "关键数据降级: 使用最近有效值,待校准")
+            _q("index", 0.2, "stale_cache", "关键数据降级: 使用最近有效值,待校准")
             dal.record_missing("index", False, "指数全景全失败,回退最近有效值(上证)")
-            return rows
+            return [_idx_row("sh000001", "上证指数", last, c1, c1 / c0 - 1.0,
+                             "stale_cache",
+                             f"全部指数源不可用,回退最近日线({last});非当日收盘", 0.2)]
     except Exception as e:  # noqa: BLE001
         dal.record_missing("index", False, f"指数降级回退失败: {e}")
-    return rows
+    return []
 
 
 def _index_daily(symbol: str) -> pd.DataFrame:

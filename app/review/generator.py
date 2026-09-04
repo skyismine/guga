@@ -108,6 +108,18 @@ def _index_overview(d: Dict) -> List[Dict]:
              else ("普跌" if up_n <= len(idx) * 0.25 else "涨跌互现"))
 
     items = []
+    # 数据新鲜度守卫: 采集层对"当日实时/收盘源不可用→回退最近可得日线"的指数已标注 stale/bar_date;
+    # 此处显式提示, 避免把上一交易日收盘误读为当日(曾致复盘大盘数据整体滞后一日)。
+    _rdate = str(d.get("date") or "")
+    _stale_idx = [i["name"] for i in idx
+                  if i.get("stale") or (i.get("bar_date") and str(i["bar_date"]) != _rdate)]
+    if _stale_idx:
+        _stale_dates = sorted({str(i["bar_date"]) for i in idx
+                               if i.get("bar_date") and str(i["bar_date"]) != _rdate})
+        _dates_txt = "、".join(_stale_dates) or "上一交易日"
+        items.append(_t(f"⚠ 数据提示: 指数实时/当日收盘源暂不可用,"
+                        f"**{'、'.join(_stale_idx)}** 的收盘/涨跌幅取自最近交易日 "
+                        f"**{_dates_txt}**(非当日),建议按官方当日收盘复核后再参考。"))
     # 主题须同时考虑指数方向(avg/up_n)与个股宽度(ratio),避免指数下跌+缩量仍被定性为「放量普涨」
     if avg > 0.003 and ratio > 0.55:
         theme = "指数普涨、赚钱效应扩散"
