@@ -1469,6 +1469,11 @@ def api_sector_detail():
 def page_decision():
     refresh = request.args.get("refresh") == "1"
     c = _get_decision(refresh=refresh)
+    # 被动自动刷新: 已有数据但已过期(>TTL 或交易日前移)时, 普通访问也触发后台重算,
+    # 页面附带轮询脚本, 计算完成/失败后自动重载——避免"只有点刷新才更新"。
+    auto_reload = (not refresh and bool(c["data"]) and not c["err"] and _decision_stale())
+    if auto_reload:
+        _ensure_decision_worker()
     if c["data"] is None and not c["err"]:
         # 冷缓存:立即返回占位页,后台线程生成,5s 后自动刷新(避免慢计算阻塞断连)
         _ensure_decision_worker()
@@ -1539,6 +1544,15 @@ def page_decision():
         _sector_modal_html(),
         '<div class="footer">决策引擎由四层漏斗自动收敛:市场许可 → 主线遴选 → 标的匹配 → 执行参数。仅供研究参考,不构成投资建议。股市有风险,入市需谨慎。</div>',
     ]
+    if auto_reload:
+        content.append(f"""<script>
+(function(){{var a={int(_DECISION_CACHE['t']*1000)};var n=0;
+(function p(){{fetch('/api/decision/poll').then(function(r){{return r.json();}})
+.then(function(j){{if(j.err||j.t!==a){{location.reload();return;}}
+if(++n<90){{setTimeout(p,2000);}}else{{location.reload();}}}})
+.catch(function(){{setTimeout(p,3000);}});}})();}})();
+</script>
+<div class="mut" style="padding:6px 12px">⏳ 决策已过期,后台自动刷新中,完成后本页将自动更新…</div>""")
     return _shell("decision", "今日决策", "\n".join(content))
 
 
@@ -1596,6 +1610,15 @@ def api_decision():
     if c["err"]:
         return jsonify({"error": c["err"]}), 500
     return jsonify(c["data"])
+
+
+@app.route("/api/decision/poll")
+def api_decision_poll():
+    """决策缓存新鲜度探针: 返回计算时间戳(ms)与错误, 供页面检测后台自动刷新完成。"""
+    d = _DECISION_CACHE["data"] or {}
+    return jsonify({"t": int(_DECISION_CACHE["t"] * 1000),
+                    "date": d.get("date"),
+                    "err": _DECISION_CACHE["err"]})
 
 
 # ---- 每日复盘 ----
