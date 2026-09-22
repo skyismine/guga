@@ -7,11 +7,13 @@
 - 数据语义: 毫秒 Unix 时间戳(Asia/Shanghai),价格 CNY;历史K线仅支持 1d。
 """
 import json
+import os
 import threading
 import time
 
 import requests
 
+from app import config
 from app.support import settings as _st
 
 
@@ -237,9 +239,34 @@ def get_anomaly_analysis_list(tag_codes: str = None):
 
 
 def get_ths_index_list(tag: str = "cn_concept"):
-    """同花顺指数目录(概念/行业/区域/特色)。"""
-    data = _get("/api/a-share-index/catalog/ths-index-list", {"tag": tag}, ttl=86400)
-    return (data or {}).get("item") or []
+    """同花顺指数目录(概念/行业/区域/特色)。
+
+    限流/失败兜底: 成功时按 tag 落盘(当日覆盖), 失败时读最近一次成功目录。
+    目录是"概念名→thscode"映射的唯一来源, 一旦取不到会导致概念指数/板块评分整体退化、
+    主线选不出 core(进而 ③标的匹配/④执行参数为空), 故必须有本地持久化兜底。
+    """
+    path = os.path.join(config.DATA_DIR, f"fuyao_ths_index_list_{tag}.json")
+    try:
+        data = _get("/api/a-share-index/catalog/ths-index-list", {"tag": tag}, ttl=86400)
+        items = (data or {}).get("item") or []
+        if items:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(items, f, ensure_ascii=False)
+            except OSError:
+                pass
+            return items
+    except Exception as e:  # noqa: BLE001
+        try:
+            with open(path, encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached:
+                print(f"[fuyao] 指数目录 {tag} 实时失败,回退本地最近成功目录({len(cached)} 条): {e}")
+                return cached
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    return []
 
 
 def get_ths_constituents(ths: str):

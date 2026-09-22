@@ -2661,6 +2661,11 @@ def main():
         from app.support.mainline_stabilizer import start_polling
         if start_polling() is not None:
             print("  主线防抖稳定器每5分钟轮询已启动(平滑与N周期确认独立于网页访问)\n")
+        # 启动预热: 后台推进至 N 个稳定器周期, seed 驻留状态, 避免重启后 core 长时间为空
+        from app.support.mainline_stabilizer import warmup as _stab_warmup
+        _th2 = __import__("threading")
+        _th2.Thread(target=_stab_warmup, daemon=True, name="stabilizer-warmup").start()
+        print("  稳定器启动预热已启动(后台推进驻留周期)\n")
     except Exception as e:  # noqa: BLE001
         print(f"  主线稳定器轮询启动失败(不影响主流程): {e}\n")
     host = os.environ.get("GUGA_HOST", "127.0.0.1")

@@ -95,6 +95,7 @@ _LAST_OUTPUT = {"t": 0.0, "data": None}
 _poll_thread = None
 _poll_stop = threading.Event()
 _NEAR_MARGIN = 5.0               # 观察池空态时, 距保级线多少分以内视为"边缘参考"展示
+_EMPTY_CORE_RETRY = 300          # 秒: core 为空时允许重算的最小间隔(防空结果被永久复用/防高频重算)
 
 
 def _mainline_cfg() -> dict:
@@ -723,12 +724,17 @@ def get_output(max_age: float = 30.0) -> dict:
 
     优先复用后台定时轮询的最近结果,避免每次页面访问都触发完整数据抓取;
     非交易时段(收盘/周末)直接复用最近输出(数据为收盘快照,不再重复抓取)。
+    例外: 缓存结果 core 为空(空池/驻留未满/上游降级)且已超 _EMPTY_CORE_RETRY 秒时,
+    允许重算一次(限频), 避免盘前/非交易时段启动后"空结果被永久复用"。
     """
     with _LOCK:
         if _LAST_OUTPUT["data"] is not None:
-            fresh = time.time() - _LAST_OUTPUT["t"] <= max_age
-            if fresh or not _is_trading_time():
-                return _LAST_OUTPUT["data"]
+            data = _LAST_OUTPUT["data"]
+            age = time.time() - _LAST_OUTPUT["t"]
+            fresh = age <= max_age
+            core_empty = not ((data.get("stable") or {}).get("core"))
+            if fresh or (not _is_trading_time() and not (core_empty and age > _EMPTY_CORE_RETRY)):
+                return data
     return stabilize()
 
 
@@ -774,6 +780,30 @@ def start_polling(interval_sec: int = None) -> threading.Thread:
                                     daemon=True)
     _poll_thread.start()
     return _poll_thread
+
+
+def warmup(max_cycles: int = None) -> int:
+    """启动预热: 推进至多 N 个稳定器周期, seed 驻留状态, 避免重启后长时间 core 为空。
+
+    仅在尚无输出时执行(幂等); 单周期失败即停(上游降级时不空转)。返回实际推进周期数。
+    """
+    cfg = _mainline_cfg()
+    if not cfg.get("enable_stabilizer", True):
+        return 0
+    with _LOCK:
+        if _LAST_OUTPUT["data"] is not None:
+            return 0
+    N = int(cfg.get("STABILIZE_CYCLE", 3) or 3)
+    n = min(int(max_cycles or N), N)
+    done = 0
+    for _ in range(max(1, n)):
+        try:
+            stabilize()
+            done += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[稳定器] 启动预热周期失败(停止预热): {e}")
+            break
+    return done
 
 
 def stop_polling() -> None:
