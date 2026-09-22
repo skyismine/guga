@@ -668,6 +668,14 @@ def health_metrics() -> dict:
 
 
 # ------------------------------------------------------------------ 对外入口
+def _degraded_output(reason: str) -> dict:
+    """降级空稳定输出(计算中/超时兜底): 保证结构完整, 调用方不会因 None 下标崩溃。"""
+    return {"raw": {}, "stable": {"core": None, "defensive": None, "watch": [],
+                                  "rejected": [], "candidate": [], "pass_score": 0,
+                                  "degraded": True, "degrade_reason": reason},
+            "stabilizer_enabled": True, "stats": _sw_stats()}
+
+
 def stabilize() -> dict:
     """稳定器对外入口(线程安全, 单飞推进一个快照周期)。
 
@@ -683,8 +691,8 @@ def stabilize() -> dict:
     if _computing and _data is not None:
         return _data
     if _computing:
-        # 冷启动计算中且尚无输出: 轻量等待首个线程完成(最多 ~5s)
-        for _ in range(50):
+        # 冷启动计算中且尚无输出: 轻量等待首个线程完成(最多 ~10s)
+        for _ in range(100):
             time.sleep(0.1)
             with _LOCK:
                 if _LAST_OUTPUT["data"] is not None:
@@ -694,7 +702,11 @@ def stabilize() -> dict:
     # 抢占计算权(双重检查: 等待期间可能已被后台轮询完成)
     with _LOCK:
         if _COMPUTING.is_set():
-            return _LAST_OUTPUT["data"] if _LAST_OUTPUT["data"] is not None else None
+            # 另一线程仍在计算且始终未产出(超时): 返回降级空结构, 绝不返回 None
+            # (调用方 decision_brief 会下标读取 mout["stable"], None 会导致页面报错)
+            if _LAST_OUTPUT["data"] is not None:
+                return _LAST_OUTPUT["data"]
+            return _degraded_output("稳定器计算中(冷启动),本次返回降级空结果")
         _COMPUTING.set()
     try:
         cfg = _mainline_cfg()

@@ -2333,8 +2333,8 @@ def decision_brief(total_asset: float = None, taste: str = None) -> dict:
     # 惰性导入避免 engine->mainline_stabilizer->engine 的循环依赖。
     # get_output() 优先复用后台定时轮询的最近结果,页面访问不重复抓取数据。
     from app.support import mainline_stabilizer as _stab
-    mout = _stab.get_output()
-    p2 = mout["stable"]
+    mout = _stab.get_output() or {}
+    p2 = mout.get("stable") or {}
     core = p2.get("core")
     defensive = p2.get("defensive")
     _flt.info("decision", "第二层主线遴选", trace_id=trace_id,
