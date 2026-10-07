@@ -152,6 +152,15 @@ def _sina_index_simple(symbol: str) -> Optional[Dict]:
         return None
 
 
+def _tdx_index_spot(symbol: str) -> Optional[Dict]:
+    """TDX(eltdx)指数实时(需带前缀符号如 sh000300); 未启用/失败返回 None。"""
+    try:
+        from app.data import tdx_source as _tdx
+        return _tdx.get_index_spot(symbol)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _em_index_spot(symbol: str) -> Optional[Dict]:
     try:
         import akshare as ak
@@ -180,7 +189,8 @@ def get_index_spot(symbol: str = None) -> Optional[Dict]:
     symbol = symbol or config.MARKET_INDEX
     if time.time() < _INDEX_SPOT_NEG.get(symbol, 0.0):
         return None
-    spot = (_sina_index_detail(symbol)
+    spot = (_tdx_index_spot(symbol)
+            or _sina_index_detail(symbol)
             or _sina_index_simple(symbol)
             or _em_index_spot(symbol))
     if spot is None:

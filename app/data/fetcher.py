@@ -213,6 +213,13 @@ def get_daily_history(code: str, days: int = None, adjust: str = "qfq", use_cach
 
     df = pd.DataFrame()
     errors = []
+    # 优先 TDX(通达信/eltdx): 股票与ETF均可, 前复权; 命中即用, 显著减轻 akshare/fuyao 压力
+    try:
+        from app.data import tdx_source as _tdx
+        if _tdx.enabled():
+            df = _tdx.get_daily(code, days)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"tdx:{e}")
     if is_etf(code):
         source_map = {
             "etf_sina": lambda: _fetch_etf_sina(code, start, end),
@@ -227,17 +234,18 @@ def get_daily_history(code: str, days: int = None, adjust: str = "qfq", use_cach
         }
         source_order = config.DATA_SOURCE_ORDER
 
-    for source in source_order:
-        try:
-            df = source_map[source]()
-            if df is not None and len(df) > 0:
-                break
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"{source}:{e}")
-            time.sleep(0.8)
+    if df is None or df.empty:
+        for source in source_order:
+            try:
+                df = source_map[source]()
+                if df is not None and len(df) > 0:
+                    break
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{source}:{e}")
+                time.sleep(0.8)
 
     if df is None or df.empty:
-        # P0 兜底: fuyao 官方 API(需 settings.fuyao.enabled;前复权 forward ≈ 本地 qfq 口径)。
+        # 兜底: fuyao 官方 API(需 settings.fuyao.enabled;前复权 forward ≈ 本地 qfq 口径)。
         # 仅股票走 fuyao:ETF 的 fund 行情端点在部分账号/Key 下不可用,ETF 仍用 akshare 双源。
         if not is_etf(code):
             try:
@@ -442,7 +450,16 @@ def get_spot_quotes(codes: List[str]) -> Dict[str, Dict]:
         else:
             fresh_codes.append(c)
     if fresh_codes:
-        for c, q in _spot_local_fallback(fresh_codes).items():
+        # 优先 TDX(通达信/eltdx): 实时快照, 命中即用(含 ETF); 减轻本地快照陈旧/新浪/ fuyao 压力
+        try:
+            from app.data import tdx_source as _tdx
+            for c, q in (_tdx.get_spot(fresh_codes) or {}).items():
+                if c not in out:
+                    out[c] = q
+                    dal.mem_set(dal.cache_key("spot", c, date=_today), q, 30)
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e, "tdx 实时快照失败,继续本地/新浪")
+        for c, q in _spot_local_fallback([c for c in fresh_codes if c not in out]).items():
             dal.attach_quality(q, 0.6, "local_snapshot", "本地日快照(收盘价)")
             out[c] = q
             dal.mem_set(dal.cache_key("spot", c, date=_today), q, 30)
@@ -474,7 +491,7 @@ def get_spot_quotes(codes: List[str]) -> Dict[str, Dict]:
                     dal.mem_set(dal.cache_key("spot", c, date=_today), q, 30)
             except Exception as _e:  # noqa: BLE001  实时失败按已有快照继续
                 _fault(_e, "新浪批量行情失败,按本地快照继续")
-        # fuyao 官方行情兜底: 本地快照/新浪均缺的股票, 批量取同花顺快照(收盘后=当日收盘)。
+        # fuyao 官方行情兜底: 本地快照/新浪/TDX 均缺的股票, 批量取同花顺快照(收盘后=当日收盘)。
         # 解决新浪实时不可达时持仓/标的行情静默回退"上一交易日日线"致复盘数据滞后一日。
         miss = [c for c in codes if c not in out and not is_etf(c)]
         if miss:

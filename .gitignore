@@ -18,3 +18,7 @@ _filelist.txt
 _rule*.png
 # 数据缓存压缩备份(超大,不入库)
 data_cache.zip
+
+# TDX(eltdx) 运行时资源(板块/证券列表等,自动下载,可再生)
+downloads/
+zhb.zip

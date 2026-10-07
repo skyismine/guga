@@ -218,6 +218,8 @@ DEFAULTS = {
     "etf_min_amount": 5000.0,        # ETF 日均成交额下限(万元)
     # ---- 6.2 告警(webhook, 可用 GUGA_ALERT_WEBHOOK 环境变量覆盖, 不落盘密钥)
     "alert": {"webhook": ""},
+    # ---- TDX(通达信, eltdx)数据源: 行情优先源(实时快照+前复权日K), 用于减轻 fuyao 429
+    "tdx": {"enabled": True, "timeout": 8.0, "adjust": "qfq", "probe_hosts": True},
     # ---- 6.1 熔断/日志参数(替代 fault.py 硬编码魔法数字)
     "system": {
         "cb_fail_threshold": 5,      # 模块连续失败次数触发熔断
