@@ -1536,20 +1536,31 @@ def _adjust_signal(item: dict, sector_level: str) -> dict:
                 elif _bb < 0.1:
                     _adj(int(tir.get("bb_under", 1)), f"跌破布林下轨(位置 {_bb:.2f}),超卖反弹机会")
 
-    # 6) 资金流修正:近3日连续流入(近似)/连续流出
+    # 6) 资金流修正: 优先 TDX 真·个股主力净额; 缺失回退"近3日连续流入(连续收涨)"近似
     fund = scfg.get("fund_flow", {})
     if fund.get("enabled", True):
-        try:
-            from app.data.fetcher import _load_cache as _flc
-            df = _flc(str(item.get("code") or "").zfill(6))
-            if df is not None and len(df) >= 5 and "close" in df.columns:
-                rets = df["close"].astype(float).pct_change().dropna().tail(3)
-                if len(rets) == 3 and float(rets.min()) > 0:
-                    _adj(int(fund.get("up", 1)), "近3日资金连续流入(连续收涨)")
-                elif len(rets) == 3 and float(rets.max()) < 0:
-                    _adj(int(fund.get("down", -1)), "近3日资金连续流出(连续收跌)")
-        except Exception as _e:  # noqa: BLE001
-            _fault(_e)
+        mf = item.get("money_flow") or {}
+        mn = mf.get("main_net")
+        if mn is not None:
+            thr = float(fund.get("tdx_net_min_yi", 0.2) or 0.2) * 1e8
+            _r = mf.get("main_ratio")
+            _rt = f"(占比 {_r:.1f}%)" if _r is not None else ""
+            if mn >= thr:
+                _adj(int(fund.get("up", 1)), f"主力净流入 {mn / 1e8:.2f}亿{_rt}")
+            elif mn <= -thr:
+                _adj(int(fund.get("down", -1)), f"主力净流出 {abs(mn) / 1e8:.2f}亿{_rt}")
+        else:
+            try:
+                from app.data.fetcher import _load_cache as _flc
+                df = _flc(str(item.get("code") or "").zfill(6))
+                if df is not None and len(df) >= 5 and "close" in df.columns:
+                    rets = df["close"].astype(float).pct_change().dropna().tail(3)
+                    if len(rets) == 3 and float(rets.min()) > 0:
+                        _adj(int(fund.get("up", 1)), "近3日资金连续流入(连续收涨)")
+                    elif len(rets) == 3 and float(rets.max()) < 0:
+                        _adj(int(fund.get("down", -1)), "近3日资金连续流出(连续收跌)")
+            except Exception as _e:  # noqa: BLE001
+                _fault(_e)
 
     # 累计修正限幅 ±max_delta 档
     b_idx = _SIGNAL_RANK.get(base, 0)

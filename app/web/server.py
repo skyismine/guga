@@ -1771,10 +1771,13 @@ def page_portfolio():
             return s["name"]
         return _etf_by_code.get(code, code)
 
+    _mf_map = {str(r.get("code")).zfill(6): r.get("main_net_yi")
+               for r in ((c["data"] or {}).get("positions") or [])}
     rows = "".join(f"<tr><td>{_h(p['code'])}</td><td>{_h(_nm(p['code']))}</td>"
-                   f"<td>{_h(p['category'])}</td><td>{_h(p['qty'])}</td><td>{_h(p['cost'])}</td></tr>"
+                   f"<td>{_h(p['category'])}</td><td>{_h(p['qty'])}</td><td>{_h(p['cost'])}</td>"
+                   f"<td>{'' if _mf_map.get(str(p['code']).zfill(6)) is None else format(_mf_map[str(p['code']).zfill(6)], '+.2f')}</td></tr>"
                    for p in positions)
-    pos_table = (f"<div class='tbl'><table><tr><th>代码</th><th>名称</th><th>分类</th><th>数量</th><th>成本</th></tr>{rows}"
+    pos_table = (f"<div class='tbl'><table><tr><th>代码</th><th>名称</th><th>分类</th><th>数量</th><th>成本</th><th>主力净额(亿)</th></tr>{rows}"
                  "</table></div>") if positions else '<div class="mut">尚未导入持仓,可在下方添加(支持 CSV 批量导入:code,qty,cost,category)。</div>'
     cards = "\n".join(_pos_row_html(p) for p in (c["data"] or {}).get("positions", []))
     summary = ""

@@ -395,6 +395,15 @@ def match_targets_v2(sector_name: str, sector_level: str = "watch",
             it["continue_rank_cycle"] = 1
             it.setdefault("match_source", "normal")
             _jobs.append((role, it))
+    # 个股资金流(TDX, 批量一次): 供 _adjust_signal 资金修正 + 展示
+    if _jobs:
+        try:
+            from app.data import tdx_source as _tdx
+            _mf = _tdx.money_flow_batch([it["code"] for _, it in _jobs])
+            for _, it in _jobs:
+                it["money_flow"] = _mf.get(str(it["code"]).zfill(6))
+        except Exception as _e:  # noqa: BLE001
+            _fault(_e)
     if _jobs:
         with ThreadPoolExecutor(max_workers=min(4, len(_jobs))) as _ex:
             _items = list(_ex.map(
@@ -503,6 +512,17 @@ def _render_item(it: dict, role: str, sector_name: str, sector_level: str,
         item["error"] = pred["error"]
         return item
     item.update(pred)
+    # 个股资金流(TDX): 透传 + 附展示字段与入选理由
+    if it.get("money_flow"):
+        item["money_flow"] = it["money_flow"]
+        _mn = item["money_flow"].get("main_net")
+        _mr = item["money_flow"].get("main_ratio")
+        if _mn is not None:
+            item["main_net_yi"] = round(float(_mn) / 1e8, 2)
+            item["main_net_ratio"] = _mr
+            if item.get("reasons"):
+                _txt = f"主力净额 {float(_mn) / 1e8:+.2f}亿" + (f"(占比 {_mr:.1f}%)" if _mr is not None else "")
+                item["reasons"] = item["reasons"][:4] + [_txt]
     # 个股级数据校准落地: 数据异常/不一致标注到标的上("数据可能异常,建议核实")
     if pred.get("data_warning"):
         item["data_note"] = "数据可能异常,建议核实: " + "; ".join(pred["data_warning"][:2])

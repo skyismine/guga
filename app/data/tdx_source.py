@@ -141,6 +141,12 @@ def get_daily(code, days: int = 600):
                  "amount": getattr(b, "amount", None)} for b in bars]
         df = pd.DataFrame(recs)
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        # 统一 tz-naive: tdx 时间为 Asia/Shanghai tz-aware, 下游(特征/训练)按 naive 比较否则报错
+        try:
+            if getattr(df["date"].dt, "tz", None) is not None:
+                df["date"] = df["date"].dt.tz_localize(None)
+        except Exception:  # noqa: BLE001
+            pass
         df = df.dropna(subset=["date", "close"]).drop_duplicates("date").sort_values("date")
         if df.empty:
             return None
@@ -176,6 +182,55 @@ def get_index_spot(symbol: str):
     except Exception:  # noqa: BLE001
         _mark_fail()
         return None
+
+
+_MF_CACHE = {}            # code -> (date, {"main_net","main_ratio","total_amount"})
+
+
+def money_flow_batch(codes) -> dict:
+    """批量个股资金流(最近一日) → {code: {date,main_net,main_ratio,total_amount}}。
+
+    单次 eltdx 调用可传多代码; 结果按 code 进程内按日缓存。失败返回 {}(不抛)。
+    板块资金流 eltdx 不支持。
+    """
+    if not enabled():
+        return {}
+    codes = [str(c).zfill(6) for c in (codes or []) if c]
+    if not codes:
+        return {}
+    # 命中缓存
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    out, need = {}, []
+    for c in codes:
+        hit = _MF_CACHE.get(c)
+        if hit and hit[0] == today:
+            out[c] = hit[1]
+        else:
+            need.append(c)
+    if not need:
+        return out
+    cl = _client()
+    if cl is None:
+        return out
+    try:
+        mf = cl.money_flow.daily([_sym(c) for c in need])
+        for blk in (getattr(mf, "blocks", []) or []):
+            code = str(getattr(blk, "code", "") or "").zfill(6)
+            recs = list(getattr(blk, "records", []) or [])
+            if not code or not recs:
+                continue
+            r = recs[-1]
+            info = {"date": str(getattr(r, "date", "")),
+                    "main_net": getattr(r, "main_net", None),
+                    "main_ratio": getattr(r, "main_ratio", None),
+                    "total_amount": getattr(r, "total_amount", None)}
+            out[code] = info
+            _MF_CACHE[code] = (today, info)
+        return out
+    except Exception:  # noqa: BLE001
+        _mark_fail()
+        return out
 
 
 def get_money_flow(code):

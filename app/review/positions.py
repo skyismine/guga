@@ -57,6 +57,17 @@ def positions_review(d: dict) -> list:
     fy = _fy_snapshot(positions)
     pnl_total = ov.get("cumulative_pnl")
 
+    # 个股资金流(TDX, 批量一次): 供持仓明细展示"主力净额"
+    mf_map = {}
+    try:
+        from app.data import tdx_source as _tdx
+        for _c, _info in (_tdx.money_flow_batch([str(r["code"]).zfill(6) for r in rows]) or {}).items():
+            _mn = _info.get("main_net")
+            if _mn is not None:
+                mf_map[_c] = round(float(_mn) / 1e8, 2)
+    except Exception:  # noqa: BLE001
+        mf_map = {}
+
     # ---- 账户概览
     items.append({"head": "账户整体概览"})
     items.append({"t": (f"总资产 **{_fmt_asset(total_asset)}** · 持仓市值 **{_fmt_asset(mv)}**"
@@ -106,9 +117,10 @@ def positions_review(d: dict) -> list:
                 _cell(f"{pct:+.2f}%" if pct is not None else "-"),
                 _cell(f"{r.get('pnl_pct', 0) * 100:+.1f}%"),
                 _cell(_attr_cn(r)),
+                _cell(f"{mf_map[code]:+.2f}" if code in mf_map else "-"),
             ])
         items.append({"table": {"title": f"{bname}(市值 {_fmt_asset(grp_mv)})",
-                                "cols": ["名称", "代码", "分类", "持仓数", "成本", "收盘", "当日涨跌", "持仓盈亏", "属性"],
+                                "cols": ["名称", "代码", "分类", "持仓数", "成本", "收盘", "当日涨跌", "持仓盈亏", "属性", "主力净额(亿)"],
                                 "rows": tbl}})
 
     # ---- 今日合规校验

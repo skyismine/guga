@@ -81,6 +81,18 @@ def diagnose(positions: list = None, total_asset: float = None) -> dict:
     for r in rows:
         r["weight"] = round(r["market_value"] / total_mv, 4) if total_mv else 0.0
 
+    # 个股资金流(TDX, 批量一次): 附加到每行(主力净额/占比)
+    try:
+        from app.data import tdx_source as _tdx
+        _mf = _tdx.money_flow_batch([str(r["code"]).zfill(6) for r in rows])
+        for r in rows:
+            info = _mf.get(str(r["code"]).zfill(6)) or {}
+            if info.get("main_net") is not None:
+                r["main_net_yi"] = round(float(info["main_net"]) / 1e8, 2)
+                r["main_net_ratio"] = info.get("main_ratio")
+    except Exception as _e:  # noqa: BLE001
+        print(f"[portfolio] 个股资金流获取失败(忽略): {_e}")
+
     from app.support.risk import validate
     from app.review.operations import account_overview
     # 账户模型: 总资产 = 初始本金 + 已实现盈亏 + 未实现浮盈(未配置本金时退回市值口径)
