@@ -521,6 +521,22 @@ def get_spot_quotes(codes: List[str]) -> Dict[str, Dict]:
                             dal.mem_set(dal.cache_key("spot", _c, date=_today), _q, 30)
             except Exception as _e:  # noqa: BLE001  官方兜底失败按现有行情继续
                 _fault(_e, "fuyao 行情兜底失败,按现有快照继续")
+    # 最终兜底: 仍缺失的代码(尤其 ETF / 节假日 / 多源受限) → 用日线最后收盘价,
+    # 标注 daily(非实时) 质量 0.5, 避免持仓诊断"现价缺失(None)"。
+    for c in [x for x in codes if x not in out]:
+        try:
+            dfx = get_daily_history(c, days=5)
+            if dfx is not None and len(dfx) and "close" in dfx.columns:
+                px = float(dfx["close"].astype(float).iloc[-1])
+                if px > 0:
+                    q = {"name": "", "price": px, "prev_close": px, "open": 0.0, "high": 0.0,
+                         "low": 0.0, "volume": 0.0, "amount": 0.0, "pct_chg": 0.0,
+                         "datetime": ""}
+                    dal.attach_quality(q, 0.5, "daily", "日线收盘价(非实时,兜底)")
+                    out[c] = q
+                    dal.mem_set(dal.cache_key("spot", c, date=_today), q, 30)
+        except Exception:  # noqa: BLE001
+            continue
     return out
 
 

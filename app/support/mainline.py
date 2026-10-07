@@ -502,6 +502,20 @@ def _etf_map(refresh=False) -> dict:
                 return json.load(f)
         except (OSError, ValueError):
             pass
+
+    def _latest_etf_file():
+        """最近一次成功的 etf_*.json(跨日兜底: 节假日/抓取失败时至少给最近收盘价, 避免 ETF 现价缺失)。"""
+        import glob
+        fs = [f for f in glob.glob(os.path.join(config.DATA_DIR, "etf_*.json"))
+              if os.path.getsize(f) > 2]
+        if not fs:
+            return None
+        try:
+            with open(max(fs, key=os.path.getmtime), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
     def _fetch():
         import akshare as ak
         df = ak.fund_etf_spot_em()
@@ -516,11 +530,18 @@ def _etf_map(refresh=False) -> dict:
         return out
 
     out = _with_timeout(_fetch, 30, {}, name="etf_spot")
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False)
-    except OSError:
-        pass
+    if out:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False)
+        except OSError:
+            pass
+        return out
+    # 抓取失败: 跨日回退最近可用 ETF 文件(不覆盖成空文件, 避免下次直接读到 {})
+    fb = _latest_etf_file()
+    if fb:
+        print(f"[mainline] etf 快照实时失败,回退最近可用 ETF 文件({len(fb)} 只)")
+        return fb
     return out
 
 
