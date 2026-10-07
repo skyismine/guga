@@ -20,6 +20,10 @@ flask>=3.0
 #  版本错配会在 import 时报 `Bad property path:scattermapbox`,请用 6.x 并 clean 重装)
 plotly>=6.0,<7
 
+# 可选:TDX(通达信)行情源(实时快照/前复权日K/指数),默认启用;不安装则自动降级到 akshare/新浪/fuyao
+#   pip install eltdx   # 需 CPython 3.10~3.14(glibc/manylinux 或 Windows);协议 Research-Only,仅个人研究
+# eltdx>=3.2.3
+
 # 可选:SilverQuant 实盘/模拟交易(QMT/掘金)依赖,无需实盘可忽略
 # xtquant>=250516.1.1
 # pywencai>=0.12.3
