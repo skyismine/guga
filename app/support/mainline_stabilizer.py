@@ -591,6 +591,33 @@ def _build_stable(cfg: dict) -> dict:
         # 观察池空态: 展示接近观察线的板块作为「边缘参考」(is_reference=True), 避免页面误读为无数据
         watch = sorted(near, key=lambda x: -x["score"])[:watch_n]
 
+    # ---- 观察级降级核心(1): 无板块达准入/晋升线 → 取最高分非否决板块作"核心(观察级)",
+    #      确保弱市/退潮期第三层标的匹配仍有观察标的(仅观察, 不实质加仓; 阶段风控仍生效)。
+    degraded_core = False
+    if core is None and cfg.get("enable_degraded_core", True):
+        _best = None
+        for _src in (passed, low, near):
+            if _src:
+                _best = sorted(_src, key=lambda x: -(x.get("score") or 0))[0]
+                break
+        if _best is None:
+            _cand = [r for r in rows if r.get("level") != "rejected"]
+            if _cand:
+                _r0 = max(_cand, key=lambda x: (x.get("score") or 0))
+                _best = _mk_item(_r0, stats_map.get(_r0["industry"]) or {}, "core", [])
+                _best["score"] = round(_r0.get("score") or 0, 2)
+        if _best is not None:
+            core = _best
+            degraded_core = True
+            core["level"] = "core"
+            core["degraded_core"] = True
+            core["reasons"] = (core.get("reasons") or []) + [
+                f"降级核心(观察级): 无板块达准入线(pass_score {pass_score:.0f}),"
+                f"取最高分板块暂作观察级主线,仅观察跟踪、不实质加仓"]
+            if defen is not None and defen.get("name") == core["name"]:
+                defen = None
+            watch = [w for w in watch if w["name"] != core["name"]]
+
     # ---- 3.3 稳定器置信度(0-1): 驻留周期进度 + 相对保级线安全边际
     ccfg = cfg.get("confidence", {})
     for it in ([core] if core else []) + ([defen] if defen else []) + watch:
@@ -634,6 +661,7 @@ def _build_stable(cfg: dict) -> dict:
             "rejected": rejected[:max(watch_n, 5)],
             "candidate": candidate[:12],
             "pass_score": pass_score,
+            "degraded_core": degraded_core,
             "phase_adjustment": _phase_adj_txt}
 
 

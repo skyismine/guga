@@ -426,6 +426,19 @@ _cons_cache = {}
 _cons_cache_mtime = None
 
 
+def _trend_exempt_ok(fcfg: dict, row: dict) -> bool:
+    """资金准入"强势趋势豁免": 综合资金为负但当日强涨幅+当日资金回流 → 豁免准入剔除。
+
+    修正弱市"一刀切资金否决"误杀真实趋势主线(当日放量大涨、资金转流入但5日累计仍负)。
+    可配: fcfg.admission_trend_exempt = {enabled, pct_chg_min(默认3.0), net_yi_min(默认0.0)}。
+    """
+    cfg = (fcfg.get("admission_trend_exempt") or {})
+    if not cfg.get("enabled", True):
+        return False
+    return ((row.get("pct_chg") or 0) >= float(cfg.get("pct_chg_min", 3.0) or 3.0)
+            and (row.get("net_yi") or 0) > float(cfg.get("net_yi_min", 0.0) or 0.0))
+
+
 def _concept_cons(name: str, allow_net: bool = True) -> list:
     """板块成分股(多策略):concept_map 精确 → 双向子串 → 东财概念成分接口兜底。
 
@@ -898,12 +911,16 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
                 blend_net = w_5d * row["net_5d_yi"] + w_1d * row["net_yi"]
                 blend_pct = w_5d * row["pct_5d"] + w_1d * row["pct_chg"]
                 if blend_net <= net_5d_min:
-                    rejected.append({**row, "level": "rejected", "fund_status": "流出",
-                                     "reject_reason": (f"综合资金净流入 {blend_net:.1f} 亿"
-                                                       f"(当日 {row['net_yi']:+.1f} + 5日 {row['net_5d_yi']:+.1f}),"
-                                                       f"未达准入门槛(准入剔除)")})
-                    continue
-                if blend_pct <= pct_5d_min:
+                    if _trend_exempt_ok(fcfg, row):
+                        row["admission_exempt"] = (f"强势趋势豁免(当日 {row['pct_chg']:+.2f}%/"
+                                                   f"净流入 {row['net_yi']:+.1f}亿,5日累计 {row['net_5d_yi']:+.1f}亿)")
+                    else:
+                        rejected.append({**row, "level": "rejected", "fund_status": "流出",
+                                         "reject_reason": (f"综合资金净流入 {blend_net:.1f} 亿"
+                                                           f"(当日 {row['net_yi']:+.1f} + 5日 {row['net_5d_yi']:+.1f}),"
+                                                           f"未达准入门槛(准入剔除)")})
+                        continue
+                if not row.get("admission_exempt") and blend_pct <= pct_5d_min:
                     rejected.append({**row, "level": "rejected", "fund_status": "背离",
                                      "reject_reason": (f"综合涨幅 {blend_pct:+.2f}%"
                                                        f"(当日 {row['pct_chg']:+.2f} + 5日 {row['pct_5d']:+.2f}),"
@@ -911,10 +928,14 @@ def sector_scores(use_cache=True, flows=None, flows_5d=None,
                     continue
             else:
                 if row["net_5d_yi"] <= net_5d_min:
-                    rejected.append({**row, "level": "rejected", "fund_status": "流出",
-                                     "reject_reason": f"5日主力资金累计净流出 {row['net_5d_yi']:.1f} 亿(准入剔除)"})
-                    continue
-                if row["pct_5d"] <= pct_5d_min:
+                    if _trend_exempt_ok(fcfg, row):
+                        row["admission_exempt"] = (f"强势趋势豁免(当日 {row['pct_chg']:+.2f}%/"
+                                                   f"净流入 {row['net_yi']:+.1f}亿)")
+                    else:
+                        rejected.append({**row, "level": "rejected", "fund_status": "流出",
+                                         "reject_reason": f"5日主力资金累计净流出 {row['net_5d_yi']:.1f} 亿(准入剔除)"})
+                        continue
+                if not row.get("admission_exempt") and row["pct_5d"] <= pct_5d_min:
                     rejected.append({**row, "level": "rejected", "fund_status": "背离",
                                      "reject_reason": f"5日资金净流入但累计涨幅 {row['pct_5d']:+.2f}%,量价背离(准入剔除)"})
                     continue
