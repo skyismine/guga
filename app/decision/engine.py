@@ -91,6 +91,15 @@ def _sector_stats_uncached(name: str) -> dict | None:
                 out["res20"] = float(win.max())
                 out["sup20"] = float(win.min())
                 out["dd20"] = float(close.iloc[-1] / win.max() - 1)  # 相对20日高点回撤(负值)
+                # 位置分位(60/120日): 现价在区间内的相对位置, 区分"启动初期低位"与"高位"
+                try:
+                    for _n in (60, 120):
+                        if len(close) >= _n:
+                            _w = close.tail(_n)
+                            _lo, _hi = float(_w.min()), float(_w.max())
+                            out[f"pos{_n}"] = float((close.iloc[-1] - _lo) / (_hi - _lo)) if _hi > _lo else 0.5
+                except Exception:  # noqa: BLE001
+                    pass
                 # 板块量能比:当日成交量 / 近5日均量(>1 放量,<1 缩量)
                 if "volume" in df.columns and len(df["volume"]) >= 6:
                     v = df["volume"].astype(float)
@@ -900,15 +909,27 @@ def _veto_penalty(r, dcfg, stats, zt_available=True) -> tuple:
                 pts = missing * float(zcfg.get("per_missing", 5.0))
                 penalty += pts
                 reasons.append(f"涨停 {zt_n} 家,不足 {min_zt} 家,扣 {pts:.1f} 分")
-    # 近3日过热(0-10)
+    # 近3日过热(0-10) —— 启动期豁免: 位置仍低(未回到高位)的快速上涨不按过热重罚,
+    # 避免"刚启动的主线"因3日快涨被过度打压; 仅对"高位滞涨/已在高位再快涨"正常扣分。
     ocfg = vp.get("overheat", {})
     thr = float(ocfg.get("threshold", dcfg.get("veto", {}).get("max_gain_3d", 0.15)))
     gain3 = (stats or {}).get("gain3")
     if ocfg.get("enabled", True) and gain3 is not None and gain3 >= thr:
         pts = min(float(ocfg.get("max_pts", 10.0)),
                   (gain3 - thr) / max(thr, 1e-6) * float(ocfg.get("max_pts", 10.0)))
+        _st = stats or {}
+        _pos = _st.get("pos60")
+        if _pos is None:
+            _pos = _st.get("pos120")
+        _low_pos_max = float(ocfg.get("low_pos_max", 0.5) or 0.5)
+        _low_factor = float(ocfg.get("low_pos_factor", 0.3) or 0.3)
+        if _pos is not None and _pos <= _low_pos_max:
+            pts = pts * _low_factor
+            reasons.append(f"近3日涨幅 {gain3 * 100:+.1f}%,超 {thr * 100:.0f}%,"
+                           f"但位置分位 {_pos * 100:.0f}% 仍低(启动期),过热扣分×{_low_factor} 折减为 {pts:.1f} 分")
+        else:
+            reasons.append(f"近3日涨幅 {gain3 * 100:+.1f}%,超 {thr * 100:.0f}% 过热,扣 {pts:.1f} 分")
         penalty += pts
-        reasons.append(f"近3日涨幅 {gain3 * 100:+.1f}%,超 {thr * 100:.0f}% 过热,扣 {pts:.1f} 分")
     return round(penalty, 1), reasons
 
 
@@ -1097,16 +1118,36 @@ def _style_score_adj(style: dict, size_bias, scale: float = 1.0) -> float:
 
 
 def _pos_rating(stats: dict, vcfg: dict) -> str:
-    """位置评级:低位启动 / 中位运行 / 短期高位(基于近3日涨幅与20日回撤)。"""
+    """位置评级:低位启动 / 中位运行 / 短期高位。
+
+    方案: 以「位置分位(60/120日)」为主, 结合 3日涨幅/20日回撤/量能, 区分
+    「启动初期(低位放量上涨)」与「高位滞涨」——修正原先仅用 gain3/dd20 绝对阈值、
+    把刚启动3天的主线误判为高位的缺陷。pos 分位不可得时回退原阈值逻辑。
+    """
     gain3 = stats.get("gain3")
     dd20 = stats.get("dd20")
+    pos = stats.get("pos60")
+    if pos is None:
+        pos = stats.get("pos120")
     if gain3 is None or dd20 is None:
         return "位置未知"
-    p = vcfg.get("pos", {})
-    if gain3 < p.get("low_gain3", 0.05) and dd20 < -p.get("low_dd20", 0.10):
-        return "低位启动"
-    if gain3 >= p.get("mid_gain3", 0.10) or dd20 > -p.get("mid_dd20", 0.05):
+    p = vcfg.get("pos", {}) or {}
+    if pos is None:
+        # 回退: 原绝对阈值口径
+        if gain3 < p.get("low_gain3", 0.05) and dd20 < -p.get("low_dd20", 0.10):
+            return "低位启动"
+        if gain3 >= p.get("mid_gain3", 0.10) or dd20 > -p.get("mid_dd20", 0.05):
+            return "短期高位"
+        return "中位运行"
+    # 主口径: 位置分位
+    lo_pos = float(p.get("low_pos60", 0.45) or 0.45)      # 低位分位上限
+    hi_pos = float(p.get("high_pos60", 0.75) or 0.75)     # 高位分位下限
+    launch_gain_max = float(p.get("launch_gain3_max", 0.15) or 0.15)
+    mid_gain3 = float(p.get("mid_gain3", 0.10) or 0.10)
+    if pos >= hi_pos or (pos >= 0.6 and gain3 >= mid_gain3):
         return "短期高位"
+    if pos <= lo_pos and gain3 < launch_gain_max:
+        return "低位启动"
     return "中位运行"
 
 
@@ -1164,14 +1205,30 @@ def _value_notes(it: dict, vcfg: dict) -> str:
             + ("上涨" if (it.get("pct_chg") or 0) > 0 else "下跌")
         zt += f",量能{vtag}(比 {vr:.2f})"
     if pos == "低位启动":
-        lead = "资金技术双共振,低位启动持续性强"
+        lead = "低位启动(资金技术共振,持续性较好)"
     elif pos == "短期高位":
-        lead = "短线已进入高位,追高风险大,仅作观察"
+        lead = "位置偏高(短线涨幅已大),不宜追高"
     elif pos == "中位运行":
-        lead = "资金技术共振,中位蓄势待突破"
+        lead = "中位蓄势(资金技术共振,待方向选择)"
     else:
         lead = "资金面与板块效应共振"
-    return f"{lead}——{fund_txt},{zt}"
+    # 可执行触发: 给"什么时候买"的明确条件(回踩低吸/突破跟进), 替代笼统"仅作观察"
+    st2 = it.get("stats") or {}
+    sup, res = st2.get("sup20"), st2.get("res20")
+    _pg = ""
+    try:
+        _pginfo = st2.get("pos60")
+        if _pginfo is not None:
+            _pg = f",位置分位 {_pginfo * 100:.0f}%"
+    except Exception:  # noqa: BLE001
+        _pg = ""
+    if pos == "短期高位":
+        trig = (f";操作: 不追高;回踩 {sup:.2f} 不破可低吸,或放量突破 {res:.2f} 确认后跟进" if (sup and res)
+                else ";操作: 不追高,等回踩企稳或放量突破再跟进")
+    else:
+        trig = (f";操作: 回踩 {sup:.2f} 不破低吸,放量突破 {res:.2f} 跟进" if (sup and res)
+                else ";操作: 回踩企稳低吸,放量突破跟进")
+    return f"{lead}{_pg}——{fund_txt},{zt}{trig}"
 
 
 def mainline_select() -> dict:

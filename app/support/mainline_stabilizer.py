@@ -331,6 +331,16 @@ def _pick_leader(pool_rows, prev_name, label, N, now, margin: float = 0.0):
     return top, None
 
 
+def _upgrade_trigger(stats, up_eff=None) -> str:
+    """观察/边缘层的升级触发条件(把"仅观察"变成有阈值的状态)。"""
+    st = stats or {}
+    sup, res = st.get("sup20"), st.get("res20")
+    tgt = f"(综合评分≥{up_eff:.0f})" if up_eff is not None else ""
+    if sup and res:
+        return (f"升级触发: 回踩 {sup:.2f} 不破→升发酵层, 放量突破 {res:.2f}→升核心层 {tgt}").strip()
+    return ("升级触发: 回踩支撑不破→升发酵层, 放量突破压力→升核心层 " + tgt).strip()
+
+
 def _confidence(st: dict, score: float, up: float, down: float, N: int, ccfg: dict) -> float:
     """稳定器置信度(0-1, 3.3): 驻留周期进度 + 相对保级线的安全边际。
 
@@ -513,7 +523,8 @@ def _build_stable(cfg: dict) -> dict:
                 if score >= down_eff:
                     it = _mk_item(r, stats, "watch",
                                   [f"综合评分 {score:.2f} 分,低于晋升线 {up_eff:.0f}"
-                                   + (f"(板块动态{adj:+.1f})" if adj else "") + ",仅跟踪"],
+                                   + (f"(板块动态{adj:+.1f})" if adj else "") + ",仅跟踪",
+                                   _upgrade_trigger(stats, up_eff)],
                                   pool=pool)
                     it["score"] = score
                     it.update(_extra)
@@ -521,7 +532,8 @@ def _build_stable(cfg: dict) -> dict:
                 elif score >= down_eff - _NEAR_MARGIN:
                     # 边缘参考: 距观察线较近的板块, 观察池空时展示(避免页面误读为无数据)
                     it = _mk_item(r, stats, "watch",
-                                  [f"边缘参考: 评分 {score:.2f} 距观察线 {down_eff:.0f} 以内,未达准入"],
+                                  [f"边缘参考: 评分 {score:.2f} 距观察线 {down_eff:.0f} 以内,未达准入",
+                                   _upgrade_trigger(stats, up_eff)],
                                   pool=pool)
                     it["score"] = score
                     it["is_reference"] = True
