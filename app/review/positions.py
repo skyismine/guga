@@ -114,9 +114,10 @@ def positions_review(d: dict) -> list:
     # ---- 今日合规校验
     items.append({"head": "今日操作合规校验"})
     try:
-        from app.decision.engine import phase_cfg
+        from app.decision.engine import phase_cfg, position_cap
         _p = phase_cfg()
-        items.append({"t": f"市场阶段 **{_p.get('label')}**:总仓位上限 **{_p.get('cap', 0) * 100:.0f}%**"
+        _cap_eff = position_cap()
+        items.append({"t": f"市场阶段 **{_p.get('label')}**:总仓位上限 **{_cap_eff * 100:.0f}%**(含热度折扣)"
                            f" · 单票上限 **{_p.get('single_cap', 0) * 100:.0f}%**"
                            f" · 单次新增 **{_p.get('add_cap', 0) * 100:.0f}%**"
                            f" · 盈亏比门槛 **≥{_p.get('rr_left', 0)}:1**(左侧)"})

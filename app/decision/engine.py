@@ -236,6 +236,71 @@ def phase_cfg(phase: str = None) -> dict:
     return {**cfg, "phase": phase}
 
 
+# ---------------------------------------------------------------- 热度折扣(方案2)
+# 评级/阶段给出"基准上限"; 热度(恐贪/偏离MA20/涨停)给出连续折扣系数, 避免"越热越加仓"。
+_HEAT_CACHE = {"t": 0.0, "phase": None, "cap": None, "data": None}
+
+
+def _lin01(v, lo, hi) -> float:
+    if v is None or hi <= lo:
+        return 0.0
+    return max(0.0, min(1.0, (float(v) - lo) / (hi - lo)))
+
+
+def _compute_heat(fg, closes, zt) -> dict:
+    """市场热度(0~1) = 恐贪(权重.5) + 偏离MA20(.3) + 涨停家数(.2); 返回折扣系数。
+
+    热度越高 → factor 越小 → 总仓位上限越保守。参数可在 settings.decision.heat 覆盖:
+      fg_cool/fg_hot, dev_cool/dev_hot, zt_cool/zt_hot, weights, max_discount, min_cap。
+    健康走强但热度正常(恐贪居中、未明显偏离均线、涨停不算极端)时 factor≈1, 不施加折扣。
+    """
+    c = (_cfg().get("heat") or {})
+    fg_cool, fg_hot = float(c.get("fg_cool", 50) or 50), float(c.get("fg_hot", 85) or 85)
+    dev_cool, dev_hot = float(c.get("dev_cool", 0.02) or 0.02), float(c.get("dev_hot", 0.08) or 0.08)
+    zt_cool, zt_hot = float(c.get("zt_cool", 40) or 40), float(c.get("zt_hot", 100) or 100)
+    w = c.get("weights") or {}
+    wf, wd, wz = (float(w.get("fear_greed", 0.5) or 0.5),
+                  float(w.get("deviation", 0.3) or 0.3), float(w.get("limit_up", 0.2) or 0.2))
+    fg_c = _lin01(fg, fg_cool, fg_hot)
+    dev = None
+    try:
+        if closes and len(closes) >= 20:
+            ma = sum(float(x) for x in closes[-20:]) / 20
+            if ma:
+                dev = float(closes[-1]) / ma - 1
+    except Exception:  # noqa: BLE001
+        dev = None
+    dev_c = _lin01(dev, dev_cool, dev_hot)
+    zt_c = _lin01(zt, zt_cool, zt_hot)
+    score = max(0.0, min(1.0, wf * fg_c + wd * dev_c + wz * zt_c))
+    maxd = float(c.get("max_discount", 0.4) or 0.4)
+    return {"score": round(score, 3), "factor": round(1 - maxd * score, 3),
+            "fear_greed": fg, "dev": round(dev, 4) if dev is not None else None, "limit_up": zt,
+            "components": {"恐贪": round(fg_c, 2), "偏离MA20": round(dev_c, 2), "涨停": round(zt_c, 2)},
+            "max_discount": maxd}
+
+
+def _heat_cap(base_cap: float, heat: dict) -> float:
+    """基准上限 × 热度系数, 下限 min_cap。"""
+    c = (_cfg().get("heat") or {})
+    min_cap = float(c.get("min_cap", 0.2) or 0.2)
+    return round(max(min_cap, float(base_cap) * float(heat.get("factor", 1.0))), 3)
+
+
+def position_cap(phase: str = None, force: bool = False) -> float:
+    """当前总仓位上限(阶段基准 × 热度折扣), 60s 缓存; 供速览/策略/风控/执行统一取用。"""
+    now = time.time()
+    if (not force and _HEAT_CACHE["cap"] is not None
+            and now - _HEAT_CACHE["t"] < 60
+            and (phase is None or _HEAT_CACHE["phase"] == phase)):
+        return _HEAT_CACHE["cap"]
+    try:
+        return float(market_permit().get("cap"))
+    except Exception:  # noqa: BLE001
+        cfg = _PHASE_CFG.get(phase or "main") or _PHASE_CFG["main"]
+        return float(cfg["cap"])
+
+
 # ---------------------------------------------------------------- 第一层 大盘开仓许可评级
 def _in_trading_time(now: dt.datetime = None) -> bool:
     """交易时段(周一~周五 9:30-15:00, 含午休; 与 fetcher.is_trading_time 口径一致)。"""
@@ -668,7 +733,12 @@ def market_permit() -> dict:
     phase = _phase_from_permit({"grade": grade, "fear_greed": fg,
                                 "vol_ratio": vol_ratio, "limit_up": zt})
     pcfg = _PHASE_CFG[phase]
-    cap = pcfg["cap"]
+    _base_cap = pcfg["cap"]
+    # 方案2: 阶段基准 × 热度折扣(恐贪/偏离MA20/涨停) → 越热上限越保守
+    heat = _compute_heat(fg, closes, zt)
+    cap = _heat_cap(_base_cap, heat)
+    _HEAT_CACHE.update(t=time.time(), phase=phase, cap=cap,
+                       data={"base_cap": _base_cap, "cap": cap, **heat})
     checks = {
         "大盘打分": {"value": score, "ok": score >= rules["score_full"], "ok_min": score >= rules["score_ok"]},
         "涨停家数": {"value": zt, "ok": zt is not None and zt >= rules["zt_full"],
@@ -699,6 +769,10 @@ def market_permit() -> dict:
     reasons.append(f"权重模式: {_W_MODE_TAG.get(weights['mode'], weights['mode'])}(恐贪{weights['mood']:.0f}/宽度{weights['breadth']:.0f}/"
                    f"涨停{weights['zt']:.0f}/量价{weights['vp']:.0f}/趋势{weights['trend']:.0f})")
     reasons.append(f"大盘综合评分 {score},达 {grade} 级标准,当前市场阶段「{pcfg['label']}」总仓位上限 {cap:.0%}")
+    if heat["factor"] < 0.999:
+        _dev_txt = f"{heat['dev'] * 100:.1f}%" if heat.get("dev") is not None else "-"
+        reasons.append(f"热度折扣 {heat['score']:.2f}(恐贪 {fg if fg is not None else '-'}/偏离MA20 {_dev_txt}/"
+                       f"涨停 {zt}):上限 {_base_cap:.0%}×{heat['factor']:.2f}={cap:.0%}(越热越保守)")
     if grade_change:
         reasons.append(grade_change)
     # 数据质量: 行情日期是否当日 + 关键维度是否缺失(供决策层降权)
@@ -719,6 +793,8 @@ def market_permit() -> dict:
         "grade_label": {"A": "A级·积极配置", "B": "B级·谨慎配置",
                         "C": "C级·持有兑现", "D": "D级·观望为主"}[grade],
         "cap": cap,
+        "cap_base": _base_cap,
+        "heat": {**heat, "cap": cap, "base_cap": _base_cap},
         "score": score, "fear_greed": fg, "fear_greed_label": fear_greed_label(fg),
         "limit_up": zt, "advance": adv, "decline": dec, "adv_ratio": adv_ratio,
         "amount_yi": amount_yi, "vol_ratio": vol_ratio, "vol_ratio_raw": vol_raw,

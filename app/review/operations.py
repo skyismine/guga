@@ -237,8 +237,15 @@ def audit_today(today_ops: list, positions: list, levels_map: dict,
             mv_sum += mv
             if total_asset > 0 and mv / total_asset > single_cap:
                 violations.append(f"{p['code']} 单票仓位 {(mv / total_asset) * 100:.1f}% 超红线 {single_cap * 100:.0f}%")
-    if total_asset and mv_sum / total_asset > float(_p.get("cap", 0.7)) + 1e-6:
-        violations.append(f"总仓位 {mv_sum / total_asset * 100:.1f}% 超阶段({_p.get('label', '')})上限 {float(_p.get('cap', 0.7)) * 100:.0f}%")
+    if total_asset:
+        try:
+            from app.decision.engine import position_cap as _pos_cap
+            _cap_eff = _pos_cap()
+        except Exception:  # noqa: BLE001
+            _cap_eff = float(_p.get("cap", 0.7))
+        if mv_sum / total_asset > _cap_eff + 1e-6:
+            violations.append(f"总仓位 {mv_sum / total_asset * 100:.1f}% 超阶段({_p.get('label', '')})"
+                              f"上限 {_cap_eff * 100:.0f}%(含热度折扣)")
     # 3) 破位未止损(今日最低 < stop_loss 且当日未卖出)
     sold_today = {str(o["code"]).zfill(6) for o in today_ops if o.get("action") == "sell"}
     for code, lv in levels_map.items():

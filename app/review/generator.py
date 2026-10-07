@@ -668,8 +668,8 @@ def generate_review(d: Dict) -> Dict:
             risk_txt = it["t"].split(":", 1)[-1].strip().lstrip("· ").strip()[:60]
     _cap_txt = "阶段仓位上限见明日策略"
     try:
-        from app.decision.engine import phase_cfg
-        _cap_txt = f"{phase_cfg().get('cap', 0) * 100:.0f}%(当前阶段 {phase_cfg().get('label', '')})"
+        from app.decision.engine import phase_cfg, position_cap
+        _cap_txt = f"{position_cap() * 100:.0f}%(当前阶段 {phase_cfg().get('label', '')})"
     except Exception:  # noqa: BLE001
         pass
     ctx = {

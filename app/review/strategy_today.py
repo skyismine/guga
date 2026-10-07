@@ -30,7 +30,12 @@ def strategy_review(d: dict) -> list:
         from app.decision.engine import phase_cfg
         _p = phase_cfg()
         items.append({"head": "0. 市场阶段与风控基调(全局阶段)"})
-        items.append({"t": f"当前市场阶段 **{_p.get('label')}**:总仓位上限 **{_p.get('cap', 0) * 100:.0f}%**"
+        try:
+            from app.decision.engine import position_cap as _pos_cap
+            _cap_eff = _pos_cap()
+        except Exception:  # noqa: BLE001
+            _cap_eff = _p.get("cap", 0)
+        items.append({"t": f"当前市场阶段 **{_p.get('label')}**:总仓位上限 **{_cap_eff * 100:.0f}%**(含热度折扣)"
                            f" · 单票上限 **{_p.get('single_cap', 0) * 100:.0f}%**"
                            f" · 单次新增上限 **{_p.get('add_cap', 0) * 100:.0f}%**"
                            f" · 盈亏比门槛 左侧≥{_p.get('rr_left')} / 右侧"

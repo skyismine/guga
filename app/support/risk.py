@@ -154,13 +154,17 @@ def validate(positions: list, total_asset: float = None,
     sec_v = [{"sector": k, **v, "limit": rules["sector_pct"]}
              for k, v in sector.items() if v["pct"] > rules["sector_pct"] + 1e-6]
 
-    cap = ph["cap"]   # 分阶段总仓位上限(全系统天花板)
+    try:  # 阶段基准 × 热度折扣(与决策/复盘统一口径)
+        from app.decision.engine import position_cap as _pos_cap
+        cap = _pos_cap()
+    except Exception:  # noqa: BLE001
+        cap = ph["cap"]   # 分阶段总仓位上限(全系统天花板)
     total_ok = total_pct <= cap + 1e-6
     n_viol = len(single) + len(sec_v) + (0 if total_ok else 1) + len(add)
     rating = "低" if n_viol == 0 else ("中" if n_viol == 1 else "高")
     tips = []
     if not total_ok:
-        tips.append(f"总仓位 {total_pct:.1%} 超过当前阶段({ph['label']})上限 {cap:.0%},建议降仓至 {cap:.0%} 以内")
+        tips.append(f"总仓位 {total_pct:.1%} 超过当前阶段({ph['label']})上限 {cap:.0%}(含热度折扣),建议降仓至 {cap:.0%} 以内")
     for s in single:
         tips.append(f"{s['code']} 仓位 {s['pct']:.1%} 超过单只上限 {s['limit']:.0%}")
     for s in sec_v:
