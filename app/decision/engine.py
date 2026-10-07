@@ -287,6 +287,31 @@ def _heat_cap(base_cap: float, heat: dict) -> float:
     return round(max(min_cap, float(base_cap) * float(heat.get("factor", 1.0))), 3)
 
 
+def _dq_eval(mdate, expected, fg, adv_ratio, amount_yi, today=None):
+    """数据质量判定(纯函数, 便于测试): 按「最近交易日」expected 判断行情是否滞后。
+
+    - expected(最近交易日)可得: mdate < expected 才算滞后(节假日不会把上一交易日误判);
+    - expected 不可得(交易日历失败): 退化为自然日比较, 且周末不误判;
+    - 关键维度缺失 → 0.65; 否则 1.0。
+    返回 (dq, note)。
+    """
+    mdate = str(mdate or "")[:10]
+    today = str(today or dt.date.today())
+    dq, note = 1.0, ""
+    if mdate and expected and mdate < str(expected):
+        dq, note = 0.55, f"行情日期滞后(快照 {mdate},最近交易日 {expected})"
+    elif mdate and not expected:
+        try:
+            _wd = dt.date.fromisoformat(today).weekday()
+        except Exception:  # noqa: BLE001
+            _wd = 0
+        if mdate < today and _wd < 5:
+            dq, note = 0.55, f"行情日期滞后(快照 {mdate},今日 {today})"
+    if dq >= 0.8 and (fg is None or adv_ratio is None or amount_yi is None):
+        dq, note = 0.65, "关键维度缺失(恐贪/涨跌家数/成交额)"
+    return dq, note
+
+
 def position_cap(phase: str = None, force: bool = False) -> float:
     """当前总仓位上限(阶段基准 × 热度折扣), 60s 缓存; 供速览/策略/风控/执行统一取用。"""
     now = time.time()
@@ -775,15 +800,18 @@ def market_permit() -> dict:
                        f"涨停 {zt}):上限 {_base_cap:.0%}×{heat['factor']:.2f}={cap:.0%}(越热越保守)")
     if grade_change:
         reasons.append(grade_change)
-    # 数据质量: 行情日期是否当日 + 关键维度是否缺失(供决策层降权)
+    # 数据质量: 行情日期是否对齐「最近交易日」(非自然日) + 关键维度是否缺失(供决策层降权)
     _dq, _dq_note = 1.0, ""
     try:
-        _mdate = str(snap.get("market_date") or "")
-        _today_s = str(dt.date.today())
-        if _mdate and _mdate[:10] < _today_s:
-            _dq, _dq_note = 0.55, f"行情日期滞后(快照 {_mdate},今日 {_today_s})"
-        elif fg is None or adv_ratio is None or amount_yi is None:
-            _dq, _dq_note = 0.65, "关键维度缺失(恐贪/涨跌家数/成交额)"
+        _mdate = str(snap.get("market_date") or "")[:10]
+        # 关键修复: 以「最近交易日」为基准比较, 避免节假日(如国庆)把上一交易日误判为"日期滞后"
+        _expected = None
+        try:
+            from app.review.data import review_date
+            _expected = str(review_date())
+        except Exception:  # noqa: BLE001
+            _expected = None
+        _dq, _dq_note = _dq_eval(_mdate, _expected, fg, adv_ratio, amount_yi)
     except Exception as _e:  # noqa: BLE001
         _fault(_e)
     if _dq < 0.8:
