@@ -96,32 +96,110 @@ def get_index_history(symbol: str = None, days: int = None, use_cache: bool = Tr
     return df
 
 
-def get_index_spot(symbol: str = None) -> Dict:
-    """指数实时快照(新浪 hq 接口,与股票行情同格式前 6 个数值字段)。"""
+_INDEX_SPOT_NEG = {}          # symbol -> 负缓存到期时间戳(失败后短时间内不再重试)
+_INDEX_SPOT_NEG_SEC = 300
+
+
+def _sina_index_detail(symbol: str) -> Optional[Dict]:
+    try:
+        resp = requests.get(_SINA_HQ.format(symbols=symbol),
+                            headers={"Referer": _SINA_REFERER}, timeout=10)
+        resp.encoding = "gbk"
+        m = re.search(r'="(.*)"', resp.text)
+        if not m or not m.group(1):
+            return None
+        parts = m.group(1).split(",")
+        if len(parts) < 5:
+            return None
+        name = parts[0]
+        try:
+            open_, prev_close, price, high, low = (float(parts[i]) for i in range(1, 6))
+        except (TypeError, ValueError, IndexError):
+            open_ = prev_close = price = high = low = 0.0
+        pct = (price - prev_close) / prev_close if prev_close else 0.0
+        amount = 0.0
+        try:
+            amount = float(parts[9]) if len(parts) > 9 else 0.0
+        except (TypeError, ValueError, IndexError):
+            pass
+        m2 = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})", resp.text)
+        return {"symbol": symbol, "name": name, "open": open_, "prev_close": prev_close,
+                "price": price, "high": high, "low": low, "pct_chg": pct, "amount": amount,
+                "datetime": f"{m2.group(1)} {m2.group(2)}" if m2 else "", "src": "sina"}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _sina_index_simple(symbol: str) -> Optional[Dict]:
+    """新浪简版指数(s_前缀): name,点数,涨跌额,涨跌幅,成交量,成交额(万元)。"""
+    try:
+        s = symbol if symbol.startswith("s_") else "s_" + symbol
+        resp = requests.get(_SINA_HQ.format(symbols=s),
+                            headers={"Referer": _SINA_REFERER}, timeout=10)
+        resp.encoding = "gbk"
+        m = re.search(r'="(.*)"', resp.text)
+        if not m or not m.group(1):
+            return None
+        parts = m.group(1).split(",")
+        if len(parts) < 4 or not parts[1]:
+            return None
+        name, price, chg, pct = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+        return {"symbol": symbol, "name": name, "open": None, "prev_close": price - chg,
+                "price": price, "high": None, "low": None, "pct_chg": pct / 100.0,
+                "amount": (float(parts[5]) * 1e4 if len(parts) > 5 and parts[5] else 0.0),
+                "datetime": "", "src": "sina_s"}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _em_index_spot(symbol: str) -> Optional[Dict]:
+    try:
+        import akshare as ak
+        code = str(symbol)[-6:]
+        df = ak.stock_zh_index_spot_em(symbol="沪深重要指数")
+        row = df[df["代码"].astype(str).str.zfill(6) == code]
+        if row.empty:
+            return None
+        x = row.iloc[0]
+        price = float(x.get("最新价") or 0)
+        prev = float(x.get("昨收") or x.get("前收盘") or 0)
+        return {"symbol": symbol, "name": str(x.get("名称") or symbol),
+                "open": float(x.get("今开") or 0), "prev_close": prev, "price": price,
+                "high": float(x.get("最高") or 0), "low": float(x.get("最低") or 0),
+                "pct_chg": (price / prev - 1) if prev else 0.0,
+                "amount": float(x.get("成交额") or 0), "datetime": "", "src": "em"}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_index_spot(symbol: str = None) -> Optional[Dict]:
+    """指数实时快照(多源兜底): 新浪详版 → 新浪简版(s_) → 东财(akshare) → 日线末值。
+
+    全部失败返回 None(不再抛异常); 失败后 _INDEX_SPOT_NEG_SEC 内负缓存直接返回 None,
+    避免"指数实时注入失败"刷屏与空转重试。"""
     symbol = symbol or config.MARKET_INDEX
-    resp = requests.get(_SINA_HQ.format(symbols=symbol),
-                        headers={"Referer": _SINA_REFERER}, timeout=10)
-    resp.encoding = "gbk"
-    m = re.search(r'="(.*)"', resp.text)
-    if not m or not m.group(1):
-        raise ConnectionError(f"指数实时行情无数据: {symbol}")
-    parts = m.group(1).split(",")
-    name = parts[0]
-    try:
-        open_, prev_close, price, high, low = (float(parts[i]) for i in range(1, 6))
-    except (TypeError, ValueError, IndexError):
-        open_ = prev_close = price = high = low = 0.0
-    pct = (price - prev_close) / prev_close if prev_close else 0.0
-    amount = 0.0
-    try:
-        amount = float(parts[9]) if len(parts) > 9 else 0.0
-    except (TypeError, ValueError, IndexError):
-        pass
-    m2 = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})", resp.text)
-    return {"symbol": symbol, "name": name, "open": open_, "prev_close": prev_close,
-            "price": price, "high": high, "low": low, "pct_chg": pct,
-            "amount": amount,
-            "datetime": f"{m2.group(1)} {m2.group(2)}" if m2 else ""}
+    if time.time() < _INDEX_SPOT_NEG.get(symbol, 0.0):
+        return None
+    spot = (_sina_index_detail(symbol)
+            or _sina_index_simple(symbol)
+            or _em_index_spot(symbol))
+    if spot is None:
+        # 末值兜底: 日线最后收盘
+        try:
+            df = get_index_history(symbol, days=5)
+            if df is not None and len(df) and "close" in df.columns:
+                c = df["close"].astype(float)
+                price = float(c.iloc[-1])
+                prev = float(c.iloc[-2]) if len(c) >= 2 else price
+                spot = {"symbol": symbol, "name": symbol, "open": None, "prev_close": prev,
+                        "price": price, "high": None, "low": None,
+                        "pct_chg": (price / prev - 1) if prev else 0.0,
+                        "amount": 0.0, "datetime": "", "src": "daily"}
+        except Exception:  # noqa: BLE001
+            spot = None
+    if spot is None:
+        _INDEX_SPOT_NEG[symbol] = time.time() + _INDEX_SPOT_NEG_SEC
+    return spot
 
 
 def get_two_market_amount() -> Optional[float]:
@@ -129,7 +207,7 @@ def get_two_market_amount() -> Optional[float]:
     try:
         sh = get_index_spot("sh000001")
         sz = get_index_spot("sz399001")
-        if sh.get("amount") and sz.get("amount"):
+        if sh and sz and sh.get("amount") and sz.get("amount"):
             return sh["amount"] + sz["amount"]
     except Exception as _e:  # noqa: BLE001
         _fault(_e)

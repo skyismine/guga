@@ -29,6 +29,19 @@ from app.data import market as mk
 from app.features.indicators import compute_features
 from app.features.standardize import zscore_frame
 
+
+_LOG_THROTTLE = {}
+
+
+def _log_throttled(msg: str, key: str = None, sec: int = 300) -> None:
+    """日志节流: 同一问题每 sec 秒最多打印一次, 避免实时源缺失时刷屏。"""
+    key = key or msg[:24]
+    now = time.time()
+    if now - _LOG_THROTTLE.get(key, 0.0) < sec:
+        return
+    _LOG_THROTTLE[key] = now
+    print(f"[market_features] {msg}")
+
 _MARKET_FRAME_PATH = os.path.join(config.DATA_DIR, "market_frame.pkl")
 _MARKET_FRAME_TTL = 24 * 3600   # 市场帧缓存 TTL(秒):收盘后宽度数据不再变动,每日重建一次即可
 
@@ -385,6 +398,9 @@ def _realtime_market_row() -> dict:
     # 3) 实时指数:追加今日实时价重算动量/RSI(仅用历史+实时,无前视)
     try:
         spot = mk.get_index_spot(config.MARKET_INDEX)
+        if not spot or not spot.get("price"):
+            _log_throttled("实时指数不可得(多源兜底均失败),跳过实时注入")
+            return row
         px = spot.get("price")
         if px and px > 0:
             idx = mk.get_index_history(config.MARKET_INDEX, days=120)
@@ -406,7 +422,7 @@ def _realtime_market_row() -> dict:
             if rsi is not None:
                 row["market_index_rsi14"] = rsi
     except Exception as e:  # noqa: BLE001
-        print(f"[market_features] 实时指数注入失败: {e}")
+        _log_throttled(f"实时指数注入失败: {e}")
 
     return row
 
