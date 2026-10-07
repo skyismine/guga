@@ -268,7 +268,10 @@ def _trade_rr_dual(item: dict, role: str, df=None) -> tuple:
     """分模式盈亏比双口径(4.2): 短期(5日区间)与中期(20日levels)。
 
     - 左侧低吸: rr = (压力位-低吸价)/(低吸价-止损位), 止损位=支撑位下方ATR;
-    - 右侧突破: rr = (目标价-突破价)/(突破价-回踩位), 目标价=突破位+ATR幅度;
+    - 右侧突破: rr = (目标价-突破进价)/(突破进价-回踩止损), 突破进价=max(现价,5日高),
+      回踩止损=5日高-ATR(跌破突破区视为假突破), 目标取20日压力/levels压力, 缺失回退 进价+2ATR;
+      —— 替代原 (突破位+ATR-突破位)/ATR≡1 的无区分度口径:
+      现价越追高(离突破位越远)→风险越大、空间越小→rr 越小, 能反映追高风险。
     - 输出 (mode, rr_5d, rr_20d, note), 根据交易模式选择参考。
     """
     lv = item.get("levels") or {}
@@ -292,10 +295,13 @@ def _trade_rr_dual(item: dict, role: str, df=None) -> tuple:
         c = df["close"].astype(float)
         hi5, lo5 = float(c.tail(5).max()), float(c.tail(5).min())
         if mode == "right":
-            brk = hi5
-            tgt5 = brk + atr
             if atr > 0:
-                rr5 = (tgt5 - brk) / atr
+                entry = max(float(price or hi5), hi5)          # 突破进价: 突破位/现价取高
+                stop5 = hi5 - atr                               # 回踩止损: 跌破突破区1ATR
+                _res = lv.get("resistance") or lv.get("target")
+                tgt5 = float(_res) if (_res and float(_res) > entry) else entry + 2 * atr
+                if entry > stop5:
+                    rr5 = (tgt5 - entry) / (entry - stop5)
         else:
             buy = lo5
             stop5 = lo5 - atr
