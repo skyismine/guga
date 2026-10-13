@@ -605,9 +605,10 @@ def api_backtest():
 # ============================================================ 决策执行引擎(今日决策)
 import threading as _threading
 
-_DECISION_CACHE = {"t": 0.0, "data": None, "err": None}
+_DECISION_CACHE = {"t": 0.0, "data": None, "err": None, "low_q": False}
 _DECISION_TTL = 600
 _DECISION_TTL_TRADING = 180   # 盘中: 家数/成交额/涨停等变化快, 缩短 TTL 以便更快吸收最新数据
+_DECISION_TTL_LOWQ = 10       # 低质量(数据未就绪/关键维度缺失): 极短 TTL, 促使尽快重算纠正
 
 
 def _decision_ttl() -> int:
@@ -617,6 +618,21 @@ def _decision_ttl() -> int:
     hm = now.hour * 60 + now.minute
     trading = now.weekday() < 5 and (9 * 60 + 30) <= hm <= (15 * 60)
     return _DECISION_TTL_TRADING if trading else _DECISION_TTL
+
+
+def _decision_low_quality(d: dict) -> bool:
+    """决策是否"数据未就绪/关键维度缺失"(盘前预热常见): 是则不应长期缓存。"""
+    try:
+        p1 = ((d or {}).get("layers") or {}).get("layer1") or {}
+        if (p1.get("data_quality") or 1.0) < 0.8:
+            return True
+        for k in ("advance", "decline", "amount_yi", "limit_up"):
+            v = p1.get(k)
+            if v is None or (isinstance(v, (int, float)) and v == 0):
+                return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
 _DECISION_LOCK = _threading.Lock()
 _DECISION_WORKER = {"running": False}
 # 交易日前移自动感知: 数据源恢复(如 fuyao 限流解除)后无需重启/改配置,
@@ -645,7 +661,7 @@ def _mkt_date_probe(force: bool = False) -> str:
 def _decision_stale(probe_force: bool = False) -> bool:
     if _DECISION_CACHE["data"] is None or _DECISION_CACHE["err"]:
         return True
-    if _time.time() - _DECISION_CACHE["t"] > _decision_ttl():
+    if _time.time() - _DECISION_CACHE["t"] > (_DECISION_TTL_LOWQ if _DECISION_CACHE.get("low_q") else _decision_ttl()):
         return True
     # 缓存决策日期落后于最新交易日 → 强制重算(自愈, 无需重启)
     try:
@@ -664,11 +680,14 @@ def _compute_decision(force_probe: bool = False):
             return _DECISION_CACHE
         from app.decision.engine import decision_brief
         try:
-            _DECISION_CACHE["data"] = decision_brief()
+            _d = decision_brief()
+            _DECISION_CACHE["data"] = _d
             _DECISION_CACHE["err"] = None
+            _DECISION_CACHE["low_q"] = _decision_low_quality(_d)
         except Exception as e:  # noqa: BLE001
             _DECISION_CACHE["data"] = None
             _DECISION_CACHE["err"] = str(e)
+            _DECISION_CACHE["low_q"] = False
         _DECISION_CACHE["t"] = _time.time()
     return _DECISION_CACHE
 
@@ -1481,7 +1500,8 @@ def page_decision():
     c = _get_decision(refresh=refresh)
     # 被动自动刷新: 已有数据但已过期(>TTL 或交易日前移)时, 普通访问也触发后台重算,
     # 页面附带轮询脚本, 计算完成/失败后自动重载——避免"只有点刷新才更新"。
-    auto_reload = (not refresh and bool(c["data"]) and not c["err"] and _decision_stale())
+    auto_reload = (not refresh and bool(c["data"]) and not c["err"]
+                   and (_decision_stale() or _DECISION_CACHE.get("low_q")))
     if auto_reload:
         _ensure_decision_worker()
     if c["data"] is None and not c["err"]:
@@ -2634,7 +2654,21 @@ def _warm_startup_cache():
     _t.sleep(2)
     try:
         _get_decision(refresh=True)
-        print("[预热] 今日决策缓存已就绪")
+        if not _DECISION_CACHE.get("low_q"):
+            print("[预热] 今日决策缓存已就绪")
+        else:
+            # 盘前/数据未就绪: 自动重试(最多10次, 每60s一次)直到关键维度齐备
+            print("[预热] 决策数据未就绪(盘前/源未更新),启动自动重试...")
+            for _ in range(10):
+                _t.sleep(60)
+                try:
+                    _compute_decision(force_probe=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                if not _DECISION_CACHE.get("low_q"):
+                    break
+            print("[预热] 决策数据已就绪" if not _DECISION_CACHE.get("low_q")
+                  else "[预热] 决策仍低质量(源未就绪),将由 10s TTL 自动重算纠正")
     except Exception as e:  # noqa: BLE001
         print(f"[预热] 今日决策预热失败: {e}")
     # DAL 数据预热: 指数/市场日度/板块资金/涨跌家数(开盘前预加载当日基础数据)
