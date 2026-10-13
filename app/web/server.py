@@ -607,6 +607,16 @@ import threading as _threading
 
 _DECISION_CACHE = {"t": 0.0, "data": None, "err": None}
 _DECISION_TTL = 600
+_DECISION_TTL_TRADING = 180   # 盘中: 家数/成交额/涨停等变化快, 缩短 TTL 以便更快吸收最新数据
+
+
+def _decision_ttl() -> int:
+    """决策缓存 TTL: 交易时段(含午休, 9:30-15:00 工作日) 缩短, 其余 600s。"""
+    import datetime as _ddt
+    now = _ddt.datetime.now()
+    hm = now.hour * 60 + now.minute
+    trading = now.weekday() < 5 and (9 * 60 + 30) <= hm <= (15 * 60)
+    return _DECISION_TTL_TRADING if trading else _DECISION_TTL
 _DECISION_LOCK = _threading.Lock()
 _DECISION_WORKER = {"running": False}
 # 交易日前移自动感知: 数据源恢复(如 fuyao 限流解除)后无需重启/改配置,
@@ -635,7 +645,7 @@ def _mkt_date_probe(force: bool = False) -> str:
 def _decision_stale(probe_force: bool = False) -> bool:
     if _DECISION_CACHE["data"] is None or _DECISION_CACHE["err"]:
         return True
-    if _time.time() - _DECISION_CACHE["t"] > _DECISION_TTL:
+    if _time.time() - _DECISION_CACHE["t"] > _decision_ttl():
         return True
     # 缓存决策日期落后于最新交易日 → 强制重算(自愈, 无需重启)
     try:
